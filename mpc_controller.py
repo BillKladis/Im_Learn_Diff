@@ -20,9 +20,10 @@ class MPC_controller:
         self.N      = N
         self.dt     = torch.tensor(0.05, device=device, dtype=torch.float64)
 
-        # q2/q2_dot weights: strong restoring force to fight Coriolis coupling from q1 swing.
-        # q2_dot raised from 15→25; Qf q2/q2_dot raised to give terminal plan a damped q2 target.
-        self.q_base_diag = torch.tensor([12.0, 5.0, 30.0, 25.0], device=device, dtype=torch.float64)
+        # q_base_diag: [q1=12, q1_dot=5, q2=50, q2_dot=40]
+        # Higher q2/q2_dot weights reduce Coriolis-driven folding during swing-up.
+        # Qf handles q1_dot overshoot (q1_dot weight raised to 60 in L_base).
+        self.q_base_diag = torch.tensor([12.0, 5.0, 50.0, 40.0], device=device, dtype=torch.float64)
         self.r_base_diag = torch.tensor([1.0, 1.0], device=device, dtype=torch.float64)
         self.Qf = torch.diag(torch.tensor([20.0, 20.0, 40.0, 30.0], device=device, dtype=torch.float64))
 
