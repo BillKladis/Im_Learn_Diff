@@ -128,6 +128,7 @@ def train_linearization_network(
     W_TERMINAL = 1.0
     W_ENERGY = 1.5      # energy-deficit loss (replaces disabled control-effort loss)
     W_PUMP = 5.0        # stronger pump reward
+    W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
@@ -137,9 +138,10 @@ def train_linearization_network(
     CLIP_OTHER = 5.0
     SKIP_UPDATE_GRAD_NORM = 5e7
 
-    # Phase-aware curriculum boundaries (fraction of num_steps)
-    ENERGY_PHASE_END   = 0.50   # pure energy-building up to 50 %
-    POSITION_PHASE_IN  = 0.65   # position loss fully active at 65 %
+    # Phase-aware curriculum boundaries (fraction of num_steps) — base values,
+    # shrink epoch-by-epoch as the network learns to build energy faster.
+    ENERGY_PHASE_END_BASE  = 0.50
+    POSITION_PHASE_IN_BASE = 0.65
 
     n_res = lin_net.n_res
     state_dim = lin_net.state_dim
@@ -164,6 +166,8 @@ def train_linearization_network(
         recorder = network_module.NetworkOutputRecorder()
 
     E_goal_det = mpc.compute_energy_single(x_goal).detach()
+    E_bottom   = mpc.compute_energy_single(x0).detach()
+    E_span     = (E_goal_det - E_bottom).abs() + 1.0  # normalisation denominator
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
@@ -171,6 +175,24 @@ def train_linearization_network(
         optimizer.zero_grad()
         recorder.start_epoch()
         qp_fallback_start = int(getattr(mpc, 'qp_fallback_count', 0))
+
+        # ── Epoch-level curriculum variables ─────────────────────────────
+        epoch_frac = epoch / max(num_epochs - 1, 1)
+
+        # Energy curriculum: ramp target from 40 % → 100 % of goal energy.
+        # Starting with a reachable target makes the deficit gradient locally
+        # convex before the full upright energy is demanded.
+        E_target_frac = min(1.0, 0.4 + 0.6 * epoch_frac)
+        E_goal_curr   = (E_bottom + E_target_frac * (E_goal_det - E_bottom)).detach()
+
+        # Shrink energy-only phase as training progresses (network gets faster
+        # at building energy so can afford to weight position sooner).
+        energy_phase_end  = max(0.20, ENERGY_PHASE_END_BASE  - 0.25 * epoch_frac)
+        position_phase_in = max(0.35, POSITION_PHASE_IN_BASE - 0.20 * epoch_frac)
+
+        # Waypoint weight fades to 0 after the first 60 % of training.
+        waypoint_weight = W_WAYPOINT * max(0.0, 1.0 - epoch_frac / 0.6)
+        # ─────────────────────────────────────────────────────────────────
 
         current_state_detached = x0.detach().clone()
         state_history = [current_state_detached.clone() for _ in range(5)]
@@ -182,6 +204,7 @@ def train_linearization_network(
         step_losses = []
         energy_terms = []
         pump_rewards = []
+        waypoint_terms = []
         qf_anchor_terms = []
         u_lin_imitation_terms = []
 
@@ -228,32 +251,40 @@ def train_linearization_network(
 
             next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
 
-            # ── Angle-wrapped position error (periodic, handles q1 near ±π) ──
+            # ── Cosine position loss — smooth, bounded, no wrap discontinuity ──
+            # (1-cos(Δ)) ∈ [0,2] has a single global min at Δ=0 and is C∞.
+            # Avoids the cusp that atan2²  can have when Δ crosses ±π.
             err = next_state - x_goal
-            err_q1 = torch.atan2(torch.sin(err[0]), torch.cos(err[0]))
-            err_q2 = torch.atan2(torch.sin(err[2]), torch.cos(err[2]))
-            step_state_err = 3.0 * err_q1**2 + err[1]**2 + 3.0 * err_q2**2 + err[3]**2
+            q1_cost = 1.0 - torch.cos(next_state[0] - x_goal[0])
+            q2_cost = 1.0 - torch.cos(next_state[2] - x_goal[2])
+            step_state_err = 3.0 * q1_cost + err[1]**2 + 3.0 * q2_cost + err[3]**2
 
-            # ── Phase weight: suppress position cost while energy is still building ──
+            # ── Phase weight: suppress position cost while energy still building ─
             t_frac = step / max(num_steps - 1, 1)
-            if t_frac < ENERGY_PHASE_END:
+            if t_frac < energy_phase_end:
                 pos_w = 0.05
-            elif t_frac < POSITION_PHASE_IN:
-                pos_w = 0.05 + 0.95 * (t_frac - ENERGY_PHASE_END) / (POSITION_PHASE_IN - ENERGY_PHASE_END)
+            elif t_frac < position_phase_in:
+                pos_w = 0.05 + 0.95 * (t_frac - energy_phase_end) / (position_phase_in - energy_phase_end)
             else:
                 pos_w = 1.0
 
             step_losses.append(torch.clamp(pos_w * step_state_err, max=STEP_LOSS_CLAMP))
 
+            # ── Waypoint: Gaussian reward centred at q1=π/2 (arm horizontal) ──
+            # Breaks the non-convex leap 0→π into two easier sub-goals.
+            # Fades out once the network consistently passes through it.
+            waypoint_terms.append(torch.exp(-((next_state[0] - math.pi / 2) ** 2) / 0.4))
+
             qf_anchor_terms.append(((Qf_dense - mpc.Qf) ** 2).mean())
 
-            # Single energy computation reused for both deficit loss and pump reward
+            # Energy deficit: use curriculum target (locally convex, gentler gradient).
+            # Pump reward: always gate on the full goal so we never stop pumping.
             E_next = mpc.compute_energy_single(next_state)
-            deficit_next = torch.relu(E_goal_det - E_next) / (E_goal_det.abs() + 1.0)
+            deficit_next = torch.relu(E_goal_curr - E_next) / E_span
             energy_terms.append(deficit_next ** 2)
 
             with torch.no_grad():
-                deficit_w = torch.relu(E_goal_det - E_prev) / (E_goal_det.abs() + 1.0)
+                deficit_w = torch.relu(E_goal_det - E_prev) / E_span
             pump_rewards.append(deficit_w * (E_next - E_prev))
             E_prev = E_next.detach()
 
@@ -288,10 +319,11 @@ def train_linearization_network(
             residual_history.pop(0)
             residual_history.append(delta)
 
-        terminal_loss = torch.stack(step_losses).sum() / num_steps
-        energy_loss = torch.stack(energy_terms).sum() / num_steps
-        pump_loss = -torch.stack(pump_rewards).sum() / num_steps
-        qf_anchor_loss = torch.stack(qf_anchor_terms).mean()
+        terminal_loss    = torch.stack(step_losses).sum() / num_steps
+        energy_loss      = torch.stack(energy_terms).sum() / num_steps
+        pump_loss        = -torch.stack(pump_rewards).sum() / num_steps
+        waypoint_loss    = -torch.stack(waypoint_terms).sum() / num_steps  # negative = reward
+        qf_anchor_loss   = torch.stack(qf_anchor_terms).mean()
         u_lin_imitation_loss = torch.stack(u_lin_imitation_terms).mean()
 
         pump_weight = W_PUMP * min(1.0, float(epoch + 1) / float(PUMP_WARMUP_EPOCHS))
@@ -299,6 +331,7 @@ def train_linearization_network(
             W_TERMINAL * terminal_loss
             + W_ENERGY * energy_loss
             + pump_weight * pump_loss
+            + waypoint_weight * waypoint_loss
             + W_QF_ANCHOR * qf_anchor_loss
             + W_U_LIN_IMITATION * u_lin_imitation_loss
         )
@@ -358,8 +391,11 @@ def train_linearization_network(
                 'learning_rate': optimizer.param_groups[0]['lr'],
                 'loss_terminal': terminal_loss.item(),
                 'loss_pump': pump_loss.item(),
+                'loss_waypoint': waypoint_loss.item(),
                 'loss_qf_anchor': qf_anchor_loss.item(),
                 'pump_weight': pump_weight,
+                'waypoint_weight': waypoint_weight,
+                'e_target_frac': E_target_frac,
                 'qp_fallbacks': qp_fallbacks_epoch,
                 'pure_end_error': goal_dist,
                 'mean_Q_gate_dev': summary.get('mean_Q_gate_dev', float('nan')),
