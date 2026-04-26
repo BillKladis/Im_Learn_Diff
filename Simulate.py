@@ -157,6 +157,8 @@ def train_linearization_network(
         min_lr=1e-6,
     )
     loss_history = []
+    best_goal_dist = float('inf')
+    best_state_dict = None          # best model weights seen during training
 
     if recorder is None:
         recorder = network_module.NetworkOutputRecorder()
@@ -336,9 +338,16 @@ def train_linearization_network(
 
         scheduler.step(torch.nan_to_num(total_loss, nan=1000.0))
 
+        # Track best model by end-of-trajectory goal distance
+        with torch.no_grad():
+            goal_dist = torch.norm(current_state_detached - x_goal).item()
+        if goal_dist < best_goal_dist:
+            best_goal_dist = goal_dist
+            import copy
+            best_state_dict = copy.deepcopy(lin_net.state_dict())
+
         if debug_monitor:
             with torch.no_grad():
-                goal_dist = torch.norm(current_state_detached - x_goal).item()
                 summary = recorder.epoch_summary(epoch)
                 qp_fallbacks_epoch = int(getattr(mpc, 'qp_fallback_count', 0)) - qp_fallback_start
 
@@ -375,6 +384,10 @@ def train_linearization_network(
             if grad_stats["missing_count"] > 0:
                 sample = ", ".join(grad_stats["missing_names"][:5])
                 print(f"      NoGrad sample: {sample}")
+
+    # Restore best weights so the caller gets the best-seen model, not the last
+    if best_state_dict is not None:
+        lin_net.load_state_dict(best_state_dict)
 
     return loss_history, recorder
 

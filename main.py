@@ -348,6 +348,7 @@ def main():
     dist_final = np.linalg.norm(x_final_np[-1] - x_goal_np)
     dist_first = np.linalg.norm(x_first_np[-1] - x_goal_np)
     print(f"  Trained final goal distance : {dist_final:.4f}  (was {dist_first:.4f})")
+    print(f"  (Note: model restored to best-seen checkpoint before final rollout)")
 
     # Save
     print()
