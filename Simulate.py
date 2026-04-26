@@ -4,8 +4,72 @@ import mpc_controller
 import torch
 import torch.nn as nn
 from typing import Optional, List, Tuple
+from torch.func import jacrev
 
 import lin_net as network_module
+
+
+# ── Task-specific energy shaping ─────────────────────────────────────────────
+# These helpers live here, not in mpc_controller, so that swapping to a new
+# system only requires editing Simulate.py (or a task-specific file).
+
+def _compute_q1_energy(x: torch.Tensor) -> torch.Tensor:
+    """
+    Single-link effective energy for q1 — structurally zero gradient w.r.t. q2
+    and q2_dot, so no projection is ever needed and q2 coupling is impossible.
+
+    Treats the double pendulum as an effective pendulum of mass (m1+m2) at l1.
+    Goal energy gap: V(π) − V(0) = 2·(m1+m2)·g·l1 = 19.62 J.
+    """
+    q1, q1_dot = x[0], x[1]
+    m_eff, l_eff, g = 2.0, 0.5, 9.81
+    return 0.5 * m_eff * (l_eff * q1_dot) ** 2 - m_eff * g * l_eff * torch.cos(q1)
+
+
+def _build_energy_linear(
+    u_lin_seq: torch.Tensor,
+    current_state: torch.Tensor,
+    mpc: "mpc_controller.MPC_controller",
+    gates_E: torch.Tensor,
+    E_q1_goal: torch.Tensor,
+    w_e_base: float = 25.0,
+) -> torch.Tensor:
+    """
+    Compute the extra_linear_state vector (N*nx,) for q1-only energy shaping.
+
+    Uses the q1-only effective energy so that dE/dq2 = dE/dq2_dot = 0 by
+    construction — no gradient projection required, and q2 is never driven
+    by the energy term.  gates_E from the network gates the shaping weight at
+    each horizon step, preserving the gradient path to network parameters.
+    """
+    N, nx = mpc.N, 4
+    device = mpc.device
+
+    # Nominal rollout under current warm-start (detached — same as QP_formulation).
+    X_bar_list: list = []
+    curr = current_state.detach()
+    for i in range(N):
+        curr = mpc.MPC_RK4_disc(curr, u_lin_seq[i].detach(), mpc.dt)
+        X_bar_list.append(curr)
+    X_bar_seq = torch.stack(X_bar_list)  # (N, nx)
+
+    linear_E = torch.zeros(N * nx, device=device, dtype=torch.float64)
+    E_curr = torch.stack([_compute_q1_energy(X_bar_seq[i]) for i in range(N)])
+
+    for i in range(N):
+        idx = slice(i * nx, (i + 1) * nx)
+        e_i  = E_curr[i] - E_q1_goal            # negative = energy deficit
+        gate = gates_E[i]                        # network gate: only grad path
+
+        deficit_norm = torch.relu(-e_i) / (2.0 * E_q1_goal.abs() + 1.0)
+        w_k = w_e_base * gate * (1.0 + 2.0 * deficit_norm ** 2)
+
+        # g_i indices 2 and 3 are exactly zero — no coupling to q2 / q2_dot
+        g_i = jacrev(_compute_q1_energy)(X_bar_seq[i])
+        linear_E[idx] = w_k * e_i * g_i
+
+    return linear_E
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _gradient_stats(lin_net: nn.Module) -> dict:
@@ -65,6 +129,8 @@ def gradient_flow_smoke_test(
     residual_history = [zero_residual.clone() for _ in range(n_res)]
     u_seq_guess = torch.zeros((mpc.N, n_u), device=mpc.device, dtype=torch.float64)
 
+    E_q1_goal_smoke = _compute_q1_energy(x_goal).detach()
+
     step_losses = []
     for _ in range(num_steps):
         gates_Q, gates_R, gates_E, Qf_dense, _, _, u_lin_delta = lin_net(
@@ -80,11 +146,14 @@ def gradient_flow_smoke_test(
             min=mpc.MPC_dynamics.u_min.unsqueeze(0),
             max=mpc.MPC_dynamics.u_max.unsqueeze(0),
         )
+        extra_linear = _build_energy_linear(
+            u_lin_seq, current_state, mpc, gates_E, E_q1_goal_smoke,
+        )
         u_mpc, U_opt_full = mpc.control(
             current_state, x_lin_seq, u_lin_seq, x_goal,
             diag_corrections_Q=gates_Q,
             diag_corrections_R=gates_R,
-            gates_E=gates_E,
+            extra_linear_state=extra_linear,
             Qf_dense=Qf_dense,
         )
 
@@ -126,11 +195,12 @@ def train_linearization_network(
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     W_TERMINAL = 1.0
-    W_ENERGY = 1.5      # energy-deficit loss
+    W_ENERGY = 1.5      # energy-deficit loss (full system energy, for training signal)
     W_PUMP = 5.0        # pump reward
     W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
     W_Q2_SHAPE = 3.0    # always-on anti-fold cost: keeps q2 near 0 throughout
     W_Q2_DOT = 0.5      # always-on q2_dot velocity penalty: limits Coriolis-driven folding
+    W_E_SHAPE = 25.0    # base weight for MPC energy-shaping linear term (q1-only energy)
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
@@ -165,6 +235,9 @@ def train_linearization_network(
     E_goal_det = mpc.compute_energy_single(x_goal).detach()
     E_bottom   = mpc.compute_energy_single(x0).detach()
     E_span     = (E_goal_det - E_bottom).abs() + 1.0  # normalisation denominator
+
+    # q1-only effective energy at the goal — used for MPC shaping (zero q2 coupling)
+    E_q1_goal = _compute_q1_energy(x_goal).detach()
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
@@ -229,6 +302,11 @@ def train_linearization_network(
                 max=mpc.MPC_dynamics.u_max.unsqueeze(0),
             )
 
+            # q1-only energy shaping linear term — gradient path preserved through gates_E
+            extra_linear = _build_energy_linear(
+                u_lin_seq, current_state_detached, mpc, gates_E, E_q1_goal, W_E_SHAPE,
+            )
+
             u_mpc, U_opt_full = mpc.control(
                 current_state_detached,
                 x_lin_seq,
@@ -236,7 +314,7 @@ def train_linearization_network(
                 x_goal,
                 diag_corrections_Q=gates_Q,
                 diag_corrections_R=gates_R,
-                gates_E=gates_E,
+                extra_linear_state=extra_linear,
                 Qf_dense=Qf_dense,
             )
 
@@ -455,6 +533,7 @@ def rollout(
     x_hist[0] = x
     u_seq_guess = torch.zeros((mpc.N, n_u), dtype=torch.float64, device=mpc.device)
     state_history = [x.clone() for _ in range(5)]
+    E_q1_goal_rollout = _compute_q1_energy(x_goal).detach()
 
     if lin_net is not None:
         lin_net.eval()
@@ -483,6 +562,11 @@ def rollout(
             max=mpc.MPC_dynamics.u_max.unsqueeze(0),
         )
 
+        extra_linear = (
+            _build_energy_linear(u_lin_seq, x, mpc, gates_E, E_q1_goal_rollout)
+            if gates_E is not None else None
+        )
+
         u_opt, U_opt_full = mpc.control(
             x,
             x_lin_seq,
@@ -490,7 +574,7 @@ def rollout(
             x_goal,
             diag_corrections_Q=gates_Q,
             diag_corrections_R=gates_R,
-            gates_E=gates_E,
+            extra_linear_state=extra_linear,
             Qf_dense=Qf_dense,
         )
 

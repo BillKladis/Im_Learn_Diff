@@ -25,9 +25,6 @@ class MPC_controller:
         self.q_base_diag = torch.tensor([12.0, 5.0, 30.0, 25.0], device=device, dtype=torch.float64)
         self.r_base_diag = torch.tensor([1.0, 1.0], device=device, dtype=torch.float64)
         self.Qf = torch.diag(torch.tensor([20.0, 20.0, 40.0, 30.0], device=device, dtype=torch.float64))
-        
-        # Base penalty weight for energy shaping
-        self.w_e_base = 25.0
 
         self.true_dynamics = true_dynamics.DoublePendulumDynamics(device=device)
         self.MPC_dynamics  = MPC_dynamics.DoublePendulumDynamics(device=device)
@@ -155,21 +152,25 @@ class MPC_controller:
         self,
         B_big: torch.Tensor,
         X_bar: torch.Tensor,
-        X_bar_seq: torch.Tensor,
         U_bar: torch.Tensor,
         x_goal: torch.Tensor,
-        Q_bar: torch.Tensor, 
+        Q_bar: torch.Tensor,
         R_diag: torch.Tensor,
-        gates_E: Optional[torch.Tensor] = None, 
+        extra_linear_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+        """
+        Build the QP cost matrices.
+
+        extra_linear_state: optional (N*nx,) vector added to the linear state cost.
+        Callers (e.g. Simulate.py) use this for energy shaping, waypoint rewards, or
+        any other task-specific linear cost — the MPC has no knowledge of its origin.
+        """
         X_ref = x_goal.unsqueeze(0).expand(self.N, -1).reshape(-1)
         E_raw = X_bar - X_ref
 
         # ── ANGLE WRAPPING for q1 (idx 0 mod 4) and q2 (idx 2 mod 4) ────
-        # Prevents misdirected cost gradients when predicted angles cross ±π.
-        # atan2(sin(Δ), cos(Δ)) maps any error to (−π, π] without changing
-        # the sign or magnitude for small errors, so the QP stays valid.
+        # atan2(sin(Δ), cos(Δ)) maps any angle error to (−π, π] without changing
+        # sign or magnitude for small errors, so the QP gradient is always correct.
         q1_idx = torch.arange(0, 4 * self.N, 4, device=self.device)
         q2_idx = torch.arange(2, 4 * self.N, 4, device=self.device)
         angle_idx = torch.cat([q1_idx, q2_idx])
@@ -177,39 +178,13 @@ class MPC_controller:
         E[angle_idx] = torch.atan2(torch.sin(E_raw[angle_idx]),
                                    torch.cos(E_raw[angle_idx]))
 
-        # ── ENERGY SHAPING ──────────────────────────────────────────
-        E_goal = self.compute_energy_single(x_goal)
-        E_curr = vmap(self.compute_energy_single)(X_bar_seq)   # (N,)
-
-        linear_E = torch.zeros_like(E)
-
-        for i in range(self.N):
-            idx = slice(i*4, (i+1)*4)
-            e_i = E_curr[i] - E_goal          # scalar energy error (negative = deficit)
-            gate = gates_E[i] if gates_E is not None else 1.0
-
-            # Adaptive weight: scale up quadratically when energy deficit is large.
-            # Multiplier reduced 3.0→2.0: softer energy push means lower q1_dot peak,
-            # which reduces Coriolis torque and keeps q2 from folding.
-            deficit_norm = torch.relu(-e_i) / (2.0 * E_goal.abs() + 1.0)  # ∈ [0, 1]
-            w_k = self.w_e_base * gate * (1.0 + 2.0 * deficit_norm ** 2)
-
-            # dE/dx evaluated at predicted state X_bar_seq[i]
-            g_i = jacrev(self.compute_energy_single)(X_bar_seq[i])
-
-            # Linear term only: pushes the QP toward controls that increase energy.
-            # No rank-1 Hessian block — Q_bar stays well-conditioned.
-            # NOTE: q2/q2_dot components are kept (not projected out) so energy can
-            # be pumped through both joints. Projecting to q1-only forces higher q1_dot,
-            # which increases Coriolis torque and worsens q2 folding.
-            linear_E[idx] = w_k * e_i * g_i
-
-        # Q_bar_total is just Q_bar — no Q_energy added to Hessian
         H = 2.0 * (B_big.T @ Q_bar @ B_big) + torch.diag(2.0 * R_diag)
         H = 0.5 * (H + H.T)
         H = H + 1e-4 * torch.eye(H.shape[0], device=self.device, dtype=torch.float64)
 
-        state_linear_term = 2.0 * (Q_bar @ E) + linear_E
+        state_linear_term = 2.0 * (Q_bar @ E)
+        if extra_linear_state is not None:
+            state_linear_term = state_linear_term + extra_linear_state
         f = B_big.T @ state_linear_term + 2.0 * (R_diag * U_bar)
 
         return H, f
@@ -222,41 +197,41 @@ class MPC_controller:
     def QP_formulation(
         self,
         current_state: torch.Tensor,
-        u_guess_seq: torch.Tensor, 
+        u_guess_seq: torch.Tensor,
         x_goal: Optional[torch.Tensor] = None,
         diag_corrections_Q: Optional[torch.Tensor] = None,
         diag_corrections_R: Optional[torch.Tensor] = None,
-        gates_E: Optional[torch.Tensor] = None,
+        extra_linear_state: Optional[torch.Tensor] = None,
         Qf_dense: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         x_op_list = []
         X_bar_list = []
         curr_x = current_state
-        
+
         for i in range(self.N):
-            x_op_list.append(curr_x) 
+            x_op_list.append(curr_x)
             curr_x = self.MPC_RK4_disc(curr_x, u_guess_seq[i], self.dt)
             X_bar_list.append(curr_x)
-            
+
         x_op_seq = torch.stack(x_op_list)
-        X_bar_seq = torch.stack(X_bar_list)
-        X_bar = torch.cat(X_bar_list)
-        U_bar = u_guess_seq.reshape(-1)   
+        X_bar    = torch.cat(X_bar_list)
+        U_bar    = u_guess_seq.reshape(-1)
 
         A_list, B_list = self.linearize_horizon(x_op_seq, u_guess_seq)
         _, B_big = self.build_prediction_matrices(A_list, B_list)
-        
+
         Q_bar, R_diag = self.build_cost_matrices(
             diag_corrections_Q=diag_corrections_Q,
             diag_corrections_R=diag_corrections_R,
-            Qf_dense=Qf_dense, 
+            Qf_dense=Qf_dense,
         )
-        
+
         H, f = self.build_qp_matrices_delta(
-            B_big, X_bar, X_bar_seq, U_bar, x_goal, Q_bar, R_diag, gates_E=gates_E,
+            B_big, X_bar, U_bar, x_goal, Q_bar, R_diag,
+            extra_linear_state=extra_linear_state,
         )
-        
+
         return H, f, U_bar
 
     def solve_mpc_qp(self, H, f, lb, ub):
@@ -300,15 +275,15 @@ class MPC_controller:
         x_goal: torch.Tensor,
         diag_corrections_Q: Optional[torch.Tensor] = None,
         diag_corrections_R: Optional[torch.Tensor] = None,
-        gates_E: Optional[torch.Tensor] = None,
-        Qf_dense: Optional[torch.Tensor] = None, 
+        extra_linear_state: Optional[torch.Tensor] = None,
+        Qf_dense: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+
         H, f, U_bar = self.QP_formulation(
             current_state, u_lin_seq, x_goal,
             diag_corrections_Q=diag_corrections_Q,
             diag_corrections_R=diag_corrections_R,
-            gates_E=gates_E,
+            extra_linear_state=extra_linear_state,
             Qf_dense=Qf_dense,
         )
         
