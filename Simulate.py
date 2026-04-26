@@ -130,10 +130,12 @@ def train_linearization_network(
     W_PUMP = 5.0        # stronger pump reward
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
+    W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
     STEP_LOSS_CLAMP = 200.0
-    CLIP_QF_HEAD = 10.0
-    CLIP_OTHER = 50.0
-    SKIP_UPDATE_GRAD_NORM = 1e10
+    CLIP_QF_HEAD = 5.0
+    CLIP_U_LIN = 2.0
+    CLIP_OTHER = 5.0
+    SKIP_UPDATE_GRAD_NORM = 5e7
 
     # Phase-aware curriculum boundaries (fraction of num_steps)
     ENERGY_PHASE_END   = 0.50   # pure energy-building up to 50 %
@@ -179,6 +181,7 @@ def train_linearization_network(
         energy_terms = []
         pump_rewards = []
         qf_anchor_terms = []
+        u_lin_imitation_terms = []
 
         E_prev = mpc.compute_energy_single(current_state_detached).detach()
 
@@ -195,9 +198,11 @@ def train_linearization_network(
 
             x_lin_seq = current_state_detached.unsqueeze(0).expand(mpc.N, -1).clone()
 
-            u_lin_seq = u_seq_guess.clone() + u_lin_delta
+            # Detach u_lin from the QP warm-start gradient path: backprop through
+            # 170 QP solves w.r.t. the warm-start input accumulates explosively.
+            # u_lin_head is trained separately via imitation loss below.
             u_lin_seq = torch.clamp(
-                u_lin_seq,
+                u_seq_guess.clone() + u_lin_delta.detach(),
                 min=mpc.MPC_dynamics.u_min.unsqueeze(0),
                 max=mpc.MPC_dynamics.u_max.unsqueeze(0),
             )
@@ -211,6 +216,12 @@ def train_linearization_network(
                 diag_corrections_R=gates_R,
                 gates_E=gates_E,
                 Qf_dense=Qf_dense,
+            )
+
+            # Imitation loss: train u_lin_head to predict the first MPC action.
+            # Gradient is simple (no QP), preventing the warm-start explosion.
+            u_lin_imitation_terms.append(
+                ((u_lin_delta[0] - u_mpc.detach()) ** 2).mean()
             )
 
             next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
@@ -232,17 +243,15 @@ def train_linearization_network(
 
             step_losses.append(torch.clamp(pos_w * step_state_err, max=STEP_LOSS_CLAMP))
 
-            # ── Energy-deficit loss: penalise being below goal energy ──
-            E_next = mpc.compute_energy_single(next_state)
-            deficit = torch.relu(E_goal_det - E_next) / (E_goal_det.abs() + 1.0)
-            energy_terms.append(deficit ** 2)
-
             qf_anchor_terms.append(((Qf_dense - mpc.Qf) ** 2).mean())
 
+            # Single energy computation reused for both deficit loss and pump reward
             E_next = mpc.compute_energy_single(next_state)
+            deficit_next = torch.relu(E_goal_det - E_next) / (E_goal_det.abs() + 1.0)
+            energy_terms.append(deficit_next ** 2)
+
             with torch.no_grad():
-                deficit = torch.relu(E_goal_det - E_prev)
-                deficit_w = deficit / (E_goal_det.abs() + 1.0)
+                deficit_w = torch.relu(E_goal_det - E_prev) / (E_goal_det.abs() + 1.0)
             pump_rewards.append(deficit_w * (E_next - E_prev))
             E_prev = E_next.detach()
 
@@ -277,6 +286,7 @@ def train_linearization_network(
         energy_loss = torch.stack(energy_terms).sum() / num_steps
         pump_loss = -torch.stack(pump_rewards).sum() / num_steps
         qf_anchor_loss = torch.stack(qf_anchor_terms).mean()
+        u_lin_imitation_loss = torch.stack(u_lin_imitation_terms).mean()
 
         pump_weight = W_PUMP * min(1.0, float(epoch + 1) / float(PUMP_WARMUP_EPOCHS))
         total_loss = (
@@ -284,6 +294,7 @@ def train_linearization_network(
             + W_ENERGY * energy_loss
             + pump_weight * pump_loss
             + W_QF_ANCHOR * qf_anchor_loss
+            + W_U_LIN_IMITATION * u_lin_imitation_loss
         )
 
         loss_history.append(total_loss.item())
@@ -308,12 +319,15 @@ def train_linearization_network(
                 if grad_stats is not None and grad_stats["total_norm"] > SKIP_UPDATE_GRAD_NORM:
                     optimizer.zero_grad()
                 else:
-                    qf_grad_params = [p for n, p in lin_net.named_parameters() if n.startswith("qf_head") and p.grad is not None]
-                    other_grad_params = [p for n, p in lin_net.named_parameters() if (not n.startswith("qf_head")) and p.grad is not None]
-                    if qf_grad_params:
-                        torch.nn.utils.clip_grad_norm_(qf_grad_params, max_norm=CLIP_QF_HEAD)
-                    if other_grad_params:
-                        torch.nn.utils.clip_grad_norm_(other_grad_params, max_norm=CLIP_OTHER)
+                    qf_params    = [p for n, p in lin_net.named_parameters() if n.startswith("qf_head")    and p.grad is not None]
+                    u_lin_params = [p for n, p in lin_net.named_parameters() if n.startswith("u_lin_head") and p.grad is not None]
+                    other_params = [p for n, p in lin_net.named_parameters() if (not n.startswith("qf_head")) and (not n.startswith("u_lin_head")) and p.grad is not None]
+                    if qf_params:
+                        torch.nn.utils.clip_grad_norm_(qf_params,    max_norm=CLIP_QF_HEAD)
+                    if u_lin_params:
+                        torch.nn.utils.clip_grad_norm_(u_lin_params, max_norm=CLIP_U_LIN)
+                    if other_params:
+                        torch.nn.utils.clip_grad_norm_(other_params, max_norm=CLIP_OTHER)
                     optimizer.step()
 
         scheduler.step(torch.nan_to_num(total_loss, nan=1000.0))
