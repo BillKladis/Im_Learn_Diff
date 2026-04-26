@@ -272,7 +272,11 @@ def train_linearization_network(
                 u_lin_delta=u_lin_delta,
             )
 
-            current_state_detached = next_state
+            # Detach state to cut gradient accumulation across 170 QP steps.
+            # Without this, each step's QP Jacobian multiplies into the previous,
+            # producing gradient norms that grow exponentially with trajectory length.
+            # Each step still contributes a clean one-step gradient to the network.
+            current_state_detached = next_state.detach()
 
             U_opt_reshaped = U_opt_full.detach().view(mpc.N, n_u)
             u_seq_guess = torch.cat([U_opt_reshaped[1:], U_opt_reshaped[-1:]], dim=0).clone()
