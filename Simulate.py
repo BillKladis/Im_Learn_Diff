@@ -311,6 +311,16 @@ def train_linearization_network(
         if grad_debug and ((epoch + 1) % max(1, grad_debug_every) == 0 or epoch == 0):
             grad_stats = _gradient_stats(lin_net)
 
+        # Track best model BEFORE the optimizer step: goal_dist reflects the
+        # trajectory produced by the CURRENT weights. Saving after step would
+        # record the updated (different) weights instead.
+        with torch.no_grad():
+            goal_dist = torch.norm(current_state_detached - x_goal).item()
+        if goal_dist < best_goal_dist:
+            best_goal_dist = goal_dist
+            import copy
+            best_state_dict = copy.deepcopy(lin_net.state_dict())
+
         if not torch.isfinite(total_loss):
             optimizer.zero_grad()
         else:
@@ -337,14 +347,6 @@ def train_linearization_network(
                     optimizer.step()
 
         scheduler.step(torch.nan_to_num(total_loss, nan=1000.0))
-
-        # Track best model by end-of-trajectory goal distance
-        with torch.no_grad():
-            goal_dist = torch.norm(current_state_detached - x_goal).item()
-        if goal_dist < best_goal_dist:
-            best_goal_dist = goal_dist
-            import copy
-            best_state_dict = copy.deepcopy(lin_net.state_dict())
 
         if debug_monitor:
             with torch.no_grad():
