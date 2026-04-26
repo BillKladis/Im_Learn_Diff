@@ -36,8 +36,8 @@ X_GOAL    = [math.pi, 0.0, 0.0, 0.0] # [q1, q1_dot, q2, q2_dot] — perfectly up
 NUM_STEPS = 170
 DT        = 0.05                      # seconds
 
-EPOCHS      = 50
-LR          = 3e-4
+EPOCHS      = 30
+LR          = 1e-4
 HORIZON     = 10
 HIDDEN_DIM  = 128
 GATE_RANGE_Q = 0.50   # reduced: limits q2 cost suppression to ≤50% (was 75%)

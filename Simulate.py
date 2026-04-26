@@ -216,12 +216,12 @@ def train_linearization_network(
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     W_TERMINAL = 1.0
-    W_ENERGY = 1.5      # energy-deficit loss (full system energy, for training signal)
-    W_PUMP = 3.0        # pump reward (reduced: less aggressive energy injection)
-    W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
-    W_Q2_SHAPE = 8.0    # anti-fold cost: strong penalty keeps q2 near 0
-    W_Q2_DOT = 1.5      # q2_dot velocity penalty: damps Coriolis-driven folding
-    W_E_SHAPE = 20.0    # base weight for MPC energy-shaping (τ1-only, control space)
+    W_ENERGY = 0.5      # energy-deficit loss (lighter: L_base q1_dot fix handles overshoot)
+    W_PUMP = 1.0        # pump reward (lighter: energy shaping via QP; training convergence)
+    W_WAYPOINT = 1.5    # reward for passing through q1=π/2 waypoint (fades over training)
+    W_Q2_SHAPE = 4.0    # anti-fold cost: L_base Qf already enforces q2≈0 effectively
+    W_Q2_DOT = 0.5      # q2_dot velocity penalty: lighter now that q2 is well-controlled
+    W_E_SHAPE = 15.0    # base weight for MPC energy-shaping (τ1-only, control space)
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output

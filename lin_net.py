@@ -97,13 +97,16 @@ class LinearizationNetwork(nn.Module):
         )
 
         # ── Expert Seeded Baseline ─────────────────────────────────────
+        # Qf diagonal: [q1=20, q1_dot=60, q2=30, q2_dot=30]
+        # Higher q1_dot terminal weight prevents overshoot during swing-up.
+        # q2/q2_dot weights match the Q matrix's anti-fold priorities.
         base_L_matrix = torch.zeros((state_dim, state_dim), dtype=torch.float64)
-        base_L_matrix[0, 0] = math.sqrt(20.0) 
-        base_L_matrix[1, 1] = math.sqrt(20.0)  
-        base_L_matrix[2, 2] = math.sqrt(20.0) 
-        base_L_matrix[3, 3] = math.sqrt(20.0)  
-        base_L_matrix[1, 0] = 1.0  
-        base_L_matrix[3, 2] = 1.0 
+        base_L_matrix[0, 0] = math.sqrt(20.0)   # Qf_q1     ≈ 20
+        base_L_matrix[1, 1] = math.sqrt(60.0)   # Qf_q1dot  ≈ 60 (prevents overshoot)
+        base_L_matrix[2, 2] = math.sqrt(30.0)   # Qf_q2     ≈ 30
+        base_L_matrix[3, 3] = math.sqrt(30.0)   # Qf_q2dot  ≈ 30
+        base_L_matrix[1, 0] = 1.0
+        base_L_matrix[3, 2] = 1.0
 
         tril_idx = torch.tril_indices(row=state_dim, col=state_dim, offset=0)
         base_L_flat = base_L_matrix[tril_idx[0], tril_idx[1]]
