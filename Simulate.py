@@ -32,7 +32,7 @@ def _build_energy_linear(
     mpc: "mpc_controller.MPC_controller",
     gates_E: torch.Tensor,
     E_q1_goal: torch.Tensor,
-    w_e_base: float = 25.0,
+    w_e_base: float = 10.0,
 ) -> torch.Tensor:
     """
     Compute the extra_linear_state vector (N*nx,) for q1-only energy shaping.
@@ -41,6 +41,11 @@ def _build_energy_linear(
     construction — no gradient projection required, and q2 is never driven
     by the energy term.  gates_E from the network gates the shaping weight at
     each horizon step, preserving the gradient path to network parameters.
+
+    The cost is a symmetric quadratic: gradient of 0.5*w*(E-E_goal)^2.
+    This penalises both deficit and excess energy, preventing the system from
+    shooting past the top. A smooth angle gate fades the shaping to zero near
+    q1=π so position tracking can dominate for the final stabilisation.
     """
     N, nx = mpc.N, 4
     device = mpc.device
@@ -58,15 +63,24 @@ def _build_energy_linear(
 
     for i in range(N):
         idx = slice(i * nx, (i + 1) * nx)
-        e_i  = E_curr[i] - E_q1_goal            # negative = energy deficit
-        gate = gates_E[i]                        # network gate: only grad path
+        e_i  = E_curr[i] - E_q1_goal   # signed: negative = deficit, positive = excess
+        gate = gates_E[i]               # network gate: only grad path
 
-        deficit_norm = torch.relu(-e_i) / (2.0 * E_q1_goal.abs() + 1.0)
-        w_k = w_e_base * gate * (1.0 + 2.0 * deficit_norm ** 2)
+        # Simple symmetric quadratic weight — no deficit amplification.
+        w_k = w_e_base * gate
+
+        # Smooth angle gate: turns off energy shaping as q1 approaches π.
+        # Prevents the energy term from fighting position tracking near the top.
+        # Exactly 0 at q1=π; ≈1 when more than ~90° away.
+        q1_i = X_bar_seq[i][0]
+        dist_top = torch.abs(torch.atan2(
+            torch.sin(q1_i - math.pi), torch.cos(q1_i - math.pi)
+        ))
+        angle_gate = 1.0 - torch.exp(-3.0 * dist_top ** 2)
 
         # g_i indices 2 and 3 are exactly zero — no coupling to q2 / q2_dot
         g_i = jacrev(_compute_q1_energy)(X_bar_seq[i])
-        linear_E[idx] = w_k * e_i * g_i
+        linear_E[idx] = w_k * angle_gate * e_i * g_i
 
     return linear_E
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,7 +214,7 @@ def train_linearization_network(
     W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
     W_Q2_SHAPE = 3.0    # always-on anti-fold cost: keeps q2 near 0 throughout
     W_Q2_DOT = 0.5      # always-on q2_dot velocity penalty: limits Coriolis-driven folding
-    W_E_SHAPE = 25.0    # base weight for MPC energy-shaping linear term (q1-only energy)
+    W_E_SHAPE = 10.0    # base weight for MPC energy-shaping linear term (q1-only energy)
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
