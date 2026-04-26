@@ -126,14 +126,18 @@ def train_linearization_network(
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     W_TERMINAL = 1.0
-    W_ENERGY = 0.0
-    W_PUMP = 2.0
-    PUMP_WARMUP_EPOCHS = 5
+    W_ENERGY = 1.5      # energy-deficit loss (replaces disabled control-effort loss)
+    W_PUMP = 5.0        # stronger pump reward
+    PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     STEP_LOSS_CLAMP = 200.0
     CLIP_QF_HEAD = 10.0
     CLIP_OTHER = 50.0
     SKIP_UPDATE_GRAD_NORM = 1e10
+
+    # Phase-aware curriculum boundaries (fraction of num_steps)
+    ENERGY_PHASE_END   = 0.50   # pure energy-building up to 50 %
+    POSITION_PHASE_IN  = 0.65   # position loss fully active at 65 %
 
     n_res = lin_net.n_res
     state_dim = lin_net.state_dim
@@ -210,9 +214,29 @@ def train_linearization_network(
             )
 
             next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
-            step_state_err = ((next_state - x_goal) ** 2).sum()
-            step_losses.append(torch.clamp(step_state_err, max=STEP_LOSS_CLAMP))
-            energy_terms.append((u_mpc ** 2).sum())
+
+            # ── Angle-wrapped position error (periodic, handles q1 near ±π) ──
+            err = next_state - x_goal
+            err_q1 = torch.atan2(torch.sin(err[0]), torch.cos(err[0]))
+            err_q2 = torch.atan2(torch.sin(err[2]), torch.cos(err[2]))
+            step_state_err = 3.0 * err_q1**2 + err[1]**2 + 3.0 * err_q2**2 + err[3]**2
+
+            # ── Phase weight: suppress position cost while energy is still building ──
+            t_frac = step / max(num_steps - 1, 1)
+            if t_frac < ENERGY_PHASE_END:
+                pos_w = 0.05
+            elif t_frac < POSITION_PHASE_IN:
+                pos_w = 0.05 + 0.95 * (t_frac - ENERGY_PHASE_END) / (POSITION_PHASE_IN - ENERGY_PHASE_END)
+            else:
+                pos_w = 1.0
+
+            step_losses.append(torch.clamp(pos_w * step_state_err, max=STEP_LOSS_CLAMP))
+
+            # ── Energy-deficit loss: penalise being below goal energy ──
+            E_next = mpc.compute_energy_single(next_state)
+            deficit = torch.relu(E_goal_det - E_next) / (E_goal_det.abs() + 1.0)
+            energy_terms.append(deficit ** 2)
+
             qf_anchor_terms.append(((Qf_dense - mpc.Qf) ** 2).mean())
 
             E_next = mpc.compute_energy_single(next_state)

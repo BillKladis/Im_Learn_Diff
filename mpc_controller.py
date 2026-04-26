@@ -25,7 +25,7 @@ class MPC_controller:
         self.Qf = torch.diag(torch.tensor([20.0, 20.0, 20.0, 20.0], device=device, dtype=torch.float64))
         
         # Base penalty weight for energy shaping
-        self.w_e_base = 10.0 
+        self.w_e_base = 25.0
 
         self.true_dynamics = true_dynamics.DoublePendulumDynamics(device=device)
         self.MPC_dynamics  = MPC_dynamics.DoublePendulumDynamics(device=device)
@@ -162,7 +162,18 @@ class MPC_controller:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
         X_ref = x_goal.unsqueeze(0).expand(self.N, -1).reshape(-1)
-        E = X_bar - X_ref 
+        E_raw = X_bar - X_ref
+
+        # ── ANGLE WRAPPING for q1 (idx 0 mod 4) and q2 (idx 2 mod 4) ────
+        # Prevents misdirected cost gradients when predicted angles cross ±π.
+        # atan2(sin(Δ), cos(Δ)) maps any error to (−π, π] without changing
+        # the sign or magnitude for small errors, so the QP stays valid.
+        q1_idx = torch.arange(0, 4 * self.N, 4, device=self.device)
+        q2_idx = torch.arange(2, 4 * self.N, 4, device=self.device)
+        angle_idx = torch.cat([q1_idx, q2_idx])
+        E = E_raw.clone()
+        E[angle_idx] = torch.atan2(torch.sin(E_raw[angle_idx]),
+                                   torch.cos(E_raw[angle_idx]))
 
         # ── ENERGY SHAPING ──────────────────────────────────────────
         E_goal = self.compute_energy_single(x_goal)
@@ -172,8 +183,13 @@ class MPC_controller:
 
         for i in range(self.N):
             idx = slice(i*4, (i+1)*4)
-            e_i = E_curr[i] - E_goal          # scalar energy error
-            w_k = self.w_e_base * (gates_E[i] if gates_E is not None else 1.0)
+            e_i = E_curr[i] - E_goal          # scalar energy error (negative = deficit)
+            gate = gates_E[i] if gates_E is not None else 1.0
+
+            # Adaptive weight: scale up quadratically when energy deficit is large
+            # so energy pumping dominates position error during swing-up.
+            deficit_norm = torch.relu(-e_i) / (2.0 * E_goal.abs() + 1.0)  # ∈ [0, 1]
+            w_k = self.w_e_base * gate * (1.0 + 5.0 * deficit_norm ** 2)
 
             # dE/dx evaluated at predicted state X_bar_seq[i]
             g_i = jacrev(self.compute_energy_single)(X_bar_seq[i])
@@ -182,7 +198,7 @@ class MPC_controller:
             # No rank-1 Hessian block — Q_bar stays well-conditioned.
             linear_E[idx] = w_k * e_i * g_i
 
-        # Q_bar_total is just Q_bar — no Q_energy added
+        # Q_bar_total is just Q_bar — no Q_energy added to Hessian
         H = 2.0 * (B_big.T @ Q_bar @ B_big) + torch.diag(2.0 * R_diag)
         H = 0.5 * (H + H.T)
         H = H + 1e-4 * torch.eye(H.shape[0], device=self.device, dtype=torch.float64)
