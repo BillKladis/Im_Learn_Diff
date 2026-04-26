@@ -189,10 +189,18 @@ class MPC_controller:
             # Adaptive weight: scale up quadratically when energy deficit is large
             # so energy pumping dominates position error during swing-up.
             deficit_norm = torch.relu(-e_i) / (2.0 * E_goal.abs() + 1.0)  # ∈ [0, 1]
-            w_k = self.w_e_base * gate * (1.0 + 5.0 * deficit_norm ** 2)
+            w_k = self.w_e_base * gate * (1.0 + 3.0 * deficit_norm ** 2)
 
             # dE/dx evaluated at predicted state X_bar_seq[i]
             g_i = jacrev(self.compute_energy_single)(X_bar_seq[i])
+
+            # Project out q2 and q2_dot from the energy gradient.
+            # dE/dq2 = m2·g·l2·sin(q1+q2) is non-zero during swing-up and pushes the
+            # QP to fold q2 to build energy. Zeroing these forces energy pumping to
+            # happen only through q1, producing a smooth single-arc swing-up.
+            g_i = g_i.clone()
+            g_i[2] = 0.0   # q2 component
+            g_i[3] = 0.0   # q2_dot component
 
             # Linear term only: pushes the QP toward controls that increase energy.
             # No rank-1 Hessian block — Q_bar stays well-conditioned.

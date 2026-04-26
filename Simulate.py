@@ -126,9 +126,10 @@ def train_linearization_network(
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     W_TERMINAL = 1.0
-    W_ENERGY = 1.5      # energy-deficit loss (replaces disabled control-effort loss)
-    W_PUMP = 5.0        # stronger pump reward
+    W_ENERGY = 1.5      # energy-deficit loss
+    W_PUMP = 5.0        # pump reward
     W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
+    W_Q2_SHAPE = 2.0    # always-on anti-fold cost: keeps q2 near 0 throughout
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
@@ -246,24 +247,27 @@ def train_linearization_network(
 
             next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
 
-            # ── Cosine position loss — smooth, bounded, no wrap discontinuity ──
-            # (1-cos(Δ)) ∈ [0,2] has a single global min at Δ=0 and is C∞.
-            # Avoids the cusp that atan2²  can have when Δ crosses ±π.
-            err = next_state - x_goal
-            q1_cost = 1.0 - torch.cos(next_state[0] - x_goal[0])
-            q2_cost = 1.0 - torch.cos(next_state[2] - x_goal[2])
-            step_state_err = 3.0 * q1_cost + err[1]**2 + 3.0 * q2_cost + err[3]**2
-
             # ── Phase weight: suppress position cost while energy still building ─
             t_frac = step / max(num_steps - 1, 1)
             if t_frac < energy_phase_end:
-                pos_w = 0.05
+                pos_w = 0.0   # no position punishment — let pendulum swing freely
             elif t_frac < position_phase_in:
-                pos_w = 0.05 + 0.95 * (t_frac - energy_phase_end) / (position_phase_in - energy_phase_end)
+                pos_w = (t_frac - energy_phase_end) / (position_phase_in - energy_phase_end)
             else:
                 pos_w = 1.0
 
-            step_losses.append(torch.clamp(pos_w * step_state_err, max=STEP_LOSS_CLAMP))
+            err = next_state - x_goal
+            q1_cost = 1.0 - torch.cos(next_state[0] - x_goal[0])
+
+            # q2 shape: always penalised independently of phase.
+            # q2_goal=0, so (1-cos(q2)) is both the anti-fold term and the terminal q2 cost.
+            # This prevents the MPC from folding q2 to chase energy even with pos_w=0.
+            q2_shape = 1.0 - torch.cos(next_state[2])
+
+            # Terminal cost (q1 + velocities) is phase-weighted; q2 is always-on.
+            step_state_err = (pos_w * (3.0 * q1_cost + err[1]**2 + err[3]**2)
+                              + W_Q2_SHAPE * q2_shape)
+            step_losses.append(torch.clamp(step_state_err, max=STEP_LOSS_CLAMP))
 
             # ── Waypoint: Gaussian reward centred at q1=π/2 (arm horizontal) ──
             # Breaks the non-convex leap 0→π into two easier sub-goals.
