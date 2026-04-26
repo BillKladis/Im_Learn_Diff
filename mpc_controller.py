@@ -20,7 +20,9 @@ class MPC_controller:
         self.N      = N
         self.dt     = torch.tensor(0.05, device=device, dtype=torch.float64)
 
-        self.q_base_diag = torch.tensor([12.0, 5.0, 10.0, 5.0], device=device, dtype=torch.float64)
+        # q2/q2_dot weights tripled: the projection (zeroing q2 from energy gradient) removes
+        # the incidental bound on q2; stronger restoring force fights Coriolis coupling from q1.
+        self.q_base_diag = torch.tensor([12.0, 5.0, 30.0, 15.0], device=device, dtype=torch.float64)
         self.r_base_diag = torch.tensor([1.0, 1.0], device=device, dtype=torch.float64)
         self.Qf = torch.diag(torch.tensor([20.0, 20.0, 20.0, 20.0], device=device, dtype=torch.float64))
         

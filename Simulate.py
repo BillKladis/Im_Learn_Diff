@@ -129,7 +129,7 @@ def train_linearization_network(
     W_ENERGY = 1.5      # energy-deficit loss
     W_PUMP = 5.0        # pump reward
     W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
-    W_Q2_SHAPE = 2.0    # always-on anti-fold cost: keeps q2 near 0 throughout
+    W_Q2_SHAPE = 3.0    # always-on anti-fold cost: keeps q2 near 0 throughout
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
