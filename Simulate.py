@@ -32,7 +32,7 @@ def _build_energy_linear(
     mpc: "mpc_controller.MPC_controller",
     gates_E: torch.Tensor,
     E_q1_goal: torch.Tensor,
-    w_e_base: float = 10.0,
+    w_e_base: float = 20.0,
 ) -> torch.Tensor:
     """
     Compute the extra_linear_state vector (N*nx,) for q1-only energy shaping.
@@ -42,10 +42,9 @@ def _build_energy_linear(
     by the energy term.  gates_E from the network gates the shaping weight at
     each horizon step, preserving the gradient path to network parameters.
 
-    The cost is a symmetric quadratic: gradient of 0.5*w*(E-E_goal)^2.
-    This penalises both deficit and excess energy, preventing the system from
-    shooting past the top. A smooth angle gate fades the shaping to zero near
-    q1=π so position tracking can dominate for the final stabilisation.
+    The deficit boost amplifies the push when energy is low (drives pumping).
+    The angle gate fades the shaping to zero near q1=π (lets position tracking
+    dominate for final stabilisation, prevents fighting near the top).
     """
     N, nx = mpc.N, 4
     device = mpc.device
@@ -66,12 +65,13 @@ def _build_energy_linear(
         e_i  = E_curr[i] - E_q1_goal   # signed: negative = deficit, positive = excess
         gate = gates_E[i]               # network gate: only grad path
 
-        # Simple symmetric quadratic weight — no deficit amplification.
-        w_k = w_e_base * gate
+        # Deficit boost: amplifies push when energy is low to force pumping.
+        # Naturally fades to base weight when E ≈ E_goal (deficit_norm → 0).
+        deficit_norm = torch.relu(-e_i) / (2.0 * E_q1_goal.abs() + 1.0)
+        w_k = w_e_base * gate * (1.0 + 2.0 * deficit_norm ** 2)
 
-        # Smooth angle gate: turns off energy shaping as q1 approaches π.
-        # Prevents the energy term from fighting position tracking near the top.
-        # Exactly 0 at q1=π; ≈1 when more than ~90° away.
+        # Angle gate: smoothly turns off energy shaping as q1 approaches π.
+        # 0 at q1=π; ≈1 when ≥90° away; ≈0.84 at 45° from top.
         q1_i = X_bar_seq[i][0]
         dist_top = torch.abs(torch.atan2(
             torch.sin(q1_i - math.pi), torch.cos(q1_i - math.pi)
@@ -214,7 +214,7 @@ def train_linearization_network(
     W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
     W_Q2_SHAPE = 3.0    # always-on anti-fold cost: keeps q2 near 0 throughout
     W_Q2_DOT = 0.5      # always-on q2_dot velocity penalty: limits Coriolis-driven folding
-    W_E_SHAPE = 10.0    # base weight for MPC energy-shaping linear term (q1-only energy)
+    W_E_SHAPE = 20.0    # base weight for MPC energy-shaping linear term (q1-only energy)
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
