@@ -2,8 +2,3 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-saved_models/
-*.pt
-*.pth
-*.png
-*.gif
