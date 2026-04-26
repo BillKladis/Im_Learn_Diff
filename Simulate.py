@@ -247,25 +247,26 @@ def train_linearization_network(
 
             next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
 
-            # ── Phase weight: suppress position cost while energy still building ─
+            # ── Phase weight ──────────────────────────────────────────────────
             t_frac = step / max(num_steps - 1, 1)
             if t_frac < energy_phase_end:
-                pos_w = 0.0   # no position punishment — let pendulum swing freely
+                pos_w = 0.05  # small but nonzero — prevents unbounded q1 spinning
             elif t_frac < position_phase_in:
-                pos_w = (t_frac - energy_phase_end) / (position_phase_in - energy_phase_end)
+                pos_w = 0.05 + 0.95 * (t_frac - energy_phase_end) / (position_phase_in - energy_phase_end)
             else:
                 pos_w = 1.0
 
             err = next_state - x_goal
-            q1_cost = 1.0 - torch.cos(next_state[0] - x_goal[0])
+            # atan2 wraps q1 error into (−π, π]: correctly identifies q1=3π as
+            # far from the goal, unlike cosine which treats 3π and π identically.
+            q1_err_w = torch.atan2(torch.sin(next_state[0] - x_goal[0]),
+                                   torch.cos(next_state[0] - x_goal[0]))
 
-            # q2 shape: always penalised independently of phase.
-            # q2_goal=0, so (1-cos(q2)) is both the anti-fold term and the terminal q2 cost.
-            # This prevents the MPC from folding q2 to chase energy even with pos_w=0.
+            # q2 shape: always-on, independent of phase.
+            # Prevents folding at any stage; q2_goal=0 so (1-cos(q2)) is the correct cost.
             q2_shape = 1.0 - torch.cos(next_state[2])
 
-            # Terminal cost (q1 + velocities) is phase-weighted; q2 is always-on.
-            step_state_err = (pos_w * (3.0 * q1_cost + err[1]**2 + err[3]**2)
+            step_state_err = (pos_w * (3.0 * q1_err_w**2 + err[1]**2 + err[3]**2)
                               + W_Q2_SHAPE * q2_shape)
             step_losses.append(torch.clamp(step_state_err, max=STEP_LOSS_CLAMP))
 
