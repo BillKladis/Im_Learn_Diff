@@ -135,7 +135,7 @@ def train_linearization_network(
     STEP_LOSS_CLAMP = 200.0
     CLIP_QF_HEAD = 5.0
     CLIP_U_LIN = 2.0
-    CLIP_OTHER = 5.0
+    CLIP_OTHER = 2.0
     SKIP_UPDATE_GRAD_NORM = 5e7
 
     # Phase-aware curriculum boundaries (fraction of num_steps) — base values,
@@ -147,16 +147,11 @@ def train_linearization_network(
     state_dim = lin_net.state_dim
     n_u = mpc.MPC_dynamics.u_min.shape[0]
 
-    optimizer = torch.optim.AdamW(lin_net.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=8,
-        threshold=0.01,
-        threshold_mode='rel',
-        cooldown=4,
-        min_lr=1e-6,
+    optimizer = torch.optim.AdamW(lin_net.parameters(), lr=lr, weight_decay=1e-4)
+    # Warm restarts let the model escape local optima that ReduceLROnPlateau
+    # would freeze it in. T_0=5 → restart every 5 epochs, doubling each cycle.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=5, T_mult=2, eta_min=1e-5,
     )
     loss_history = []
     best_goal_dist = float('inf')
@@ -379,7 +374,7 @@ def train_linearization_network(
                         torch.nn.utils.clip_grad_norm_(other_params, max_norm=CLIP_OTHER)
                     optimizer.step()
 
-        scheduler.step(torch.nan_to_num(total_loss, nan=1000.0))
+        scheduler.step(epoch + 1)
 
         if debug_monitor:
             with torch.no_grad():

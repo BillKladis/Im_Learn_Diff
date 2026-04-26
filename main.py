@@ -36,8 +36,8 @@ X_GOAL    = [math.pi, 0.0, 0.0, 0.0] # [q1, q1_dot, q2, q2_dot] — perfectly up
 NUM_STEPS = 170
 DT        = 0.05                      # seconds
 
-EPOCHS      = 35
-LR          = 1e-3
+EPOCHS      = 50
+LR          = 3e-4
 HORIZON     = 10
 HIDDEN_DIM  = 128
 GATE_RANGE_Q = 0.75   # was 0.3 — allows network to suppress Q penalties during swing-up
