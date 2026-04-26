@@ -20,11 +20,11 @@ class MPC_controller:
         self.N      = N
         self.dt     = torch.tensor(0.05, device=device, dtype=torch.float64)
 
-        # q2/q2_dot weights tripled: the projection (zeroing q2 from energy gradient) removes
-        # the incidental bound on q2; stronger restoring force fights Coriolis coupling from q1.
-        self.q_base_diag = torch.tensor([12.0, 5.0, 30.0, 15.0], device=device, dtype=torch.float64)
+        # q2/q2_dot weights: strong restoring force to fight Coriolis coupling from q1 swing.
+        # q2_dot raised from 15→25; Qf q2/q2_dot raised to give terminal plan a damped q2 target.
+        self.q_base_diag = torch.tensor([12.0, 5.0, 30.0, 25.0], device=device, dtype=torch.float64)
         self.r_base_diag = torch.tensor([1.0, 1.0], device=device, dtype=torch.float64)
-        self.Qf = torch.diag(torch.tensor([20.0, 20.0, 20.0, 20.0], device=device, dtype=torch.float64))
+        self.Qf = torch.diag(torch.tensor([20.0, 20.0, 40.0, 30.0], device=device, dtype=torch.float64))
         
         # Base penalty weight for energy shaping
         self.w_e_base = 25.0
@@ -188,24 +188,20 @@ class MPC_controller:
             e_i = E_curr[i] - E_goal          # scalar energy error (negative = deficit)
             gate = gates_E[i] if gates_E is not None else 1.0
 
-            # Adaptive weight: scale up quadratically when energy deficit is large
-            # so energy pumping dominates position error during swing-up.
+            # Adaptive weight: scale up quadratically when energy deficit is large.
+            # Multiplier reduced 3.0→2.0: softer energy push means lower q1_dot peak,
+            # which reduces Coriolis torque and keeps q2 from folding.
             deficit_norm = torch.relu(-e_i) / (2.0 * E_goal.abs() + 1.0)  # ∈ [0, 1]
-            w_k = self.w_e_base * gate * (1.0 + 3.0 * deficit_norm ** 2)
+            w_k = self.w_e_base * gate * (1.0 + 2.0 * deficit_norm ** 2)
 
             # dE/dx evaluated at predicted state X_bar_seq[i]
             g_i = jacrev(self.compute_energy_single)(X_bar_seq[i])
 
-            # Project out q2 and q2_dot from the energy gradient.
-            # dE/dq2 = m2·g·l2·sin(q1+q2) is non-zero during swing-up and pushes the
-            # QP to fold q2 to build energy. Zeroing these forces energy pumping to
-            # happen only through q1, producing a smooth single-arc swing-up.
-            g_i = g_i.clone()
-            g_i[2] = 0.0   # q2 component
-            g_i[3] = 0.0   # q2_dot component
-
             # Linear term only: pushes the QP toward controls that increase energy.
             # No rank-1 Hessian block — Q_bar stays well-conditioned.
+            # NOTE: q2/q2_dot components are kept (not projected out) so energy can
+            # be pumped through both joints. Projecting to q1-only forces higher q1_dot,
+            # which increases Coriolis torque and worsens q2 folding.
             linear_E[idx] = w_k * e_i * g_i
 
         # Q_bar_total is just Q_bar — no Q_energy added to Hessian

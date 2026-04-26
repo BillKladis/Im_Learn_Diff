@@ -130,6 +130,7 @@ def train_linearization_network(
     W_PUMP = 5.0        # pump reward
     W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
     W_Q2_SHAPE = 3.0    # always-on anti-fold cost: keeps q2 near 0 throughout
+    W_Q2_DOT = 0.5      # always-on q2_dot velocity penalty: limits Coriolis-driven folding
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
@@ -266,8 +267,14 @@ def train_linearization_network(
             # Prevents folding at any stage; q2_goal=0 so (1-cos(q2)) is the correct cost.
             q2_shape = 1.0 - torch.cos(next_state[2])
 
+            # q2_dot penalty: always-on velocity cost limits Coriolis-driven folding.
+            # High q2_dot at large q1_dot exceeds control authority; penalising it
+            # trains the network to issue slower, gentler q1 swings.
+            q2_dot_penalty = W_Q2_DOT * next_state[3] ** 2
+
             step_state_err = (pos_w * (3.0 * q1_err_w**2 + err[1]**2 + err[3]**2)
-                              + W_Q2_SHAPE * q2_shape)
+                              + W_Q2_SHAPE * q2_shape
+                              + q2_dot_penalty)
             step_losses.append(torch.clamp(step_state_err, max=STEP_LOSS_CLAMP))
 
             # ── Waypoint: Gaussian reward centred at q1=π/2 (arm horizontal) ──
