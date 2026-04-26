@@ -124,6 +124,31 @@ class MPC_controller:
         B_batch = jac_u_fn(x_batch.detach(), u_batch.detach())
         return list(A_batch), list(B_batch)
 
+    def compute_nominal_rollout(
+        self, current_state: torch.Tensor, u_guess_seq: torch.Tensor
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Compute the nominal rollout and per-step B matrices, fully detached.
+
+        Returns:
+            X_bar_seq : (N, nx) predicted states after each control step
+            B_list    : list of N matrices (nx, nu), ∂x_{i+1}/∂u_i
+
+        Intended for callers (e.g. Simulate.py) that need to build task-specific
+        control-space shaping terms without duplicating internal QP state.
+        """
+        x_op_list: list = []
+        X_bar_list: list = []
+        curr = current_state.detach()
+        for i in range(self.N):
+            x_op_list.append(curr)
+            curr = self.MPC_RK4_disc(curr, u_guess_seq[i].detach(), self.dt)
+            X_bar_list.append(curr)
+        x_op_seq  = torch.stack(x_op_list)
+        X_bar_seq = torch.stack(X_bar_list)
+        _, B_list = self.linearize_horizon(x_op_seq, u_guess_seq.detach())
+        return X_bar_seq, B_list
+
     def linearize_horizon(self, x_lin_seq, u_lin_seq):
         return self.linearize_discrete(x_lin_seq, u_lin_seq, self.dt)
 
@@ -157,13 +182,19 @@ class MPC_controller:
         Q_bar: torch.Tensor,
         R_diag: torch.Tensor,
         extra_linear_state: Optional[torch.Tensor] = None,
+        extra_linear_control: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Build the QP cost matrices.
 
-        extra_linear_state: optional (N*nx,) vector added to the linear state cost.
-        Callers (e.g. Simulate.py) use this for energy shaping, waypoint rewards, or
-        any other task-specific linear cost — the MPC has no knowledge of its origin.
+        extra_linear_state   : optional (N*nx,) vector added to the linear STATE cost
+                               before B_big^T mapping.  Callers use this for task-
+                               specific shaping that operates in state space.
+
+        extra_linear_control : optional (N*nu,) vector added DIRECTLY to f (in
+                               control space, bypassing B_big^T).  Use this when the
+                               desired shaping must avoid cross-coupling through the
+                               B matrix (e.g. energy shaping projected to τ1 only).
         """
         X_ref = x_goal.unsqueeze(0).expand(self.N, -1).reshape(-1)
         E_raw = X_bar - X_ref
@@ -186,6 +217,8 @@ class MPC_controller:
         if extra_linear_state is not None:
             state_linear_term = state_linear_term + extra_linear_state
         f = B_big.T @ state_linear_term + 2.0 * (R_diag * U_bar)
+        if extra_linear_control is not None:
+            f = f + extra_linear_control
 
         return H, f
         
@@ -202,6 +235,7 @@ class MPC_controller:
         diag_corrections_Q: Optional[torch.Tensor] = None,
         diag_corrections_R: Optional[torch.Tensor] = None,
         extra_linear_state: Optional[torch.Tensor] = None,
+        extra_linear_control: Optional[torch.Tensor] = None,
         Qf_dense: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -230,6 +264,7 @@ class MPC_controller:
         H, f = self.build_qp_matrices_delta(
             B_big, X_bar, U_bar, x_goal, Q_bar, R_diag,
             extra_linear_state=extra_linear_state,
+            extra_linear_control=extra_linear_control,
         )
 
         return H, f, U_bar
@@ -276,6 +311,7 @@ class MPC_controller:
         diag_corrections_Q: Optional[torch.Tensor] = None,
         diag_corrections_R: Optional[torch.Tensor] = None,
         extra_linear_state: Optional[torch.Tensor] = None,
+        extra_linear_control: Optional[torch.Tensor] = None,
         Qf_dense: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -284,6 +320,7 @@ class MPC_controller:
             diag_corrections_Q=diag_corrections_Q,
             diag_corrections_R=diag_corrections_R,
             extra_linear_state=extra_linear_state,
+            extra_linear_control=extra_linear_control,
             Qf_dense=Qf_dense,
         )
         

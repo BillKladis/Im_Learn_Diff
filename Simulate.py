@@ -26,7 +26,7 @@ def _compute_q1_energy(x: torch.Tensor) -> torch.Tensor:
     return 0.5 * m_eff * (l_eff * q1_dot) ** 2 - m_eff * g * l_eff * torch.cos(q1)
 
 
-def _build_energy_linear(
+def _build_energy_control_tau1(
     u_lin_seq: torch.Tensor,
     current_state: torch.Tensor,
     mpc: "mpc_controller.MPC_controller",
@@ -35,54 +35,61 @@ def _build_energy_linear(
     w_e_base: float = 20.0,
 ) -> torch.Tensor:
     """
-    Compute the extra_linear_state vector (N*nx,) for q1-only energy shaping.
+    Compute extra_linear_control (N*nu,) for q1-only energy shaping via τ1 ONLY.
 
-    Uses the q1-only effective energy so that dE/dq2 = dE/dq2_dot = 0 by
-    construction — no gradient projection required, and q2 is never driven
-    by the energy term.  gates_E from the network gates the shaping weight at
-    each horizon step, preserving the gradient path to network parameters.
+    Root-cause of q2 folding: the mass-matrix coupling M^{-1}[q2,τ1] ≈ -8 means
+    applying B_big^T @ state_gradient biases τ2 in the WRONG direction (opposes
+    q2 correction).  This function instead:
+      1. Computes B_i^T @ ∇E_q1 to get the energy gradient in control space.
+      2. Zeros the τ2 component — energy shaping only ever pushes τ1.
+      3. Adds directly to the QP's f vector (extra_linear_control), bypassing
+         the full B_big^T mapping entirely.
 
-    The deficit boost amplifies the push when energy is low (drives pumping).
-    The angle gate fades the shaping to zero near q1=π (lets position tracking
-    dominate for final stabilisation, prevents fighting near the top).
+    The gradient path to the network flows through gates_E (the network's energy
+    gate), preserving differentiability for training.
     """
-    N, nx = mpc.N, 4
+    N, n_u = mpc.N, 2
     device = mpc.device
 
-    # Nominal rollout under current warm-start (detached — same as QP_formulation).
-    X_bar_list: list = []
-    curr = current_state.detach()
-    for i in range(N):
-        curr = mpc.MPC_RK4_disc(curr, u_lin_seq[i].detach(), mpc.dt)
-        X_bar_list.append(curr)
-    X_bar_seq = torch.stack(X_bar_list)  # (N, nx)
+    # Nominal rollout + per-step B matrices (all detached).
+    X_bar_seq, B_list = mpc.compute_nominal_rollout(current_state, u_lin_seq)
 
-    linear_E = torch.zeros(N * nx, device=device, dtype=torch.float64)
     E_curr = torch.stack([_compute_q1_energy(X_bar_seq[i]) for i in range(N)])
+    ctrl_energy = torch.zeros(N * n_u, device=device, dtype=torch.float64)
 
     for i in range(N):
-        idx = slice(i * nx, (i + 1) * nx)
-        e_i  = E_curr[i] - E_q1_goal   # signed: negative = deficit, positive = excess
+        idx = slice(i * n_u, (i + 1) * n_u)
+        e_i  = E_curr[i] - E_q1_goal   # signed: negative = deficit
         gate = gates_E[i]               # network gate: only grad path
 
-        # Deficit boost: amplifies push when energy is low to force pumping.
-        # Naturally fades to base weight when E ≈ E_goal (deficit_norm → 0).
+        # Deficit boost: drives pumping when energy is low.
         deficit_norm = torch.relu(-e_i) / (2.0 * E_q1_goal.abs() + 1.0)
         w_k = w_e_base * gate * (1.0 + 2.0 * deficit_norm ** 2)
 
-        # Angle gate: smoothly turns off energy shaping as q1 approaches π.
-        # 0 at q1=π; ≈1 when ≥90° away; ≈0.84 at 45° from top.
+        # Angle gate: turns off shaping as q1 → π so position tracking takes over.
         q1_i = X_bar_seq[i][0]
         dist_top = torch.abs(torch.atan2(
             torch.sin(q1_i - math.pi), torch.cos(q1_i - math.pi)
         ))
         angle_gate = 1.0 - torch.exp(-3.0 * dist_top ** 2)
 
-        # g_i indices 2 and 3 are exactly zero — no coupling to q2 / q2_dot
-        g_i = jacrev(_compute_q1_energy)(X_bar_seq[i])
-        linear_E[idx] = w_k * angle_gate * e_i * g_i
+        # State-space energy gradient (indices 2,3 are zero by construction).
+        g_state = jacrev(_compute_q1_energy)(X_bar_seq[i])
 
-    return linear_E
+        # Project to control space via one-step B matrix.
+        B_i  = B_list[i].detach()   # (nx, nu)
+        g_ctrl = B_i.T @ g_state    # (nu=2,): [grad_τ1, grad_τ2]
+
+        # ── ZERO τ2 ──────────────────────────────────────────────────────────
+        # B^T coupling creates a τ2 component that OPPOSES q2 correction
+        # (M^{-1}[q2,τ1] ≈ −8 drives τ2 backwards).  Zeroing it means energy
+        # shaping cannot disturb q2 — folding from this pathway is eliminated.
+        g_ctrl_τ1 = g_ctrl.clone()
+        g_ctrl_τ1[1] = 0.0
+
+        ctrl_energy[idx] = w_k * angle_gate * e_i * g_ctrl_τ1
+
+    return ctrl_energy
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -160,14 +167,14 @@ def gradient_flow_smoke_test(
             min=mpc.MPC_dynamics.u_min.unsqueeze(0),
             max=mpc.MPC_dynamics.u_max.unsqueeze(0),
         )
-        extra_linear = _build_energy_linear(
+        extra_ctrl = _build_energy_control_tau1(
             u_lin_seq, current_state, mpc, gates_E, E_q1_goal_smoke,
         )
         u_mpc, U_opt_full = mpc.control(
             current_state, x_lin_seq, u_lin_seq, x_goal,
             diag_corrections_Q=gates_Q,
             diag_corrections_R=gates_R,
-            extra_linear_state=extra_linear,
+            extra_linear_control=extra_ctrl,
             Qf_dense=Qf_dense,
         )
 
@@ -210,11 +217,11 @@ def train_linearization_network(
 
     W_TERMINAL = 1.0
     W_ENERGY = 1.5      # energy-deficit loss (full system energy, for training signal)
-    W_PUMP = 5.0        # pump reward
+    W_PUMP = 3.0        # pump reward (reduced: less aggressive energy injection)
     W_WAYPOINT = 2.0    # reward for passing through q1=π/2 waypoint (fades over training)
-    W_Q2_SHAPE = 3.0    # always-on anti-fold cost: keeps q2 near 0 throughout
-    W_Q2_DOT = 0.5      # always-on q2_dot velocity penalty: limits Coriolis-driven folding
-    W_E_SHAPE = 20.0    # base weight for MPC energy-shaping linear term (q1-only energy)
+    W_Q2_SHAPE = 8.0    # anti-fold cost: strong penalty keeps q2 near 0
+    W_Q2_DOT = 1.5      # q2_dot velocity penalty: damps Coriolis-driven folding
+    W_E_SHAPE = 20.0    # base weight for MPC energy-shaping (τ1-only, control space)
     PUMP_WARMUP_EPOCHS = 2
     W_QF_ANCHOR = 1e-3
     W_U_LIN_IMITATION = 0.05  # supervised loss: u_lin_head predicts MPC output
@@ -316,8 +323,8 @@ def train_linearization_network(
                 max=mpc.MPC_dynamics.u_max.unsqueeze(0),
             )
 
-            # q1-only energy shaping linear term — gradient path preserved through gates_E
-            extra_linear = _build_energy_linear(
+            # τ1-only energy shaping in control space — no τ2 bias, no q2 folding.
+            extra_ctrl = _build_energy_control_tau1(
                 u_lin_seq, current_state_detached, mpc, gates_E, E_q1_goal, W_E_SHAPE,
             )
 
@@ -328,7 +335,7 @@ def train_linearization_network(
                 x_goal,
                 diag_corrections_Q=gates_Q,
                 diag_corrections_R=gates_R,
-                extra_linear_state=extra_linear,
+                extra_linear_control=extra_ctrl,
                 Qf_dense=Qf_dense,
             )
 
@@ -576,8 +583,8 @@ def rollout(
             max=mpc.MPC_dynamics.u_max.unsqueeze(0),
         )
 
-        extra_linear = (
-            _build_energy_linear(u_lin_seq, x, mpc, gates_E, E_q1_goal_rollout)
+        extra_ctrl = (
+            _build_energy_control_tau1(u_lin_seq, x, mpc, gates_E, E_q1_goal_rollout)
             if gates_E is not None else None
         )
 
@@ -588,7 +595,7 @@ def rollout(
             x_goal,
             diag_corrections_Q=gates_Q,
             diag_corrections_R=gates_R,
-            extra_linear_state=extra_linear,
+            extra_linear_control=extra_ctrl,
             Qf_dense=Qf_dense,
         )
 
