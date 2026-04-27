@@ -205,6 +205,7 @@ def train_linearization_network(
     num_epochs: int = 25,
     lr: float = 2e-3,
     bptt_window: int = 10,
+    e_pump_boost: float = 1.0,
     debug_monitor=None,
     recorder: Optional[network_module.NetworkOutputRecorder] = None,
     grad_debug: bool = False,
@@ -243,7 +244,9 @@ def train_linearization_network(
     if recorder is None:
         recorder = network_module.NetworkOutputRecorder()
 
-    E_q1_goal = _compute_q1_energy(x_goal).detach()
+    E_q1_goal  = _compute_q1_energy(x_goal).detach()
+    # Boosted goal keeps pump gradient alive near top (1.15x → 10x stronger at 170°)
+    E_pump_goal = E_q1_goal * e_pump_boost
     u_min = mpc.MPC_dynamics.u_min
     u_max = mpc.MPC_dynamics.u_max
 
@@ -263,6 +266,7 @@ def train_linearization_network(
         n_windows_total = 0
         window_losses   = []
         u_hist_epoch    = []
+        grad_stats      = None
 
         optimizer.zero_grad()  # clear at start
 
@@ -303,7 +307,7 @@ def train_linearization_network(
             # learns to follow velocity sign (the pump rule).
             E_prev = _compute_q1_energy(x.detach())   # current KE+PE, no grad
             E_next_val = _compute_q1_energy(x_next)   # next step, grad flows
-            deficit = torch.relu(E_q1_goal - E_prev).detach()
+            deficit = torch.relu(E_pump_goal - E_prev).detach()
             # loss = -dE * deficit/scale  → minimised by increasing energy when deficit>0
             loss_pump = -W_E_DIFF * (E_next_val - E_prev) * deficit / (E_q1_goal.abs()**2 + 1.0)
 
@@ -312,16 +316,11 @@ def train_linearization_network(
                 torch.cos(x_next[0] - x_goal[0]),
             )
             err   = x_next - x_goal
-            # Gate q2 terms by proximity to upright. Without gating, the
-            # M^{-1}[q2,τ1]≈-8 coupling drives a gradient that pushes τ1
-            # negative during swing-up — exactly wrong. At q1=0 the gate=0
-            # so q2 coupling cannot oppose pumping; at q1=π the gate=1.
-            stabilize_gate = 1.0 - q1_err.abs() / math.pi  # 0 at bottom, 1 at top
             sloss = (loss_pump
                      + W_Q1  * q1_err**2
                      + W_VEL * err[1]**2
-                     + W_Q2_SHAPE * stabilize_gate * x_next[2]**2
-                     + W_Q2_VEL   * stabilize_gate * x_next[3]**2)
+                     + W_Q2_SHAPE * x_next[2]**2
+                     + W_Q2_VEL   * x_next[3]**2)
             window_losses.append(torch.clamp(sloss, max=STEP_LOSS_CLAMP))
 
             end_of_window = ((step + 1) % BPTT_W == 0) or (step == num_steps - 1)
@@ -338,6 +337,12 @@ def train_linearization_network(
                 ):
                     torch.nn.utils.clip_grad_norm_(lin_net.parameters(), max_norm=CLIP_GRAD)
                     optimizer.step()
+                # Capture grad stats before clearing — last window of the epoch
+                is_last_window = (step == num_steps - 1)
+                if is_last_window and grad_debug and (
+                    (epoch + 1) % max(1, grad_debug_every) == 0 or epoch == 0
+                ):
+                    grad_stats = _gradient_stats(lin_net)
                 optimizer.zero_grad()
                 window_losses = []
                 x = x_next.detach()   # detach at window boundary
@@ -369,9 +374,7 @@ def train_linearization_network(
         loss_history.append(avg_loss)
         recorder.end_epoch(avg_loss)
 
-        grad_stats = None
-        if grad_debug and ((epoch + 1) % max(1, grad_debug_every) == 0 or epoch == 0):
-            grad_stats = _gradient_stats(lin_net)
+
 
         with torch.no_grad():
             goal_dist = float(torch.norm(x - x_goal).item())

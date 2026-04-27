@@ -39,6 +39,7 @@ DT        = 0.05                      # seconds
 EPOCHS       = 40
 LR           = 5e-4
 BPTT_WINDOW  = 20
+E_PUMP_BOOST = 1.15
 HORIZON      = 10
 HIDDEN_DIM   = 128
 GATE_RANGE_Q = 0.50
@@ -318,6 +319,7 @@ def main():
         x0=x0, x_goal=x_goal, num_steps=NUM_STEPS,
         num_epochs=EPOCHS, lr=LR,
         bptt_window=BPTT_WINDOW,
+        e_pump_boost=E_PUMP_BOOST,
         debug_monitor=monitor,
         recorder=recorder,
         grad_debug=GRAD_DEBUG,
