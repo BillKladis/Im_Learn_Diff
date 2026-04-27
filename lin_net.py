@@ -87,7 +87,8 @@ class LinearizationNetwork(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, r_out_dim),
         )
-        self.register_buffer('u_lin_bound', torch.tensor(1.0, dtype=torch.float64))
+        # 5 N·m residual bound — allows swing-up (gravity needs ~3.5 N·m at 45°).
+        self.register_buffer('u_lin_bound', torch.tensor(5.0, dtype=torch.float64))
 
         # ── NEW: Tunable Energy Shaping Head ───────────────────────────
         self.e_head = nn.Sequential(
@@ -101,10 +102,10 @@ class LinearizationNetwork(nn.Module):
         # Higher q1_dot terminal weight prevents overshoot during swing-up.
         # q2/q2_dot weights match the Q matrix's anti-fold priorities.
         base_L_matrix = torch.zeros((state_dim, state_dim), dtype=torch.float64)
-        base_L_matrix[0, 0] = math.sqrt(10.0)   # Qf_q1     ≈ 10  (weak; network learns to raise)
-        base_L_matrix[1, 1] = math.sqrt(10.0)   # Qf_q1dot  ≈ 10  (weak; network prevents overshoot)
-        base_L_matrix[2, 2] = math.sqrt(10.0)   # Qf_q2     ≈ 10
-        base_L_matrix[3, 3] = math.sqrt(10.0)   # Qf_q2dot  ≈ 10
+        base_L_matrix[0, 0] = math.sqrt(20.0)
+        base_L_matrix[1, 1] = math.sqrt(20.0)   # moderate q1_dot — slight overshoot for gradient
+        base_L_matrix[2, 2] = math.sqrt(15.0)
+        base_L_matrix[3, 3] = math.sqrt(15.0)
         base_L_matrix[1, 0] = 1.0
         base_L_matrix[3, 2] = 1.0
 

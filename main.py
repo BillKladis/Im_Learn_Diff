@@ -36,16 +36,17 @@ X_GOAL    = [math.pi, 0.0, 0.0, 0.0] # [q1, q1_dot, q2, q2_dot] — perfectly up
 NUM_STEPS = 170
 DT        = 0.05                      # seconds
 
-EPOCHS      = 30
-LR          = 5e-3
-HORIZON     = 10
-HIDDEN_DIM  = 128
-GATE_RANGE_Q = 0.80   # wider range: allows network to vary Q costs ±80%
+EPOCHS       = 40
+LR           = 5e-4
+BPTT_WINDOW  = 15
+HORIZON      = 10
+HIDDEN_DIM   = 128
+GATE_RANGE_Q = 0.50
 GATE_RANGE_R = 0.30
 GATE_RANGE_E = 0.60
-N_RES       = 5
-PRINT_EVERY = 1
-GRAD_DEBUG = True
+N_RES        = 5
+PRINT_EVERY  = 1
+GRAD_DEBUG   = True
 GRAD_DEBUG_EVERY = 1
 GRAD_SMOKE_STEPS = 5
 SAVE_DIR    = "saved_models"
@@ -230,7 +231,7 @@ def main():
     print("  u_lin_head: (N, 2) offset  |  qf_head: (10,) -> Cholesky L -> Qf (4x4)")
     print("=" * 76)
     print(f"  Device      : {device}")
-    print(f"  Epochs      : {EPOCHS}  |  LR : {LR}")
+    print(f"  Epochs      : {EPOCHS}  |  LR : {LR}  |  BPTT window : {BPTT_WINDOW}")
     print(f"  Horizon (N) : {HORIZON}  |  Hidden : {HIDDEN_DIM}  |  Gate ranges (Q/R/E) : +/-{GATE_RANGE_Q} / +/-{GATE_RANGE_R} / +/-{GATE_RANGE_E}")
     print(f"  n_res       : {N_RES}   (residual history steps)")
     print(f"  dt          : {DT*1000:.1f} ms  |  Steps : {NUM_STEPS}  ({NUM_STEPS*DT:.2f} s)")
@@ -316,6 +317,7 @@ def main():
         lin_net=lin_net, mpc=mpc,
         x0=x0, x_goal=x_goal, num_steps=NUM_STEPS,
         num_epochs=EPOCHS, lr=LR,
+        bptt_window=BPTT_WINDOW,
         debug_monitor=monitor,
         recorder=recorder,
         grad_debug=GRAD_DEBUG,

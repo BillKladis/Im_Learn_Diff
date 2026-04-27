@@ -150,11 +150,12 @@ def gradient_flow_smoke_test(
     residual_history = [zero_residual.clone() for _ in range(n_res)]
     u_seq_guess = torch.zeros((mpc.N, n_u), device=mpc.device, dtype=torch.float64)
 
-    E_q1_goal_smoke = _compute_q1_energy(x_goal).detach()
+    u_min = mpc.MPC_dynamics.u_min
+    u_max = mpc.MPC_dynamics.u_max
 
     step_losses = []
     for _ in range(num_steps):
-        gates_Q, gates_R, gates_E, Qf_dense, _, _, u_lin_delta = lin_net(
+        _, _, _, _, _, _, u_lin_delta = lin_net(
             torch.stack(state_history, dim=0),
             torch.stack(residual_history, dim=0),
             q_base_diag=mpc.q_base_diag,
@@ -162,29 +163,23 @@ def gradient_flow_smoke_test(
         )
 
         x_lin_seq = current_state.unsqueeze(0).expand(mpc.N, -1).clone()
-        u_lin_seq = torch.clamp(
-            u_seq_guess.clone() + u_lin_delta,
-            min=mpc.MPC_dynamics.u_min.unsqueeze(0),
-            max=mpc.MPC_dynamics.u_max.unsqueeze(0),
-        )
-        extra_ctrl = _build_energy_control_tau1(
-            u_lin_seq, current_state, mpc, gates_E, E_q1_goal_smoke,
-        )
+        # Match training: no energy shaping in QP, residual u_lin_delta on top
         u_mpc, U_opt_full = mpc.control(
-            current_state, x_lin_seq, u_lin_seq, x_goal,
-            diag_corrections_Q=gates_Q,
-            diag_corrections_R=gates_R,
-            extra_linear_control=extra_ctrl,
-            Qf_dense=Qf_dense,
+            current_state, x_lin_seq, u_seq_guess, x_goal,
+            diag_corrections_Q=None,
+            diag_corrections_R=None,
+            extra_linear_control=None,
+            Qf_dense=None,
         )
 
-        next_state = mpc.true_RK4_disc(current_state, u_mpc, mpc.dt)
+        u_applied = torch.clamp(u_mpc.detach() + u_lin_delta[0], min=u_min, max=u_max)
+        next_state = mpc.true_RK4_disc(current_state, u_applied, mpc.dt)
         step_losses.append(((next_state - x_goal) ** 2).sum())
 
         with torch.no_grad():
             delta = next_state.detach() - mpc.MPC_RK4_disc(current_state, u_mpc.detach(), mpc.dt)
 
-        current_state = next_state
+        current_state = next_state.detach()
         U_opt_reshaped = U_opt_full.detach().view(mpc.N, n_u)
         u_seq_guess = torch.cat([U_opt_reshaped[1:], U_opt_reshaped[-1:]], dim=0).clone()
         state_history.pop(0)
@@ -208,54 +203,49 @@ def train_linearization_network(
     x_goal: torch.Tensor,
     num_steps: int,
     num_epochs: int = 25,
-    lr: float = 1e-3,
+    lr: float = 2e-3,
+    bptt_window: int = 10,
     debug_monitor=None,
     recorder: Optional[network_module.NetworkOutputRecorder] = None,
     grad_debug: bool = False,
     grad_debug_every: int = 1,
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
-    # ── Loss weights ──────────────────────────────────────────────────────────
-    # Energy shaping is FIXED (gates_E detached in the energy term below).
-    # The network trains Q/R/Qf only — those gates have a direct, clean gradient
-    # through the QP cost.  Energy-gate gradients go through H^{-1} and are too
-    # weak to overcome the initialisation gap within a reasonable epoch count.
-    W_TERMINAL = 1.0
-    W_Q2_SHAPE = 1.5    # always-on anti-fold penalty in training loss
-    W_Q2_DOT   = 0.3
-    W_E_SHAPE  = 12.0   # fixed energy shaping strength (no gate ramp needed)
-    W_QF_ANCHOR = 1e-3
-    W_U_LIN_IMITATION = 0.05
-    STEP_LOSS_CLAMP = 200.0
-    CLIP_QF_HEAD = 5.0
-    CLIP_U_LIN  = 2.0
-    CLIP_OTHER  = 2.0
-    SKIP_UPDATE_GRAD_NORM = 5e7
+    # ── Hyperparameters ───────────────────────────────────────────────────────
+    # Truncated BPTT with energy-based loss.  With a 10-step window the
+    # network can see that swinging *backward* with high velocity increases
+    # kinetic energy → reduces energy deficit → lower loss.  This teaches
+    # the pump rule without explicit supervision.
+    #
+    # QP has NO energy shaping — the network must learn it via u_lin_delta.
+    BPTT_W      = bptt_window   # gradient window; N × 0.05s lookahead
+    W_E_DIFF    = 8.0     # energy increase reward
+    W_Q1        = 2.0     # position error toward π
+    W_VEL       = 0.5     # velocity residual
+    W_Q2_SHAPE  = 25.0    # q2² penalty — strong gradient to force τ2 compensation
+    W_Q2_VEL    = 3.0     # q2_dot² penalty
+    CLIP_GRAD   = 1.5
+    STEP_LOSS_CLAMP = 50.0
 
-    # Fixed phase boundaries (fraction of trajectory length).
-    # No epoch-level ramp: the loss floor must not rise with epoch count.
-    ENERGY_PHASE_END  = 0.45
-    POSITION_PHASE_IN = 0.60
-
-    n_res = lin_net.n_res
+    n_res     = lin_net.n_res
     state_dim = lin_net.state_dim
-    n_u = mpc.MPC_dynamics.u_min.shape[0]
+    n_u       = mpc.MPC_dynamics.u_min.shape[0]
 
     optimizer = torch.optim.AdamW(lin_net.parameters(), lr=lr, weight_decay=1e-4)
-    # Warm restarts let the model escape local optima that ReduceLROnPlateau
-    # would freeze it in. T_0=5 → restart every 5 epochs, doubling each cycle.
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=5, T_mult=2, eta_min=1e-5,
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=4, min_lr=1e-5,
     )
-    loss_history = []
+
+    loss_history  = []
     best_goal_dist = float('inf')
-    best_state_dict = None          # best model weights seen during training
+    best_state_dict = None
 
     if recorder is None:
         recorder = network_module.NetworkOutputRecorder()
 
-    # q1-only effective energy at the goal — used for MPC shaping (zero q2 coupling)
     E_q1_goal = _compute_q1_energy(x_goal).detach()
+    u_min = mpc.MPC_dynamics.u_min
+    u_max = mpc.MPC_dynamics.u_max
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
@@ -264,189 +254,146 @@ def train_linearization_network(
         recorder.start_epoch()
         qp_fallback_start = int(getattr(mpc, 'qp_fallback_count', 0))
 
-        current_state_detached = x0.detach().clone()
-        state_history = [current_state_detached.clone() for _ in range(5)]
-
-        zero_residual = torch.zeros(state_dim, device=mpc.device, dtype=torch.float64)
-        residual_history = [zero_residual.clone() for _ in range(n_res)]
-
+        x          = x0.detach().clone()
+        state_hist = [x.clone() for _ in range(5)]
+        zero_res   = torch.zeros(state_dim, device=mpc.device, dtype=torch.float64)
+        res_hist   = [zero_res.clone() for _ in range(n_res)]
         u_seq_guess = torch.zeros((mpc.N, n_u), device=mpc.device, dtype=torch.float64)
-        step_losses = []
-        qf_anchor_terms = []
-        u_lin_imitation_terms = []
+        epoch_loss_sum  = 0.0
+        n_windows_total = 0
+        window_losses   = []
+        u_hist_epoch    = []
+
+        optimizer.zero_grad()  # clear at start
 
         for step in range(num_steps):
-            state_history_seq = torch.stack(state_history, dim=0)
-            residual_history_seq = torch.stack(residual_history, dim=0)
-
-            gates_Q, gates_R, gates_E, Qf_dense, q_diags, r_diags, u_lin_delta = lin_net(
-                state_history_seq,
-                residual_history_seq,
+            # ── Network forward ───────────────────────────────────────────
+            _, _, _, _, _, _, u_lin_delta = lin_net(
+                torch.stack(state_hist, 0),
+                torch.stack(res_hist,   0),
                 q_base_diag=mpc.q_base_diag,
                 r_base_diag=mpc.r_base_diag,
             )
 
-            x_lin_seq = current_state_detached.unsqueeze(0).expand(mpc.N, -1).clone()
-
-            # Detach u_lin from the QP warm-start gradient path: backprop through
-            # 170 QP solves w.r.t. the warm-start input accumulates explosively.
-            # u_lin_head is trained separately via imitation loss below.
-            u_lin_seq = torch.clamp(
-                u_seq_guess.clone() + u_lin_delta.detach(),
-                min=mpc.MPC_dynamics.u_min.unsqueeze(0),
-                max=mpc.MPC_dynamics.u_max.unsqueeze(0),
-            )
-
-            # τ1-only energy shaping — gates_E is DETACHED so gradient only flows
-            # through Q/R/Qf.  Energy shaping runs at fixed strength; the network
-            # improves tracking quality, not energy building.
-            extra_ctrl = _build_energy_control_tau1(
-                u_lin_seq, current_state_detached, mpc, gates_E.detach(), E_q1_goal, W_E_SHAPE,
-            )
-
-            u_mpc, U_opt_full = mpc.control(
-                current_state_detached,
-                x_lin_seq,
-                u_lin_seq,
-                x_goal,
-                diag_corrections_Q=gates_Q,
-                diag_corrections_R=gates_R,
-                extra_linear_control=extra_ctrl,
-                Qf_dense=Qf_dense,
-            )
-
-            # Imitation loss: train u_lin_head to predict the first MPC action.
-            # Gradient is simple (no QP), preventing the warm-start explosion.
-            u_lin_imitation_terms.append(
-                ((u_lin_delta[0] - u_mpc.detach()) ** 2).mean()
-            )
-
-            next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
-
-            # ── Phase weight (fixed boundaries, no epoch-level ramp) ──────────
-            t_frac = step / max(num_steps - 1, 1)
-            if t_frac < ENERGY_PHASE_END:
-                pos_w = 0.05
-            elif t_frac < POSITION_PHASE_IN:
-                pos_w = 0.05 + 0.95 * (t_frac - ENERGY_PHASE_END) / (POSITION_PHASE_IN - ENERGY_PHASE_END)
-            else:
-                pos_w = 1.0
-
-            err = next_state - x_goal
-            q1_err_w = torch.atan2(torch.sin(next_state[0] - x_goal[0]),
-                                   torch.cos(next_state[0] - x_goal[0]))
-            q2_shape      = 1.0 - torch.cos(next_state[2])
-            q2_dot_penalty = W_Q2_DOT * next_state[3] ** 2
-
-            step_state_err = (pos_w * (3.0 * q1_err_w**2 + err[1]**2 + err[3]**2)
-                              + W_Q2_SHAPE * q2_shape
-                              + q2_dot_penalty)
-            step_losses.append(torch.clamp(step_state_err, max=STEP_LOSS_CLAMP))
-
-            qf_anchor_terms.append(((Qf_dense - mpc.Qf) ** 2).mean())
-
+            # ── QP: fixed costs, NO energy shaping ────────────────────────
+            x_det = x.detach()
+            x_lin = x_det.unsqueeze(0).expand(mpc.N, -1).clone()
             with torch.no_grad():
-                x_mpc_predicted = mpc.MPC_RK4_disc(current_state_detached, u_mpc.detach(), mpc.dt)
-                delta = next_state.detach() - x_mpc_predicted
+                u_mpc, U_opt_full = mpc.control(
+                    x_det, x_lin, u_seq_guess, x_goal,
+                    diag_corrections_Q=None,
+                    diag_corrections_R=None,
+                    extra_linear_control=None,
+                    Qf_dense=None,
+                )
+
+            # ── Residual ──────────────────────────────────────────────────
+            u_applied = torch.clamp(
+                u_mpc.detach() + u_lin_delta[0],
+                min=u_min, max=u_max,
+            )
+
+            # RK4: gradient flows within BPTT window
+            x_next = mpc.true_RK4_disc(x, u_applied, mpc.dt)
+
+            # ── Loss ──────────────────────────────────────────────────────
+            # Energy-difference reward: penalise energy DECREASE when below
+            # goal.  Gradient sign flips with velocity — if pushing τ1 slows
+            # backward motion, kinetic energy falls → loss rises → network
+            # learns to follow velocity sign (the pump rule).
+            E_prev = _compute_q1_energy(x.detach())   # current KE+PE, no grad
+            E_next_val = _compute_q1_energy(x_next)   # next step, grad flows
+            deficit = torch.relu(E_q1_goal - E_prev).detach()
+            # loss = -dE * deficit/scale  → minimised by increasing energy when deficit>0
+            loss_pump = -W_E_DIFF * (E_next_val - E_prev) * deficit / (E_q1_goal.abs()**2 + 1.0)
+
+            q1_err = torch.atan2(
+                torch.sin(x_next[0] - x_goal[0]),
+                torch.cos(x_next[0] - x_goal[0]),
+            )
+            err   = x_next - x_goal
+            # q2² gives stronger gradient at large angles (vs 1-cos which is ~q2²/2)
+            sloss = (loss_pump
+                     + W_Q1  * q1_err**2
+                     + W_VEL * err[1]**2
+                     + W_Q2_SHAPE * x_next[2]**2
+                     + W_Q2_VEL   * x_next[3]**2)
+            window_losses.append(torch.clamp(sloss, max=STEP_LOSS_CLAMP))
+
+            end_of_window = ((step + 1) % BPTT_W == 0) or (step == num_steps - 1)
+
+            if end_of_window:
+                # One backward + one optimizer step per window
+                window_loss = torch.stack(window_losses).mean()
+                epoch_loss_sum += window_loss.item()
+                n_windows_total += 1
+                window_loss.backward()
+                if all(
+                    (p.grad is None or torch.isfinite(p.grad).all())
+                    for _, p in lin_net.named_parameters()
+                ):
+                    torch.nn.utils.clip_grad_norm_(lin_net.parameters(), max_norm=CLIP_GRAD)
+                    optimizer.step()
+                optimizer.zero_grad()
+                window_losses = []
+                x = x_next.detach()   # detach at window boundary
+            else:
+                x = x_next            # gradient flows within window
+
+            # ── Bookkeeping ───────────────────────────────────────────────
+            with torch.no_grad():
+                delta = x.detach() - mpc.MPC_RK4_disc(x_det, u_mpc.detach(), mpc.dt)
 
             recorder.record_step(
-                gates_Q=gates_Q,
-                gates_R=gates_R,
-                gates_E=gates_E,
-                q_diags=q_diags,
-                r_diags=r_diags,
-                u_mpc=u_mpc,
-                state_err=((next_state.detach() - x_goal) ** 2).sum(),
+                gates_Q=torch.ones(mpc.N-1, state_dim, device=mpc.device, dtype=torch.float64),
+                gates_R=torch.ones(mpc.N,   n_u,        device=mpc.device, dtype=torch.float64),
+                gates_E=torch.ones(mpc.N, device=mpc.device, dtype=torch.float64),
+                q_diags=None, r_diags=None,
+                u_mpc=u_applied,
+                state_err=((x.detach() - x_goal)**2).sum(),
                 residual_norm=delta.norm().item(),
-                Qf_dense=Qf_dense,
+                Qf_dense=None,
                 u_lin_delta=u_lin_delta,
             )
 
-            # Detach state to cut gradient accumulation across 170 QP steps.
-            # Without this, each step's QP Jacobian multiplies into the previous,
-            # producing gradient norms that grow exponentially with trajectory length.
-            # Each step still contributes a clean one-step gradient to the network.
-            current_state_detached = next_state.detach()
+            U_opt_r = U_opt_full.detach().view(mpc.N, n_u)
+            u_seq_guess = torch.cat([U_opt_r[1:], U_opt_r[-1:]], 0).clone()
+            state_hist.pop(0); state_hist.append(x.detach().clone())
+            res_hist.pop(0);   res_hist.append(delta)
 
-            U_opt_reshaped = U_opt_full.detach().view(mpc.N, n_u)
-            u_seq_guess = torch.cat([U_opt_reshaped[1:], U_opt_reshaped[-1:]], dim=0).clone()
+        avg_loss = epoch_loss_sum / max(n_windows_total, 1)
+        loss_history.append(avg_loss)
+        recorder.end_epoch(avg_loss)
 
-            state_history.pop(0)
-            state_history.append(current_state_detached.clone())
-            residual_history.pop(0)
-            residual_history.append(delta)
-
-        terminal_loss        = torch.stack(step_losses).sum() / num_steps
-        qf_anchor_loss       = torch.stack(qf_anchor_terms).mean()
-        u_lin_imitation_loss = torch.stack(u_lin_imitation_terms).mean()
-
-        total_loss = (
-            W_TERMINAL * terminal_loss
-            + W_QF_ANCHOR * qf_anchor_loss
-            + W_U_LIN_IMITATION * u_lin_imitation_loss
-        )
-
-        loss_history.append(total_loss.item())
-        recorder.end_epoch(total_loss.item())
-
-        total_loss.backward()
         grad_stats = None
         if grad_debug and ((epoch + 1) % max(1, grad_debug_every) == 0 or epoch == 0):
             grad_stats = _gradient_stats(lin_net)
 
-        # Track best model BEFORE the optimizer step: goal_dist reflects the
-        # trajectory produced by the CURRENT weights. Saving after step would
-        # record the updated (different) weights instead.
         with torch.no_grad():
-            goal_dist = torch.norm(current_state_detached - x_goal).item()
+            goal_dist = float(torch.norm(x - x_goal).item())
         if goal_dist < best_goal_dist:
             best_goal_dist = goal_dist
             import copy
             best_state_dict = copy.deepcopy(lin_net.state_dict())
 
-        if not torch.isfinite(total_loss):
-            optimizer.zero_grad()
-        else:
-            is_bad = any(
-                (not torch.isfinite(p.grad).all())
-                for _, p in lin_net.named_parameters()
-                if p.grad is not None
-            )
-            if is_bad:
-                optimizer.zero_grad()
-            else:
-                if grad_stats is not None and grad_stats["total_norm"] > SKIP_UPDATE_GRAD_NORM:
-                    optimizer.zero_grad()
-                else:
-                    qf_params    = [p for n, p in lin_net.named_parameters() if n.startswith("qf_head")    and p.grad is not None]
-                    u_lin_params = [p for n, p in lin_net.named_parameters() if n.startswith("u_lin_head") and p.grad is not None]
-                    other_params = [p for n, p in lin_net.named_parameters() if (not n.startswith("qf_head")) and (not n.startswith("u_lin_head")) and p.grad is not None]
-                    if qf_params:
-                        torch.nn.utils.clip_grad_norm_(qf_params,    max_norm=CLIP_QF_HEAD)
-                    if u_lin_params:
-                        torch.nn.utils.clip_grad_norm_(u_lin_params, max_norm=CLIP_U_LIN)
-                    if other_params:
-                        torch.nn.utils.clip_grad_norm_(other_params, max_norm=CLIP_OTHER)
-                    optimizer.step()
-
-        scheduler.step(epoch + 1)
+        # Optimizer steps already done inside the BPTT window loop above.
+        # Just advance the LR scheduler with this epoch's average loss.
+        scheduler.step(avg_loss)
 
         if debug_monitor:
             with torch.no_grad():
                 summary = recorder.epoch_summary(epoch)
-                qp_fallbacks_epoch = int(getattr(mpc, 'qp_fallback_count', 0)) - qp_fallback_start
-
-            debug_monitor.log_epoch(epoch, num_epochs, total_loss.item(), {
-                'epoch_time': time.time() - epoch_start_time,
-                'learning_rate': optimizer.param_groups[0]['lr'],
-                'loss_terminal': terminal_loss.item(),
-                'loss_qf_anchor': qf_anchor_loss.item(),
-                'qp_fallbacks': qp_fallbacks_epoch,
-                'pure_end_error': goal_dist,
-                'mean_Q_gate_dev': summary.get('mean_Q_gate_dev', float('nan')),
-                'mean_E_gate_dev': summary.get('mean_E_gate_dev', float('nan')),
+            qp_fallbacks_epoch = int(getattr(mpc, 'qp_fallback_count', 0)) - qp_fallback_start
+            debug_monitor.log_epoch(epoch, num_epochs, avg_loss, {
+                'epoch_time':      time.time() - epoch_start_time,
+                'learning_rate':   optimizer.param_groups[0]['lr'],
+                'loss_terminal':   avg_loss,
+                'qp_fallbacks':    qp_fallbacks_epoch,
+                'pure_end_error':  goal_dist,
+                'mean_Q_gate_dev': 0.0,
+                'mean_E_gate_dev': 0.0,
                 'mean_u_lin_norm': summary.get('mean_u_lin_norm', float('nan')),
-                'mean_qf_norm': summary.get('mean_qf_norm', float('nan')),
+                'mean_qf_norm':    float('nan'),
             })
 
         if grad_stats is not None:
@@ -462,13 +409,7 @@ def train_linearization_network(
                 f"qf={mn['qf_head']:.3e} "
                 f"missing={grad_stats['missing_count']}"
             )
-            if grad_stats["total_norm"] > SKIP_UPDATE_GRAD_NORM:
-                print(f"      GradFlow | update skipped (norm>{SKIP_UPDATE_GRAD_NORM:.1e})")
-            if grad_stats["missing_count"] > 0:
-                sample = ", ".join(grad_stats["missing_names"][:5])
-                print(f"      NoGrad sample: {sample}")
 
-    # Restore best weights so the caller gets the best-seen model, not the last
     if best_state_dict is not None:
         lin_net.load_state_dict(best_state_dict)
 
@@ -482,7 +423,11 @@ def rollout(
     x_goal: torch.Tensor,
     num_steps: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-
+    """
+    Inference rollout — mirrors the residual training architecture exactly:
+      u_applied = clamp(u_mpc_fixed_costs + u_lin_delta[0], limits)
+    QP costs are fixed (no gate influence); only u_lin_delta adjusts the action.
+    """
     n_x = x0.shape[0]
     n_u = mpc.MPC_dynamics.u_min.shape[0]
 
@@ -493,25 +438,9 @@ def rollout(
     x_hist[0] = x
     u_seq_guess = torch.zeros((mpc.N, n_u), dtype=torch.float64, device=mpc.device)
 
-    # For non-zero initial tilt, the zero warm-start exposes gravity pulling
-    # the nominal trajectory backward, which causes the velocity-gradient energy
-    # shaping to push τ1 negative before any forward momentum is built.
-    # Pre-seed u_seq_guess with enough τ1 to overcome gravity so the first
-    # nominal rollout shows forward motion and the energy shaping fires correctly.
-    init_q1 = float(x[0].item())
-    if abs(init_q1) > 0.01:
-        gravity_torque = 2.0 * 9.81 * 0.5 * abs(math.sin(init_q1))
-        wrapped_err = math.atan2(
-            math.sin(float(x_goal[0].item()) - init_q1),
-            math.cos(float(x_goal[0].item()) - init_q1),
-        )
-        goal_sign = 1.0 if wrapped_err > 0 else -1.0
-        seed_tau1 = goal_sign * min(float(mpc.MPC_dynamics.u_max[0].item()),
-                                    gravity_torque * 2.0)
-        u_seq_guess[:, 0] = seed_tau1
-
     state_history = [x.clone() for _ in range(5)]
-    E_q1_goal_rollout = _compute_q1_energy(x_goal).detach()
+    u_min = mpc.MPC_dynamics.u_min
+    u_max = mpc.MPC_dynamics.u_max
 
     if lin_net is not None:
         lin_net.eval()
@@ -519,59 +448,48 @@ def rollout(
             torch.zeros(lin_net.state_dim, device=mpc.device, dtype=torch.float64)
             for _ in range(lin_net.n_res)
         ]
+    else:
+        residual_history = None
 
     for step in range(num_steps):
         with torch.no_grad():
             if lin_net is not None:
-                gates_Q, gates_R, gates_E, Qf_dense, _, _, u_lin_delta = lin_net(
+                _, _, _, _, _, _, u_lin_delta = lin_net(
                     torch.stack(state_history, dim=0),
                     torch.stack(residual_history, dim=0),
                     q_base_diag=mpc.q_base_diag,
                     r_base_diag=mpc.r_base_diag,
                 )
             else:
-                gates_Q, gates_R, gates_E, Qf_dense = None, None, None, None
                 u_lin_delta = torch.zeros((mpc.N, n_u), dtype=torch.float64, device=mpc.device)
 
-        x_lin_seq = x.unsqueeze(0).expand(mpc.N, -1).clone()
-        u_lin_seq = torch.clamp(
-            u_seq_guess.clone() + u_lin_delta,
-            min=mpc.MPC_dynamics.u_min.unsqueeze(0),
-            max=mpc.MPC_dynamics.u_max.unsqueeze(0),
-        )
+            x_lin = x.unsqueeze(0).expand(mpc.N, -1).clone()
+            u_opt, U_opt_full = mpc.control(
+                x, x_lin, u_seq_guess, x_goal,
+                diag_corrections_Q=None,
+                diag_corrections_R=None,
+                extra_linear_control=None,
+                Qf_dense=None,
+            )
 
-        extra_ctrl = (
-            _build_energy_control_tau1(u_lin_seq, x, mpc, gates_E, E_q1_goal_rollout)
-            if gates_E is not None else None
-        )
-
-        u_opt, U_opt_full = mpc.control(
-            x,
-            x_lin_seq,
-            u_lin_seq,
-            x_goal,
-            diag_corrections_Q=gates_Q,
-            diag_corrections_R=gates_R,
-            extra_linear_control=extra_ctrl,
-            Qf_dense=Qf_dense,
-        )
+            # Residual correction — same formula as training
+            u_applied = torch.clamp(u_opt + u_lin_delta[0], min=u_min, max=u_max)
 
         x_prev = x.clone()
-        x = mpc.true_RK4_disc(x, u_opt, mpc.dt)
+        x = mpc.true_RK4_disc(x, u_applied, mpc.dt)
 
-        u_hist[step] = u_opt.detach()
+        u_hist[step] = u_applied.detach()
         x_hist[step + 1] = x.detach()
 
         U_opt_reshaped = U_opt_full.detach().view(mpc.N, n_u)
         u_seq_guess[:-1] = U_opt_reshaped[1:].clone()
-        u_seq_guess[-1] = U_opt_reshaped[-1].clone()
+        u_seq_guess[-1]  = U_opt_reshaped[-1].clone()
 
         state_history.pop(0)
         state_history.append(x.detach().clone())
 
         if lin_net is not None:
-            with torch.no_grad():
-                delta = x.detach() - mpc.MPC_RK4_disc(x_prev, u_opt.detach(), mpc.dt)
+            delta = x.detach() - mpc.MPC_RK4_disc(x_prev, u_opt.detach(), mpc.dt)
             residual_history.pop(0)
             residual_history.append(delta)
 

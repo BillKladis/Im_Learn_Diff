@@ -20,12 +20,8 @@ class MPC_controller:
         self.N      = N
         self.dt     = torch.tensor(0.05, device=device, dtype=torch.float64)
 
-        # q_base_diag: [q1=6, q1_dot=2, q2=15, q2_dot=10]
-        # Deliberately weak baseline — the untrained network produces imperfect
-        # swing-up so training has a real gradient to follow.
-        # Gate range ±0.8 lets the network reach up to 1.8× these values,
-        # i.e. [10.8, 3.6, 27, 18] at maximum — comparable to the hand-tuned values.
-        self.q_base_diag = torch.tensor([6.0, 2.0, 15.0, 10.0], device=device, dtype=torch.float64)
+        # q_base_diag: [q1=12, q1_dot=5, q2=35, q2_dot=25]
+        self.q_base_diag = torch.tensor([12.0, 5.0, 35.0, 25.0], device=device, dtype=torch.float64)
         self.r_base_diag = torch.tensor([1.0, 1.0], device=device, dtype=torch.float64)
         self.Qf = torch.diag(torch.tensor([20.0, 20.0, 40.0, 30.0], device=device, dtype=torch.float64))
 
