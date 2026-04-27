@@ -249,14 +249,20 @@ def train_linearization_network(
     E_range = (E_demo.max() - E_demo.min()).clamp(min=1.0)
 
     optimizer = torch.optim.AdamW(lin_net.parameters(), lr=lr, weight_decay=1e-4)
-    # Constant LR.  Cosine restarts in the previous loop caused the loss to
-    # bounce out of its early minimum into worse states, and plain cosine
-    # decay annealed the LR too quickly — the loss plateaued by epoch ~10
-    # before the network could escape its initial torque-saturation lock.
-    # Constant LR lets the optimiser keep pushing.
+    # Constant LR (cosine annealing was tested and didn't prevent the
+    # post-swing-up drift — it just slowed it).  Early stopping on
+    # best-goal-dist patience is the actual fix.
     scheduler = torch.optim.lr_scheduler.ConstantLR(
         optimizer, factor=1.0, total_iters=max(num_epochs, 1),
     )
+
+    # Early-stopping bookkeeping: stop when best_goal_dist hasn't improved
+    # for `patience` consecutive epochs.  Energy-tracking imitation finds
+    # the swing-up basin in ~15-20 epochs and then drifts because the
+    # loss landscape is path-degenerate; without early stopping the
+    # final state is a different (worse) energy-matching trajectory.
+    EARLY_STOP_PATIENCE = 8
+    epochs_since_improvement = 0
 
     loss_history    = []
     best_goal_dist  = float("inf")
@@ -395,6 +401,9 @@ def train_linearization_network(
         if goal_dist < best_goal_dist:
             best_goal_dist = goal_dist
             best_state_dict = copy.deepcopy(lin_net.state_dict())
+            epochs_since_improvement = 0
+        else:
+            epochs_since_improvement += 1
 
         if not torch.isfinite(total_loss):
             optimizer.zero_grad()
@@ -446,6 +455,19 @@ def train_linearization_network(
                 f"f={mn['f_head']:.3e} "
                 f"missing={grad_stats['missing_count']}"
             )
+
+        # Early stop: best goal-dist hasn't improved for too many epochs
+        # AND we've already found a near-goal solution worth keeping.
+        if (
+            epochs_since_improvement >= EARLY_STOP_PATIENCE
+            and best_goal_dist < 1.0
+        ):
+            print(
+                f"      EarlyStop after epoch {epoch+1}: "
+                f"best_goal_dist={best_goal_dist:.4f} hasn't improved "
+                f"for {epochs_since_improvement} epochs."
+            )
+            break
 
     if best_state_dict is not None:
         lin_net.load_state_dict(best_state_dict)
