@@ -38,7 +38,7 @@ DT        = 0.05                      # seconds
 
 EPOCHS       = 40
 LR           = 5e-4
-BPTT_WINDOW  = 15
+BPTT_WINDOW  = 20
 HORIZON      = 10
 HIDDEN_DIM   = 128
 GATE_RANGE_Q = 0.50
