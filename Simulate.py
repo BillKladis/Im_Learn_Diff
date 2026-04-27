@@ -312,12 +312,16 @@ def train_linearization_network(
                 torch.cos(x_next[0] - x_goal[0]),
             )
             err   = x_next - x_goal
-            # q2² gives stronger gradient at large angles (vs 1-cos which is ~q2²/2)
+            # Gate q2 terms by proximity to upright. Without gating, the
+            # M^{-1}[q2,τ1]≈-8 coupling drives a gradient that pushes τ1
+            # negative during swing-up — exactly wrong. At q1=0 the gate=0
+            # so q2 coupling cannot oppose pumping; at q1=π the gate=1.
+            stabilize_gate = 1.0 - q1_err.abs() / math.pi  # 0 at bottom, 1 at top
             sloss = (loss_pump
                      + W_Q1  * q1_err**2
                      + W_VEL * err[1]**2
-                     + W_Q2_SHAPE * x_next[2]**2
-                     + W_Q2_VEL   * x_next[3]**2)
+                     + W_Q2_SHAPE * stabilize_gate * x_next[2]**2
+                     + W_Q2_VEL   * stabilize_gate * x_next[3]**2)
             window_losses.append(torch.clamp(sloss, max=STEP_LOSS_CLAMP))
 
             end_of_window = ((step + 1) % BPTT_W == 0) or (step == num_steps - 1)
