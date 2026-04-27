@@ -216,6 +216,7 @@ def train_linearization_network(
     grad_debug:         bool  = False,
     grad_debug_every:   int   = 1,
     track_mode: str     = "energy",   # "state" (rigid Euclidean) or "energy" (scalar)
+    w_terminal_anchor:  float = 0.0,  # ONLY at last step: small wrap(q1-π)² pull
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -226,6 +227,12 @@ def train_linearization_network(
     W_Q2_SHAPE      = 0.0
     W_Q2_DOT        = 0.0
     STEP_LOSS_CLAMP = 200.0
+    # Terminal-anchor strength.  Energy tracking alone leaves position
+    # under-constrained — many trajectories with the right energy curve
+    # do NOT end at q1=π.  A small final-step-only wrap(q1-π)² pull
+    # stabilises which "correct-energy" trajectory the network converges
+    # to.  This is one extra term, not a generic stack.
+    W_FINAL_ANCHOR  = float(w_terminal_anchor)
 
     SKIP_UPDATE_GRAD_NORM = 5e7
     CLIP_OTHER = 2.0
@@ -272,6 +279,7 @@ def train_linearization_network(
         track_step_terms    = []
         terminal_step_terms = []
         q2_step_terms       = []
+        last_anchor_term    = torch.tensor(0.0, device=mpc.device, dtype=torch.float64)
 
         for step in range(num_steps):
             state_history_seq = torch.stack(state_history, dim=0)
@@ -336,6 +344,15 @@ def train_linearization_network(
             terminal_step = torch.clamp(terminal_step, max=STEP_LOSS_CLAMP)
             terminal_step_terms.append(terminal_step)
 
+            # Capture the FINAL-step's wrapped q1 anchor while next_state
+            # is still differentiable (it's about to be detached below).
+            if step == num_steps - 1 and W_FINAL_ANCHOR > 0.0:
+                q1_wrap = torch.atan2(
+                    torch.sin(next_state[0] - x_goal[0]),
+                    torch.cos(next_state[0] - x_goal[0]),
+                )
+                last_anchor_term = q1_wrap ** 2 + 0.1 * next_state[1] ** 2
+
             recorder.record_step(
                 gates_Q=gates_Q, gates_R=gates_R, f_extra=f_extra,
                 q_diags=q_diags, r_diags=r_diags,
@@ -356,9 +373,12 @@ def train_linearization_network(
         terminal_loss = torch.stack(terminal_step_terms).sum() / num_steps
         q2_loss       = torch.stack(q2_step_terms).sum()       / num_steps
 
+        anchor_loss = last_anchor_term  # captured during the final step
+
         total_loss = (
             W_TRACK    * track_loss
             + W_TERMINAL * terminal_loss
+            + W_FINAL_ANCHOR * anchor_loss
             + q2_loss
         )
 
@@ -406,7 +426,7 @@ def train_linearization_network(
                 "epoch_time":         time.time() - epoch_start_time,
                 "learning_rate":      optimizer.param_groups[0]["lr"],
                 "loss_track":         track_loss.item(),
-                "loss_terminal":      terminal_loss.item(),
+                "loss_terminal":      float(anchor_loss.detach().item()) if W_FINAL_ANCHOR > 0 else terminal_loss.item(),
                 "loss_q2":            q2_loss.item(),
                 "qp_fallbacks":       qp_fallbacks_epoch,
                 "pure_end_error":     goal_dist,

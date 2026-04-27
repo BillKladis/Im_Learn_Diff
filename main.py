@@ -46,7 +46,7 @@ X_GOAL    = [math.pi, 0.0, 0.0, 0.0]
 NUM_STEPS = 170
 DT        = 0.05
 
-EPOCHS      = 60
+EPOCHS      = 80
 LR          = 1e-3
 HORIZON     = 10
 HIDDEN_DIM  = 128
@@ -55,6 +55,14 @@ HIDDEN_DIM  = 128
 #   "state"  — original rigid Euclidean ||x - demo[t+1]||² (saturated, locks)
 #   "energy" — scalar (E(x) - E_demo[t+1])²/E_range² (monotone, escapes lock)
 TRACK_MODE  = "energy"
+
+# Final-step-only wrap(q1-π)² + 0.1·q1d² anchor.  In testing, anchor=1.0
+# actually HURT performance because the wrap(q1-π)² gradient pulls toward
+# q1=π immediately at every step, which the QP saturates against (recreating
+# the original lock).  Energy tracking alone produces clean swing-up
+# (goal_dist=0.14) so we keep this disabled.  Left as a knob in case
+# stability becomes a concern; values like 0.05-0.2 may help.
+W_TERMINAL_ANCHOR = 0.0
 
 # Zero out the q1/q1_dot RUNNING costs in the QP.  Otherwise the QP's
 # state-error pull (12·π² ≈ 118 in f-vector) saturates u at +3 Nm and
@@ -275,8 +283,10 @@ def main():
     print("  MPC LinearizationNetwork  —  Stage D + trajectory imitation")
     print("  Architecture: state encoder → trunk → {Q, R, F} heads")
     print("  QP solver:    cvxpylayers (DPP, SCS)")
-    print("  Loss:         W_TRACK=5.0 × ||x_t − demo[t+1]||² + terminal + q2")
-    print("  Init:         f_head kickstart DISABLED (tracking gradient is enough)")
+    print(f"  Track mode  : {TRACK_MODE}  (state | energy)")
+    print(f"  Anchor pull : {W_TERMINAL_ANCHOR}  (final-step wrap(q1-π)²)")
+    print(f"  Zero q1 cost: {ZERO_Q1_COSTS}")
+    print("  Init:         f_head kickstart DISABLED")
     print("=" * 76)
     print(f"  Demo CSV        : {DEMO_CSV}")
     print(f"  Demo length     : {demo.shape[0]} states")
@@ -369,6 +379,7 @@ def main():
         grad_debug=GRAD_DEBUG,
         grad_debug_every=GRAD_DEBUG_EVERY,
         track_mode=TRACK_MODE,
+        w_terminal_anchor=W_TERMINAL_ANCHOR,
     )
     total_time = time.time() - t0
 
