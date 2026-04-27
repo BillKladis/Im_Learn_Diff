@@ -102,7 +102,7 @@ class LinearizationNetwork(nn.Module):
         # q2/q2_dot weights match the Q matrix's anti-fold priorities.
         base_L_matrix = torch.zeros((state_dim, state_dim), dtype=torch.float64)
         base_L_matrix[0, 0] = math.sqrt(20.0)   # Qf_q1     ≈ 20
-        base_L_matrix[1, 1] = math.sqrt(60.0)   # Qf_q1dot  ≈ 60 (prevents overshoot)
+        base_L_matrix[1, 1] = math.sqrt(25.0)   # Qf_q1dot  ≈ 25 (moderate; network tunes this up)
         base_L_matrix[2, 2] = math.sqrt(30.0)   # Qf_q2     ≈ 30
         base_L_matrix[3, 3] = math.sqrt(30.0)   # Qf_q2dot  ≈ 30
         base_L_matrix[1, 0] = 1.0
@@ -148,12 +148,6 @@ class LinearizationNetwork(nn.Module):
         _init_block(self.qf_head, final_std=0.001)
         _init_block(self.u_lin_head, final_std=0.001)
         _init_block(self.e_head, final_std=0.01)
-        # Bias the energy gate output strongly negative so gates_E ≈ sigmoid(-4) ≈ 0.018
-        # at initialisation.  The base QP has almost no energy shaping; the network
-        # must learn to increase the gate.  This creates the performance gap that
-        # makes training decrease the loss rather than increase it.
-        with torch.no_grad():
-            self.e_head[-1].bias.fill_(-4.0)
 
     def forward(
         self,
@@ -193,11 +187,8 @@ class LinearizationNetwork(nn.Module):
         u_lin_delta = self.u_lin_bound * torch.tanh(raw_u_lin)
 
         # ── Energy Shaping Gates ──────────────────────────────────────
-        # sigmoid maps raw_E → (0, 1).  Bias is initialised to -4 so the gate
-        # starts near 0 and the network must learn to open it.  Multiplying by 2
-        # lets the gate reach up to 2× the base shaping weight when fully open.
         raw_E   = self.e_head(features).reshape(self.horizon)
-        gates_E = 2.0 * torch.sigmoid(raw_E)
+        gates_E = 1.0 + self.gate_range_e * torch.tanh(raw_E)
 
         q_diags = (q_base_diag.unsqueeze(0) * gates_Q) if q_base_diag is not None else None
         r_diags = (r_base_diag.unsqueeze(0) * gates_R) if r_base_diag is not None else None
