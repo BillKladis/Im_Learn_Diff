@@ -46,7 +46,7 @@ X_GOAL    = [math.pi, 0.0, 0.0, 0.0]
 NUM_STEPS = 170
 DT        = 0.05
 
-EPOCHS      = 50
+EPOCHS      = 60
 LR          = 1e-3
 HORIZON     = 10
 HIDDEN_DIM  = 128
@@ -55,6 +55,15 @@ HIDDEN_DIM  = 128
 #   "state"  — original rigid Euclidean ||x - demo[t+1]||² (saturated, locks)
 #   "energy" — scalar (E(x) - E_demo[t+1])²/E_range² (monotone, escapes lock)
 TRACK_MODE  = "energy"
+
+# Zero out the q1/q1_dot RUNNING costs in the QP.  Otherwise the QP's
+# state-error pull (12·π² ≈ 118 in f-vector) saturates u at +3 Nm and
+# f_extra (max ±3) cannot overcome it — the network gets stuck because
+# its gradient vanishes against the active control bound.  With these
+# zeroed, f_extra is the actual angular policy; the QP's job becomes
+# (a) preventing q2 fold via q2/q2_dot running cost, (b) terminal pull
+# via Qf, and (c) being a smoothness regulariser on the network's policy.
+ZERO_Q1_COSTS = True
 
 GATE_RANGE_Q     = 0.95
 GATE_RANGE_R     = 0.20
@@ -284,6 +293,12 @@ def main():
 
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON, device=device)
     mpc.dt = torch.tensor(DT, device=device, dtype=torch.float64)
+
+    if ZERO_Q1_COSTS:
+        # See top of file for rationale.
+        mpc.q_base_diag = torch.tensor(
+            [0.0, 0.0, 50.0, 40.0], device=device, dtype=torch.float64,
+        )
 
     lin_net = network_module.LinearizationNetwork(
         state_dim=STATE_DIM, control_dim=CONTROL_DIM,
