@@ -147,7 +147,13 @@ class LinearizationNetwork(nn.Module):
         _init_block(self.r_head, final_std=0.01)
         _init_block(self.qf_head, final_std=0.001)
         _init_block(self.u_lin_head, final_std=0.001)
-        _init_block(self.e_head, final_std=0.01) # Initialize energy gates near 1.0
+        _init_block(self.e_head, final_std=0.01)
+        # Bias the energy gate output strongly negative so gates_E ≈ sigmoid(-4) ≈ 0.018
+        # at initialisation.  The base QP has almost no energy shaping; the network
+        # must learn to increase the gate.  This creates the performance gap that
+        # makes training decrease the loss rather than increase it.
+        with torch.no_grad():
+            self.e_head[-1].bias.fill_(-4.0)
 
     def forward(
         self,
@@ -187,8 +193,11 @@ class LinearizationNetwork(nn.Module):
         u_lin_delta = self.u_lin_bound * torch.tanh(raw_u_lin)
 
         # ── Energy Shaping Gates ──────────────────────────────────────
+        # sigmoid maps raw_E → (0, 1).  Bias is initialised to -4 so the gate
+        # starts near 0 and the network must learn to open it.  Multiplying by 2
+        # lets the gate reach up to 2× the base shaping weight when fully open.
         raw_E   = self.e_head(features).reshape(self.horizon)
-        gates_E = 1.0 + self.gate_range_e * torch.tanh(raw_E)
+        gates_E = 2.0 * torch.sigmoid(raw_E)
 
         q_diags = (q_base_diag.unsqueeze(0) * gates_Q) if q_base_diag is not None else None
         r_diags = (r_base_diag.unsqueeze(0) * gates_R) if r_base_diag is not None else None
