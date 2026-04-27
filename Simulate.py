@@ -140,6 +140,7 @@ def gradient_flow_smoke_test(
     x_goal:      torch.Tensor,
     demo:        torch.Tensor,
     num_steps:   int = 5,
+    track_mode:  str = "energy",
 ) -> dict:
     """Smoke test: ensure gradient flows from a tracking loss to all heads."""
     lin_net.train()
@@ -175,8 +176,14 @@ def gradient_flow_smoke_test(
         )
 
         next_state = mpc.true_RK4_disc(current_state, u_mpc, mpc.dt)
-        target = demo[min(t + 1, demo.shape[0] - 1)]
-        step_losses.append(((next_state - target) ** 2).sum())
+        target_idx = min(t + 1, demo.shape[0] - 1)
+        if track_mode == "energy":
+            E_now = mpc.compute_energy_single(next_state)
+            E_target = mpc.compute_energy_single(demo[target_idx])
+            step_losses.append((E_now - E_target) ** 2)
+        else:
+            target = demo[target_idx]
+            step_losses.append(((next_state - target) ** 2).sum())
 
         current_state = next_state.detach()
         U_opt_reshaped = U_opt_full.detach().view(mpc.N, n_u)
@@ -208,12 +215,15 @@ def train_linearization_network(
     recorder:           Optional[network_module.NetworkOutputRecorder] = None,
     grad_debug:         bool  = False,
     grad_debug_every:   int   = 1,
+    track_mode: str     = "energy",   # "state" (rigid Euclidean) or "energy" (scalar)
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
-    W_TRACK         = 5.0    # dominant — drives the network toward demo trajectory
-    W_TERMINAL      = 0.0    # secondary — make sure we arrive cleanly at goal
-    W_Q2_SHAPE      = 0.0    # light always-on anti-fold
+    # State-mode: dominant track term that compares full state to demo[t+1].
+    # Energy-mode: dominant single-scalar energy track (no state mismatch).
+    W_TRACK         = 5.0
+    W_TERMINAL      = 0.0
+    W_Q2_SHAPE      = 0.0
     W_Q2_DOT        = 0.0
     STEP_LOSS_CLAMP = 200.0
 
@@ -223,9 +233,22 @@ def train_linearization_network(
     n_u = mpc.MPC_dynamics.u_min.shape[0]
     demo_T = demo.shape[0]   # number of demo states available
 
+    # Precompute demo's energy curve once (used by track_mode == "energy").
+    with torch.no_grad():
+        E_demo = torch.stack([mpc.compute_energy_single(demo[i]) for i in range(demo_T)])
+    # Energy track loss is in (Joules)² which is much larger numerically
+    # than (rad)² for state tracking — rescale by 1/E_range² so the
+    # gradient is comparable in magnitude regardless of units.
+    E_range = (E_demo.max() - E_demo.min()).clamp(min=1.0)
+
     optimizer = torch.optim.AdamW(lin_net.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=5, T_mult=2, eta_min=1e-5,
+    # Constant LR.  Cosine restarts in the previous loop caused the loss to
+    # bounce out of its early minimum into worse states, and plain cosine
+    # decay annealed the LR too quickly — the loss plateaued by epoch ~10
+    # before the network could escape its initial torque-saturation lock.
+    # Constant LR lets the optimiser keep pushing.
+    scheduler = torch.optim.lr_scheduler.ConstantLR(
+        optimizer, factor=1.0, total_iters=max(num_epochs, 1),
     )
 
     loss_history    = []
@@ -280,7 +303,17 @@ def train_linearization_network(
             # ── Tracking term (the main signal) ──────────────────────────
             target_idx = min(step + 1, demo_T - 1)
             target = demo[target_idx]
-            track_step = ((next_state - target) ** 2).sum()
+            if track_mode == "energy":
+                # Match the demo's energy curve at this time index. Energy
+                # is monotone over the swing-up (-14.7 → +14.7) so this
+                # gives a clean scalar progress signal whose gradient
+                # ∂E/∂q̇ is nonzero whenever there is motion — exactly the
+                # τ·q̇ pumping signal.  Normalised by demo energy range so
+                # numerical scale matches state tracking.
+                E_now = mpc.compute_energy_single(next_state)
+                track_step = ((E_now - E_demo[target_idx]) / E_range) ** 2
+            else:
+                track_step = ((next_state - target) ** 2).sum()
             track_step = torch.clamp(track_step, max=STEP_LOSS_CLAMP)
             track_step_terms.append(track_step)
 

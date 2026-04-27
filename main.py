@@ -46,10 +46,15 @@ X_GOAL    = [math.pi, 0.0, 0.0, 0.0]
 NUM_STEPS = 170
 DT        = 0.05
 
-EPOCHS      = 12
+EPOCHS      = 50
 LR          = 1e-3
 HORIZON     = 10
 HIDDEN_DIM  = 128
+
+# Imitation tracking mode:
+#   "state"  — original rigid Euclidean ||x - demo[t+1]||² (saturated, locks)
+#   "energy" — scalar (E(x) - E_demo[t+1])²/E_range² (monotone, escapes lock)
+TRACK_MODE  = "energy"
 
 GATE_RANGE_Q     = 0.95
 GATE_RANGE_R     = 0.20
@@ -322,6 +327,7 @@ def main():
         grad_report = train_module.gradient_flow_smoke_test(
             lin_net=lin_net, mpc=mpc, x0=x0, x_goal=x_goal,
             demo=demo, num_steps=GRAD_SMOKE_STEPS,
+            track_mode=TRACK_MODE,
         )
         mods = grad_report["module_norms"]
         print(f"    Smoke loss        : {grad_report['smoke_loss']:.6f}")
@@ -347,6 +353,7 @@ def main():
         recorder=recorder,
         grad_debug=GRAD_DEBUG,
         grad_debug_every=GRAD_DEBUG_EVERY,
+        track_mode=TRACK_MODE,
     )
     total_time = time.time() - t0
 
