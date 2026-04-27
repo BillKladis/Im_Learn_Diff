@@ -37,12 +37,12 @@ NUM_STEPS = 170
 DT        = 0.05                      # seconds
 
 EPOCHS      = 30
-LR          = 1e-4
+LR          = 5e-3
 HORIZON     = 10
 HIDDEN_DIM  = 128
-GATE_RANGE_Q = 0.50   # reduced: limits q2 cost suppression to ≤50% (was 75%)
-GATE_RANGE_R = 0.2
-GATE_RANGE_E = 0.60   # was 0.3 — more dynamic range for energy shaping gates
+GATE_RANGE_Q = 0.80   # wider range: allows network to vary Q costs ±80%
+GATE_RANGE_R = 0.30
+GATE_RANGE_E = 0.60
 N_RES       = 5
 PRINT_EVERY = 1
 GRAD_DEBUG = True
