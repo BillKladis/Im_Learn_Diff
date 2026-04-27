@@ -553,6 +553,24 @@ def rollout(
     x = x0.clone().to(mpc.device)
     x_hist[0] = x
     u_seq_guess = torch.zeros((mpc.N, n_u), dtype=torch.float64, device=mpc.device)
+
+    # For non-zero initial tilt, the zero warm-start exposes gravity pulling
+    # the nominal trajectory backward, which causes the velocity-gradient energy
+    # shaping to push τ1 negative before any forward momentum is built.
+    # Pre-seed u_seq_guess with enough τ1 to overcome gravity so the first
+    # nominal rollout shows forward motion and the energy shaping fires correctly.
+    init_q1 = float(x[0].item())
+    if abs(init_q1) > 0.01:
+        gravity_torque = 2.0 * 9.81 * 0.5 * abs(math.sin(init_q1))
+        wrapped_err = math.atan2(
+            math.sin(float(x_goal[0].item()) - init_q1),
+            math.cos(float(x_goal[0].item()) - init_q1),
+        )
+        goal_sign = 1.0 if wrapped_err > 0 else -1.0
+        seed_tau1 = goal_sign * min(float(mpc.MPC_dynamics.u_max[0].item()),
+                                    gravity_torque * 2.0)
+        u_seq_guess[:, 0] = seed_tau1
+
     state_history = [x.clone() for _ in range(5)]
     E_q1_goal_rollout = _compute_q1_energy(x_goal).detach()
 
