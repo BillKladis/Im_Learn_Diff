@@ -3,3 +3,4 @@ __pycache__/
 *.pyo
 *.pyd
 saved_models/run_20260426_223101/
+exp_compare.py
