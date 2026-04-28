@@ -156,19 +156,7 @@ def main():
     )
     elapsed = time.time() - t0
 
-    # Post-eval at multiple step counts
-    print(f"\n  Post-eval:")
-    for n in [170, 200, 250, 400]:
-        x_t, _ = train_module.rollout(
-            lin_net=lin_net, mpc=mpc, x0=x0, x_goal=x_goal, num_steps=n,
-        )
-        raw_d = float(np.linalg.norm(x_t.cpu().numpy()[-1] - np.array(X_GOAL)))
-        wrp_d = wrapped_goal_dist(x_t.cpu().numpy(), X_GOAL)
-        stable = "STABLE" if wrp_d < 0.5 else "UNSTABLE"
-        print(f"    {n:>3} steps: raw_dist={raw_d:.4f}  wrapped_dist={wrp_d:.4f}  {stable}")
-
-    print(f"\n  Training time: {elapsed:.0f}s")
-
+    # Save IMMEDIATELY after training so we don't lose the best weights
     session_name = f"stageD_stabilize_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     network_module.ModelManager(base_dir=SAVE_DIR).save_training_session(
         model=lin_net, loss_history=loss_history,
@@ -182,7 +170,20 @@ def main():
         },
         session_name=session_name, recorder=recorder,
     )
-    print(f"  Saved → saved_models/{session_name}/")
+    print(f"\n  Saved → saved_models/{session_name}/")
+
+    # Post-eval at multiple step counts
+    print(f"\n  Post-eval:")
+    for n in [170, 200, 250, 400]:
+        x_t, _ = train_module.rollout(
+            lin_net=lin_net, mpc=mpc, x0=x0, x_goal=x_goal, num_steps=n,
+        )
+        raw_d = float(np.linalg.norm(x_t.cpu().numpy()[-1] - np.array(X_GOAL)))
+        wrp_d = wrapped_goal_dist(x_t.cpu().numpy(), X_GOAL)
+        stable = "STABLE" if wrp_d < 0.5 else "UNSTABLE"
+        print(f"    {n:>3} steps: raw_dist={raw_d:.4f}  wrapped_dist={wrp_d:.4f}  {stable}")
+
+    print(f"\n  Training time: {elapsed:.0f}s")
 
 
 if __name__ == "__main__":
