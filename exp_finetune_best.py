@@ -37,9 +37,11 @@ HORIZON   = 10
 SAVE_DIR  = "saved_models"
 Q_BASE_DIAG = [12.0, 5.0, 50.0, 40.0]
 
-# Stronger end-phase stabilisation
+# Stronger end-phase stabilisation + f_extra suppression
 W_END_Q_HIGH     = 160.0
 END_PHASE_STEPS  = 30    # last 30 steps (1.5 s) get strong stabilisation push
+W_F_END_REG      = 50.0  # suppress f_extra in last N steps (stop pumping at goal)
+F_END_REG_STEPS  = 40    # last 2s: no pumping allowed
 
 
 def make_synthetic_demo(num_steps, device):
@@ -88,10 +90,12 @@ def main():
     demo   = make_synthetic_demo(NUM_STEPS, device)
 
     print("=" * 76)
-    print("  FINE-TUNE BEST: push clean swing-up below 0.06")
+    print("  FINE-TUNE BEST: push clean swing-up below 0.06 + fix overlearned pumping")
     print(f"  Checkpoint: {os.path.basename(PRETRAINED)}")
     print(f"  NUM_STEPS={NUM_STEPS}  LR={LR}  w_end_q_high={W_END_Q_HIGH}")
-    print(f"  end_phase_steps={END_PHASE_STEPS}  EPOCHS={EPOCHS}")
+    print(f"  end_phase_steps={END_PHASE_STEPS}  w_f_end_reg={W_F_END_REG}"
+          f"  f_end_reg_steps={F_END_REG_STEPS}")
+    print(f"  EPOCHS={EPOCHS}")
     print("=" * 76)
 
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON, device=device)
@@ -125,6 +129,8 @@ def main():
         q_profile_state_phase=True,
         w_end_q_high=W_END_Q_HIGH,
         end_phase_steps=END_PHASE_STEPS,
+        w_f_end_reg=W_F_END_REG,
+        f_end_reg_steps=F_END_REG_STEPS,
     )
     elapsed = time.time() - t0
 

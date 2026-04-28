@@ -254,6 +254,13 @@ def train_linearization_network(
     # penalty, which gives it a clean state-dependent supervision signal
     # without interference from the energy-tracking gradient trap.
     detach_gates_Q_for_qp: bool = False,
+    # f_extra end-phase regularisation: in the last `f_end_reg_steps` steps,
+    # penalise large feedforward output with w_f_end_reg * ||f_extra||².
+    # Prevents the network from applying large pumping torques near the goal
+    # ("overlearned energy pumping"), forcing the MPC to stabilise using its
+    # own Q-weighted feedback instead of relying on f_extra.
+    w_f_end_reg:          float = 0.0,
+    f_end_reg_steps:      int   = 20,
     # Noise injection during training: add Gaussian noise to the state
     # observations the network sees (state_history).  This is data
     # augmentation that makes the trained model robust to sensor noise
@@ -409,6 +416,13 @@ def train_linearization_network(
                 end_dev = ((1.0 - gates_Q[:, 0]) ** 2).mean() + \
                           ((1.0 - gates_Q[:, 1]) ** 2).mean()
                 phase_pen_terms.append(w_end_q_high * end_dev)
+
+            # f_extra end-phase regularisation: suppress feedforward output
+            # when close to end of trajectory.  Prevents the network from
+            # issuing large pumping torques at the goal (overlearned pumping).
+            if w_f_end_reg > 0.0 and step >= num_steps - f_end_reg_steps:
+                f_reg = w_f_end_reg * (f_extra ** 2).mean()
+                phase_pen_terms.append(f_reg)
 
             x_lin_seq = current_state_detached.unsqueeze(0).expand(mpc.N, -1).clone()
             u_lin_seq = torch.clamp(

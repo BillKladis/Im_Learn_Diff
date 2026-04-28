@@ -216,6 +216,190 @@ class LinearizationNetwork(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Sin/cos variant: encodes joint angles as (sin, cos) pairs
+# ──────────────────────────────────────────────────────────────────────────
+class LinearizationNetworkSC(nn.Module):
+    """Same as LinearizationNetwork but encodes joint angles as (sin, cos).
+
+    Input per frame: [sin(q1), cos(q1), q1d/8, sin(q2), cos(q2), q2d/8] = 6 dims
+    Total input: 5 × 6 = 30 dims  (vs 20 for the original)
+
+    Benefits:
+    - q1=+π and q1=-π map to the SAME input (sin=0, cos=-1)
+    - sign(sin(q1)) directly encodes swing direction
+    - The network can learn symmetric swing-up with less training data
+    - No extra parameters in trunk/heads — only first encoder layer differs
+    """
+
+    def __init__(
+        self,
+        state_dim:        int,
+        control_dim:      int,
+        horizon:          int,
+        hidden_dim:       int   = 128,
+        gate_range_q:     float = 0.95,
+        gate_range_r:     float = 0.20,
+        f_extra_bound:    float = 3.0,
+        f_kickstart_amp:  float = 1.0,
+        vel_scale:        float = 8.0,   # normalisation for joint velocities
+    ):
+        super().__init__()
+        self.state_dim   = state_dim
+        self.control_dim = control_dim
+        self.hidden_dim  = hidden_dim
+        self.horizon     = horizon
+        self.gate_range_q   = gate_range_q
+        self.gate_range_r   = gate_range_r
+        self.f_extra_bound  = f_extra_bound
+        self.f_kickstart_amp = f_kickstart_amp
+        self.vel_scale      = vel_scale
+
+        # For a 4-dim state [q1, q1d, q2, q2d]:
+        #   2 angles × 2 sincos + 2 velocities = 6 dims per frame
+        n_angle_dims = state_dim // 2   # number of joint angles (= 2 for double pendulum)
+        sincos_input_dim = 5 * (2 * n_angle_dims + (state_dim - n_angle_dims))
+        # = 5 × (2×2 + 2) = 5 × 6 = 30
+
+        enc_dim = hidden_dim
+        self.state_encoder = nn.Sequential(
+            nn.Linear(sincos_input_dim, enc_dim), nn.Tanh(),
+        )
+        self.trunk = nn.Sequential(
+            nn.Linear(enc_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+        )
+
+        q_out_dim = (horizon - 1) * state_dim
+        r_out_dim = horizon * control_dim
+        f_out_dim = horizon * control_dim
+
+        self.q_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, q_out_dim),
+        )
+        self.r_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, r_out_dim),
+        )
+        self.f_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, f_out_dim),
+        )
+
+        self._initialize_weights()
+
+        self.metadata = {
+            "state_dim":       state_dim,
+            "control_dim":     control_dim,
+            "hidden_dim":      hidden_dim,
+            "horizon":         horizon,
+            "gate_range_q":    gate_range_q,
+            "gate_range_r":    gate_range_r,
+            "f_extra_bound":   f_extra_bound,
+            "f_kickstart_amp": f_kickstart_amp,
+            "vel_scale":       vel_scale,
+            "architecture":    "stage_d_sincos_encoder",
+            "created_date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _initialize_weights(self):
+        def _init_block(seq: nn.Sequential, final_std: float = 0.01):
+            layers = [m for m in seq.modules() if isinstance(m, nn.Linear)]
+            for layer in layers[:-1]:
+                nn.init.normal_(layer.weight, mean=0.0, std=0.1)
+                nn.init.zeros_(layer.bias)
+            final = layers[-1]
+            nn.init.normal_(final.weight, mean=0.0, std=final_std)
+            nn.init.zeros_(final.bias)
+
+        _init_block(self.state_encoder, final_std=0.1)
+        _init_block(self.trunk,         final_std=0.1)
+        _init_block(self.q_head,        final_std=0.01)
+        _init_block(self.r_head,        final_std=0.01)
+        _init_block(self.f_head,        final_std=0.001)
+
+        if self.f_kickstart_amp > 0.0:
+            f_final = list(self.f_head.modules())[-1]
+            n_u = self.control_dim
+            init_bias = torch.zeros(self.horizon * n_u, dtype=f_final.bias.dtype)
+            for k in range(self.horizon):
+                phase = math.pi * (k + 0.5) / self.horizon
+                init_bias[k * n_u + 0] = self.f_kickstart_amp * math.sin(phase)
+            with torch.no_grad():
+                f_final.bias.copy_(init_bias)
+
+    def _encode(self, x_sequence: torch.Tensor) -> torch.Tensor:
+        """Convert [5, state_dim] raw states to [30] sin/cos encoded input."""
+        frames = []
+        for i in range(x_sequence.shape[0]):
+            s = x_sequence[i]
+            q1, q1d, q2, q2d = s[0], s[1], s[2], s[3]
+            frames.append(torch.stack([
+                torch.sin(q1), torch.cos(q1), q1d / self.vel_scale,
+                torch.sin(q2), torch.cos(q2), q2d / self.vel_scale,
+            ]))
+        return torch.cat(frames, dim=0)
+
+    def forward(
+        self,
+        x_sequence:  torch.Tensor,
+        q_base_diag: Optional[torch.Tensor] = None,
+        r_base_diag: Optional[torch.Tensor] = None,
+    ):
+        x_enc     = self._encode(x_sequence)
+        state_emb = self.state_encoder(x_enc)
+        features  = self.trunk(state_emb)
+
+        raw_Q   = self.q_head(features).reshape(self.horizon - 1, self.state_dim)
+        gates_Q = 1.0 + self.gate_range_q * torch.tanh(raw_Q)
+
+        raw_R   = self.r_head(features).reshape(self.horizon, self.control_dim)
+        gates_R = 1.0 + self.gate_range_r * torch.tanh(raw_R)
+
+        raw_F   = self.f_head(features).reshape(self.horizon, self.control_dim)
+        f_extra = self.f_extra_bound * torch.tanh(raw_F)
+
+        q_diags = (q_base_diag.unsqueeze(0) * gates_Q) if q_base_diag is not None else None
+        r_diags = (r_base_diag.unsqueeze(0) * gates_R) if r_base_diag is not None else None
+
+        return gates_Q, gates_R, f_extra, q_diags, r_diags
+
+    def save(self, filepath: str, metadata: Optional[Dict] = None):
+        parent = os.path.dirname(filepath)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if metadata:
+            self.metadata.update(metadata)
+        torch.save(
+            {"model_state_dict": self.state_dict(), "metadata": self.metadata},
+            filepath,
+        )
+
+    @classmethod
+    def load(cls, filepath: str, device: str = "cpu"):
+        checkpoint = torch.load(filepath, map_location=device, weights_only=False)
+        metadata   = checkpoint.get("metadata", {})
+        model = cls(
+            state_dim       = metadata.get("state_dim",       4),
+            control_dim     = metadata.get("control_dim",     2),
+            hidden_dim      = metadata.get("hidden_dim",      128),
+            horizon         = metadata.get("horizon",         10),
+            gate_range_q    = metadata.get("gate_range_q",    0.95),
+            gate_range_r    = metadata.get("gate_range_r",    0.20),
+            f_extra_bound   = metadata.get("f_extra_bound",   3.0),
+            f_kickstart_amp = metadata.get("f_kickstart_amp", 0.0),
+            vel_scale       = metadata.get("vel_scale",       8.0),
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device).double()
+        model.metadata = metadata
+        return model
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Recorder & ModelManager (unchanged from previous Stage D version)
 # ──────────────────────────────────────────────────────────────────────────
 class NetworkOutputRecorder:
