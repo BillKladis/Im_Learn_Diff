@@ -243,6 +243,12 @@ def train_linearization_network(
     q_profile_pump:     Optional[List[float]] = None,    # default [0.01,1,1,1]
     q_profile_stable:   Optional[List[float]] = None,    # default [1,1,1,1]
     q_profile_state_phase: bool = False,   # blend pump↔stable from cos(q1)
+    # Selective gradient training: detach gates_Q before passing to QP, so
+    # the tracking loss gradient only trains f_head (and trunk/encoder via
+    # f_head/r_head paths).  Q-head is then trained ONLY by the profile
+    # penalty, which gives it a clean state-dependent supervision signal
+    # without interference from the energy-tracking gradient trap.
+    detach_gates_Q_for_qp: bool = False,
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -381,9 +387,13 @@ def train_linearization_network(
 
             extra_ctrl = f_extra.reshape(-1)
 
+            # Optionally detach gates_Q so QP gradient doesn't flow back to
+            # q_head (which is trained only by the profile penalty).
+            gates_Q_qp = gates_Q.detach() if detach_gates_Q_for_qp else gates_Q
+
             u_mpc, U_opt_full = mpc.control(
                 current_state_detached, x_lin_seq, u_lin_seq, x_goal,
-                diag_corrections_Q=gates_Q,
+                diag_corrections_Q=gates_Q_qp,
                 diag_corrections_R=gates_R,
                 extra_linear_control=extra_ctrl,
             )
@@ -402,6 +412,24 @@ def train_linearization_network(
                 # numerical scale matches state tracking.
                 E_now = mpc.compute_energy_single(next_state)
                 track_step = ((E_now - E_demo[target_idx]) / E_range) ** 2
+            elif track_mode == "phase_aware":
+                # Pump phase: energy tracking (smooth gradient for pumping).
+                # Stable phase: WRAPPED q1 angle² + small velocity damping.
+                # The wrapped angle has non-vanishing gradient everywhere
+                # except at the goal (q1=π), unlike (cos(q1)+1)² which has
+                # zero gradient at q1=0.  This drives the pendulum reliably
+                # toward upright in the stable phase.
+                if step < phase_split_step:
+                    E_now = mpc.compute_energy_single(next_state)
+                    track_step = ((E_now - E_demo[target_idx]) / E_range) ** 2
+                else:
+                    q1, q1d = next_state[0], next_state[1]
+                    q2, q2d = next_state[2], next_state[3]
+                    q1_err_w = torch.atan2(
+                        torch.sin(q1 - x_goal[0]),
+                        torch.cos(q1 - x_goal[0]),
+                    )
+                    track_step = q1_err_w ** 2 + 0.1 * (q1d ** 2 + q2 ** 2 + q2d ** 2) / 64.0
             elif track_mode == "cos_q1":
                 # Wrapped q1-angle tracking: bounded [0, 4.2], unique
                 # minimum at demo state.  Breaks the spinning degeneracy
