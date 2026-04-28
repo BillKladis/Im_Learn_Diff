@@ -243,6 +243,11 @@ def train_linearization_network(
     q_profile_pump:     Optional[List[float]] = None,    # default [0.01,1,1,1]
     q_profile_stable:   Optional[List[float]] = None,    # default [1,1,1,1]
     q_profile_state_phase: bool = False,   # blend pump↔stable from cos(q1)
+    # End-phase Q-gate increase: in the last `end_phase_steps` steps,
+    # add penalty (1 - gates_Q[:, 0])² + (1 - gates_Q[:, 1])² to push
+    # q1 and q1d gates UP for stabilisation at the goal.
+    w_end_q_high:       float = 0.0,
+    end_phase_steps:    int   = 20,
     # Selective gradient training: detach gates_Q before passing to QP, so
     # the tracking loss gradient only trains f_head (and trunk/encoder via
     # f_head/r_head paths).  Q-head is then trained ONLY by the profile
@@ -361,15 +366,12 @@ def train_linearization_network(
                 )
 
             # Q-gate profile target: explicit per-dim target for gates_Q.
-            # During pump phase target is q_profile_pump (e.g. [0.01,1,1,1]),
+            # During pump phase target is q_profile_pump (e.g. [0.01,0.01,1,1]),
             # during stabilise phase target is q_profile_stable ([1,1,1,1]).
             # If `state_phase=True`: blend factor uses state's cos(q1-q1_goal)
-            # (0 at upright = stable, 1 far from upright = pump).  This gives
-            # the network a STATE-conditioned target so it learns to produce
-            # state-dependent gates rather than a trajectory-average compromise.
+            # (0 at upright = stable, 1 far from upright = pump).
             if w_q_profile > 0.0:
                 if q_profile_state_phase:
-                    # near_goal in [0,1]: 1 when q1≈π (at goal), 0 when q1=0 (bottom)
                     near_goal = (1.0 + torch.cos(current_state_detached[0] - x_goal[0])) / 2.0
                     near_goal = torch.clamp(near_goal, 0.0, 1.0)
                     target = (1.0 - near_goal) * q_profile_pump_t + near_goal * q_profile_stable_t
@@ -377,6 +379,17 @@ def train_linearization_network(
                     target = q_profile_pump_t if step < phase_split_step else q_profile_stable_t
                 profile_dev = ((gates_Q - target.unsqueeze(0)) ** 2).mean()
                 phase_pen_terms.append(w_q_profile * profile_dev)
+
+            # End-phase Q-gate increase: in the last `end_phase_steps` steps,
+            # explicitly push q1 and q1d gates UP (toward 1.0) regardless of
+            # state.  This drives stabilisation by activating the QP's q1
+            # cost near the end, tightening the final position to π.
+            # Designed to ADD to (not replace) the state-based profile target
+            # so it stacks: gates get pulled up only when this fires.
+            if w_end_q_high > 0.0 and step >= num_steps - end_phase_steps:
+                end_dev = ((1.0 - gates_Q[:, 0]) ** 2).mean() + \
+                          ((1.0 - gates_Q[:, 1]) ** 2).mean()
+                phase_pen_terms.append(w_end_q_high * end_dev)
 
             x_lin_seq = current_state_detached.unsqueeze(0).expand(mpc.N, -1).clone()
             u_lin_seq = torch.clamp(
