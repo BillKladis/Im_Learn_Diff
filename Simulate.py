@@ -261,6 +261,14 @@ def train_linearization_network(
     # own Q-weighted feedback instead of relying on f_extra.
     w_f_end_reg:          float = 0.0,
     f_end_reg_steps:      int   = 20,
+    # Stable-phase direct position tracking: in the last `stable_phase_steps`
+    # steps, add a POSITION loss that directly drives the state toward the
+    # goal (wrapped q1 error + normalised velocities/q2).  This is stronger
+    # than energy-only tracking for stabilisation — energy can be correct even
+    # when the pendulum is swinging through the goal rather than staying there.
+    # w_stable_phase=0 → disabled (default).
+    w_stable_phase:       float = 0.0,
+    stable_phase_steps:   int   = 30,
     # Noise injection during training: add Gaussian noise to the state
     # observations the network sees (state_history).  This is data
     # augmentation that makes the trained model robust to sensor noise
@@ -424,6 +432,14 @@ def train_linearization_network(
                 f_reg = w_f_end_reg * (f_extra ** 2).mean()
                 phase_pen_terms.append(f_reg)
 
+            # Stable-phase direct position tracking: explicit state-to-goal
+            # loss for the last N steps.  Uses wrapped q1 error so the loss
+            # has a valid gradient through ±π.  Velocities normalised so they
+            # contribute equally.  Together with f_end_reg this teaches the
+            # network to HOLD the position, not just reach it.
+            if w_stable_phase > 0.0 and step >= num_steps - stable_phase_steps:
+                pass  # applied after next_state is computed below
+
             x_lin_seq = current_state_detached.unsqueeze(0).expand(mpc.N, -1).clone()
             u_lin_seq = torch.clamp(
                 u_seq_guess.clone(),
@@ -490,6 +506,22 @@ def train_linearization_network(
                 track_step = ((next_state - target) ** 2).sum()
             track_step = torch.clamp(track_step, max=STEP_LOSS_CLAMP)
             track_step_terms.append(track_step)
+
+            # ── Stable-phase direct position tracking ────────────────────
+            if w_stable_phase > 0.0 and step >= num_steps - stable_phase_steps:
+                q1s, q1ds = next_state[0], next_state[1]
+                q2s, q2ds = next_state[2], next_state[3]
+                q1_err_s = torch.atan2(
+                    torch.sin(q1s - x_goal[0]),
+                    torch.cos(q1s - x_goal[0]),
+                )
+                stable_loss = w_stable_phase * (
+                    q1_err_s ** 2 +
+                    (q1ds / 8.0) ** 2 +
+                    (q2s / math.pi) ** 2 +
+                    (q2ds / 8.0) ** 2
+                )
+                phase_pen_terms.append(stable_loss)
 
             # ── Always-on q2 anti-fold ───────────────────────────────────
             q2_shape       = 1.0 - torch.cos(next_state[2])
