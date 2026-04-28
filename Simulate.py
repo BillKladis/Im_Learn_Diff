@@ -181,6 +181,17 @@ def gradient_flow_smoke_test(
             E_now = mpc.compute_energy_single(next_state)
             E_target = mpc.compute_energy_single(demo[target_idx])
             step_losses.append((E_now - E_target) ** 2)
+        elif track_mode == "cos_q1":
+            # Wrapped q1-angle + small velocity tracking.  Bounded [0, 4.2],
+            # unique minimum at demo state — distinguishes upright from
+            # spinning-bottom (same energy but different cos/sin).
+            target = demo[target_idx]
+            q1, q1d = next_state[0], next_state[1]
+            q1_t, q1d_t = target[0], target[1]
+            angle_err = (torch.cos(q1) - torch.cos(q1_t))**2 \
+                      + (torch.sin(q1) - torch.sin(q1_t))**2
+            vel_err = (q1d - q1d_t)**2 / 64.0   # normalised by 8^2
+            step_losses.append(angle_err + 0.1 * vel_err)
         else:
             target = demo[target_idx]
             step_losses.append(((next_state - target) ** 2).sum())
@@ -326,6 +337,16 @@ def train_linearization_network(
                 # numerical scale matches state tracking.
                 E_now = mpc.compute_energy_single(next_state)
                 track_step = ((E_now - E_demo[target_idx]) / E_range) ** 2
+            elif track_mode == "cos_q1":
+                # Wrapped q1-angle tracking: bounded [0, 4.2], unique
+                # minimum at demo state.  Breaks the spinning degeneracy
+                # of pure energy tracking (spinning ≠ upright in cos/sin).
+                q1, q1d = next_state[0], next_state[1]
+                q1_t, q1d_t = target[0], target[1]
+                angle_err = (torch.cos(q1) - torch.cos(q1_t))**2 \
+                          + (torch.sin(q1) - torch.sin(q1_t))**2
+                vel_err = (q1d - q1d_t)**2 / 64.0
+                track_step = angle_err + 0.1 * vel_err
             else:
                 track_step = ((next_state - target) ** 2).sum()
             track_step = torch.clamp(track_step, max=STEP_LOSS_CLAMP)
