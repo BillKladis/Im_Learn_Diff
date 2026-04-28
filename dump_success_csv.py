@@ -33,7 +33,7 @@ STATE_DIM, CONTROL_DIM = 4, 2
 Q_BASE_DIAG = [12.0, 5.0, 50.0, 40.0]
 
 OUT_DIR = "demo_csv"
-TRAINED_PATH = "saved_models/stageD_endqhigh_20260428_105538/stageD_endqhigh_20260428_105538.pth"
+TRAINED_PATH = "saved_models/stageD_nodemo_20260428_123448/stageD_nodemo_20260428_123448.pth"
 
 
 def save_csv(x_hist, u_hist, dt, x_goal_np, filepath):
