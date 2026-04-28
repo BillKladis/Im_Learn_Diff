@@ -254,6 +254,12 @@ def train_linearization_network(
     # penalty, which gives it a clean state-dependent supervision signal
     # without interference from the energy-tracking gradient trap.
     detach_gates_Q_for_qp: bool = False,
+    # Noise injection during training: add Gaussian noise to the state
+    # observations the network sees (state_history).  This is data
+    # augmentation that makes the trained model robust to sensor noise
+    # at deployment time.  Pass a list/tensor of 4 σ values (one per
+    # state dim).  Default: zeros = no noise.
+    train_noise_sigma:    Optional[List[float]] = None,
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -316,6 +322,19 @@ def train_linearization_network(
     if recorder is None:
         recorder = network_module.NetworkOutputRecorder()
 
+    # Build noise tensor for training-time noise injection (if any)
+    if train_noise_sigma is not None and any(s > 0 for s in train_noise_sigma):
+        train_noise_tensor = torch.tensor(
+            train_noise_sigma, device=mpc.device, dtype=torch.float64,
+        )
+    else:
+        train_noise_tensor = None
+
+    def add_train_noise(state):
+        if train_noise_tensor is None:
+            return state.clone()
+        return state + torch.randn_like(state) * train_noise_tensor
+
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         lin_net.train()
@@ -324,7 +343,7 @@ def train_linearization_network(
         qp_fallback_start = int(getattr(mpc, "qp_fallback_count", 0))
 
         current_state_detached = x0.detach().clone()
-        state_history = [current_state_detached.clone() for _ in range(5)]
+        state_history = [add_train_noise(current_state_detached).detach() for _ in range(5)]
         u_seq_guess = torch.zeros((mpc.N, n_u), device=mpc.device, dtype=torch.float64)
 
         track_step_terms    = []
@@ -499,7 +518,8 @@ def train_linearization_network(
                 [U_opt_reshaped[1:], U_opt_reshaped[-1:]], dim=0,
             ).clone()
             state_history.pop(0)
-            state_history.append(current_state_detached.clone())
+            # Inject training noise into the observation if configured.
+            state_history.append(add_train_noise(current_state_detached).detach().clone())
 
         # ── Combine ──────────────────────────────────────────────────────
         track_loss    = torch.stack(track_step_terms).sum()    / num_steps

@@ -25,7 +25,7 @@ DT        = 0.05
 HORIZON   = 10
 N_TRIALS  = 5
 
-MODEL_PATH = "saved_models/stageD_nodemo_20260428_123448/stageD_nodemo_20260428_123448.pth"
+MODEL_PATH = "saved_models/stageD_robust_20260428_143148/stageD_robust_20260428_143148.pth"
 Q_BASE_DIAG = [12.0, 5.0, 50.0, 40.0]
 
 NOISE_LEVELS = [
@@ -33,6 +33,8 @@ NOISE_LEVELS = [
     ("low",    [0.01, 0.05, 0.01, 0.05]),
     ("medium", [0.05, 0.20, 0.05, 0.20]),
     ("high",   [0.10, 0.50, 0.10, 0.50]),
+    ("xhigh",  [0.20, 1.00, 0.20, 1.00]),
+    ("brutal", [0.30, 1.50, 0.30, 1.50]),
 ]
 
 
