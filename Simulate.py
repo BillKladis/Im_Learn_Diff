@@ -306,7 +306,7 @@ def train_linearization_network(
     # the swing-up basin in ~15-20 epochs and then drifts because the
     # loss landscape is path-degenerate; without early stopping the
     # final state is a different (worse) energy-matching trajectory.
-    EARLY_STOP_PATIENCE = 8
+    EARLY_STOP_PATIENCE = 15
     epochs_since_improvement = 0
 
     loss_history    = []

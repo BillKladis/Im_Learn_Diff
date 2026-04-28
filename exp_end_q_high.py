@@ -30,7 +30,7 @@ X0        = [0.0, 0.0, 0.0, 0.0]
 X_GOAL    = [math.pi, 0.0, 0.0, 0.0]
 NUM_STEPS = 170
 DT        = 0.05
-EPOCHS    = 80
+EPOCHS    = 100
 LR        = 1e-3
 HORIZON   = 10
 HIDDEN_DIM = 128
@@ -43,7 +43,7 @@ GATE_RANGE_Q   = 0.99
 GATE_RANGE_R   = 0.20
 F_EXTRA_BOUND  = 3.0
 F_KICKSTART    = 0.0
-Q_GATE_KICKSTART_BIAS = -4.0
+Q_GATE_KICKSTART_BIAS = -3.0   # softer kickstart so end-phase pull can lift gates
 
 # State-phase profile (proven to allow swing-up at goal_dist=0.25)
 W_Q_PROFILE      = 100.0
@@ -51,9 +51,9 @@ Q_PROFILE_PUMP   = [0.01, 0.01, 1.0, 1.0]
 Q_PROFILE_STABLE = [1.0,  1.0,  1.0, 1.0]
 Q_PROFILE_STATE_PHASE = True
 
-# NEW: end-phase q-gate increase (stronger to dominate kickstart bias)
-W_END_Q_HIGH    = 200.0  # 4x stronger than before
-END_PHASE_STEPS = 35     # wider end window
+# end-phase q-gate increase (best was W=50, try slightly stronger with softer kickstart)
+W_END_Q_HIGH    = 80.0
+END_PHASE_STEPS = 20
 
 TRACK_MODE = "energy"
 
