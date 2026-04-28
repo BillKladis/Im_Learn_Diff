@@ -43,7 +43,7 @@ GATE_RANGE_Q   = 0.99
 GATE_RANGE_R   = 0.20
 F_EXTRA_BOUND  = 3.0
 F_KICKSTART    = 0.0
-Q_GATE_KICKSTART_BIAS = -3.0   # softer kickstart so end-phase pull can lift gates
+Q_GATE_KICKSTART_BIAS = -3.0   # bias=-3 was best (gave 0.1432)
 
 # State-phase profile (proven to allow swing-up at goal_dist=0.25)
 W_Q_PROFILE      = 100.0
@@ -51,7 +51,7 @@ Q_PROFILE_PUMP   = [0.01, 0.01, 1.0, 1.0]
 Q_PROFILE_STABLE = [1.0,  1.0,  1.0, 1.0]
 Q_PROFILE_STATE_PHASE = True
 
-# end-phase q-gate increase (best was W=50, try slightly stronger with softer kickstart)
+# Best from v5 (gave 0.1432) — keep this and run longer
 W_END_Q_HIGH    = 80.0
 END_PHASE_STEPS = 20
 
@@ -130,7 +130,8 @@ def main():
         f_extra_bound=F_EXTRA_BOUND, f_kickstart_amp=F_KICKSTART,
     ).to(device).double()
 
-    apply_q1_kickstart(lin_net, STATE_DIM, HORIZON, Q_GATE_KICKSTART_BIAS)
+    if Q_GATE_KICKSTART_BIAS is not None:
+        apply_q1_kickstart(lin_net, STATE_DIM, HORIZON, Q_GATE_KICKSTART_BIAS)
 
     recorder = network_module.NetworkOutputRecorder()
     monitor  = PrintMonitor(num_epochs=EPOCHS)
@@ -141,7 +142,8 @@ def main():
         x0=x0, x_goal=x_goal, demo=demo, num_steps=NUM_STEPS,
         num_epochs=EPOCHS, lr=LR,
         debug_monitor=monitor, recorder=recorder,
-        grad_debug=False, track_mode=TRACK_MODE, w_terminal_anchor=0.0,
+        grad_debug=False, track_mode=TRACK_MODE,
+        w_terminal_anchor=0.3,   # NEW: small position pull at final step
         w_q_profile=W_Q_PROFILE,
         q_profile_pump=Q_PROFILE_PUMP,
         q_profile_stable=Q_PROFILE_STABLE,
