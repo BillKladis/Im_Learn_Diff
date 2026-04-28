@@ -242,6 +242,7 @@ def train_linearization_network(
     w_q_profile:        float = 0.0,
     q_profile_pump:     Optional[List[float]] = None,    # default [0.01,1,1,1]
     q_profile_stable:   Optional[List[float]] = None,    # default [1,1,1,1]
+    q_profile_state_phase: bool = False,   # blend pump↔stable from cos(q1)
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -356,8 +357,18 @@ def train_linearization_network(
             # Q-gate profile target: explicit per-dim target for gates_Q.
             # During pump phase target is q_profile_pump (e.g. [0.01,1,1,1]),
             # during stabilise phase target is q_profile_stable ([1,1,1,1]).
+            # If `state_phase=True`: blend factor uses state's cos(q1-q1_goal)
+            # (0 at upright = stable, 1 far from upright = pump).  This gives
+            # the network a STATE-conditioned target so it learns to produce
+            # state-dependent gates rather than a trajectory-average compromise.
             if w_q_profile > 0.0:
-                target = q_profile_pump_t if step < phase_split_step else q_profile_stable_t
+                if q_profile_state_phase:
+                    # near_goal in [0,1]: 1 when q1≈π (at goal), 0 when q1=0 (bottom)
+                    near_goal = (1.0 + torch.cos(current_state_detached[0] - x_goal[0])) / 2.0
+                    near_goal = torch.clamp(near_goal, 0.0, 1.0)
+                    target = (1.0 - near_goal) * q_profile_pump_t + near_goal * q_profile_stable_t
+                else:
+                    target = q_profile_pump_t if step < phase_split_step else q_profile_stable_t
                 profile_dev = ((gates_Q - target.unsqueeze(0)) ** 2).mean()
                 phase_pen_terms.append(w_q_profile * profile_dev)
 

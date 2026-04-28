@@ -37,8 +37,8 @@ X0        = [0.0, 0.0, 0.0, 0.0]
 X_GOAL    = [math.pi, 0.0, 0.0, 0.0]
 NUM_STEPS = 170
 DT        = 0.05
-EPOCHS    = 80
-LR        = 5e-4
+EPOCHS    = 100
+LR        = 1e-3
 HORIZON   = 10
 HIDDEN_DIM = 128
 STATE_DIM   = 4
@@ -53,10 +53,11 @@ F_KICKSTART    = 0.0          # REMOVED — let energy tracking shape f_extra
 Q_GATE_KICKSTART_BIAS = -4.0  # KEPT — q1 gate near minimum at start
 
 # The KEY parameters
-W_Q_PROFILE      = 200.0      # very strong profile penalty (was 40)
+W_Q_PROFILE      = 100.0      # profile penalty (state-phase mode is more efficient)
 Q_PROFILE_PUMP   = [0.01, 1.0, 1.0, 1.0]    # [q1, q1d, q2, q2d]
 Q_PROFILE_STABLE = [1.0,  1.0, 1.0, 1.0]
 PHASE_SPLIT_FRAC = 0.7
+Q_PROFILE_STATE_PHASE = True   # blend pump↔stable based on cos(q1) (state-conditioned)
 
 # REMOVED: f-reward was saturating f_extra in wrong direction (no alternation).
 # Let pure energy tracking gradient shape f_extra naturally.
@@ -142,6 +143,7 @@ def main():
         w_q_profile=W_Q_PROFILE,
         q_profile_pump=Q_PROFILE_PUMP,
         q_profile_stable=Q_PROFILE_STABLE,
+        q_profile_state_phase=Q_PROFILE_STATE_PHASE,
         w_f_phase_reward=W_F_PHASE_REWARD,
         phase_split_frac=PHASE_SPLIT_FRAC,
     )
