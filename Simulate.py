@@ -228,6 +228,20 @@ def train_linearization_network(
     grad_debug_every:   int   = 1,
     track_mode: str     = "energy",   # "state" (rigid Euclidean) or "energy" (scalar)
     w_terminal_anchor:  float = 0.0,  # ONLY at last step: small wrap(q1-π)² pull
+    w_q1_gate_reg:      float = 0.0,  # penalty to keep q1 gate near q1_gate_reg_target
+    q1_gate_reg_target: float = 0.01, # target q1 gate value when regularizing
+    # Phase-conditional outer loss: during the first phase_split_frac portion
+    # of the trajectory, penalise large q1 gate AND reward large |f_extra|.
+    # Last (1-phase_split_frac) portion has no extra penalty (stabilisation).
+    w_q1_phase_pen:     float = 0.0,
+    w_f_phase_reward:   float = 0.0,
+    phase_split_frac:   float = 0.6,
+    # Optional Q-gate profile target during pump phase: explicit target
+    # values for [q1, q1d, q2, q2d] gates.  ||gates_Q - target||² added to
+    # loss with weight w_q_profile.  Set w_q_profile=0 to disable.
+    w_q_profile:        float = 0.0,
+    q_profile_pump:     Optional[List[float]] = None,    # default [0.01,1,1,1]
+    q_profile_stable:   Optional[List[float]] = None,    # default [1,1,1,1]
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -250,6 +264,14 @@ def train_linearization_network(
 
     n_u = mpc.MPC_dynamics.u_min.shape[0]
     demo_T = demo.shape[0]   # number of demo states available
+
+    # Build Q-profile target tensors (used by phase-conditional outer loss).
+    if q_profile_pump is None:
+        q_profile_pump = [0.01, 1.0, 1.0, 1.0]
+    if q_profile_stable is None:
+        q_profile_stable = [1.0, 1.0, 1.0, 1.0]
+    q_profile_pump_t = torch.tensor(q_profile_pump, device=mpc.device, dtype=torch.float64)
+    q_profile_stable_t = torch.tensor(q_profile_stable, device=mpc.device, dtype=torch.float64)
 
     # Precompute demo's energy curve once (used by track_mode == "energy").
     with torch.no_grad():
@@ -296,7 +318,11 @@ def train_linearization_network(
         track_step_terms    = []
         terminal_step_terms = []
         q2_step_terms       = []
+        q1_gate_reg_terms   = []
+        phase_pen_terms     = []
         last_anchor_term    = torch.tensor(0.0, device=mpc.device, dtype=torch.float64)
+        phase_split_step    = int(phase_split_frac * num_steps)
+        f_extra_max_norm    = math.sqrt(mpc.N * n_u) * lin_net.f_extra_bound
 
         for step in range(num_steps):
             state_history_seq = torch.stack(state_history, dim=0)
@@ -306,6 +332,34 @@ def train_linearization_network(
                 q_base_diag=mpc.q_base_diag,
                 r_base_diag=mpc.r_base_diag,
             )
+
+            # Q1-gate regularization: penalise q1 gate for deviating above
+            # q1_gate_reg_target.  Only fires when w_q1_gate_reg > 0.
+            if w_q1_gate_reg > 0.0:
+                q1_dev = (gates_Q[:, 0].mean() - q1_gate_reg_target).clamp(min=0.0)
+                q1_gate_reg_terms.append(q1_dev ** 2)
+
+            # Phase-conditional outer loss: during pumping phase (first
+            # phase_split_frac of trajectory) push q1 gate down and |f_extra|
+            # up.  This directly counteracts the gradient trap by exposing
+            # network outputs to the outer loss with phase-aware targets.
+            if (w_q1_phase_pen > 0.0 or w_f_phase_reward > 0.0) and step < phase_split_step:
+                q1_pen = gates_Q[:, 0].mean() ** 2
+                # Reward: penalty for ||f_extra|| being below max possible.
+                f_norm = torch.sqrt((f_extra ** 2).sum() + 1e-12)
+                f_short = (f_extra_max_norm - f_norm).clamp(min=0.0) / f_extra_max_norm
+                phase_pen_terms.append(
+                    w_q1_phase_pen   * q1_pen
+                    + w_f_phase_reward * (f_short ** 2)
+                )
+
+            # Q-gate profile target: explicit per-dim target for gates_Q.
+            # During pump phase target is q_profile_pump (e.g. [0.01,1,1,1]),
+            # during stabilise phase target is q_profile_stable ([1,1,1,1]).
+            if w_q_profile > 0.0:
+                target = q_profile_pump_t if step < phase_split_step else q_profile_stable_t
+                profile_dev = ((gates_Q - target.unsqueeze(0)) ** 2).mean()
+                phase_pen_terms.append(w_q_profile * profile_dev)
 
             x_lin_seq = current_state_detached.unsqueeze(0).expand(mpc.N, -1).clone()
             u_lin_seq = torch.clamp(
@@ -402,11 +456,24 @@ def train_linearization_network(
 
         anchor_loss = last_anchor_term  # captured during the final step
 
+        q1_gate_reg_loss = (
+            torch.stack(q1_gate_reg_terms).mean()
+            if q1_gate_reg_terms else
+            torch.tensor(0.0, device=mpc.device, dtype=torch.float64)
+        )
+        phase_pen_loss = (
+            torch.stack(phase_pen_terms).mean()
+            if phase_pen_terms else
+            torch.tensor(0.0, device=mpc.device, dtype=torch.float64)
+        )
+
         total_loss = (
             W_TRACK    * track_loss
             + W_TERMINAL * terminal_loss
             + W_FINAL_ANCHOR * anchor_loss
             + q2_loss
+            + w_q1_gate_reg * q1_gate_reg_loss
+            + phase_pen_loss
         )
 
         loss_history.append(total_loss.item())
