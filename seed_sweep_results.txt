@@ -1,0 +1,46 @@
+
+=== SEED 1 ===
+  scheduler.step(epoch + 1)
+      EarlyStop after epoch 25: best_goal_dist=0.0886 hasn't improved for 8 epochs.
+  seed 1: epochs=25/80 goal_dist=0.0886 E=14.675 elapsed=156s
+
+=== SEED 7 ===
+  scheduler.step(epoch + 1)
+      EarlyStop after epoch 24: best_goal_dist=0.3280 hasn't improved for 8 epochs.
+  seed 7: epochs=24/80 goal_dist=0.3280 E=14.738 elapsed=154s
+
+=== SEED 13 ===
+  scheduler.step(epoch + 1)
+      EarlyStop after epoch 25: best_goal_dist=0.2490 hasn't improved for 8 epochs.
+  seed 13: epochs=25/80 goal_dist=0.2490 E=14.744 elapsed=155s
+
+=== SEED 42 ===
+  scheduler.step(epoch + 1)
+      EarlyStop after epoch 25: best_goal_dist=0.1424 hasn't improved for 8 epochs.
+  seed 42: epochs=25/80 goal_dist=0.1424 E=14.615 elapsed=152s
+
+=== SEED 99 ===
+  scheduler.step(epoch + 1)
+      EarlyStop after epoch 24: best_goal_dist=0.1900 hasn't improved for 8 epochs.
+  seed 99: epochs=24/80 goal_dist=0.1900 E=14.727 elapsed=151s
+
+=== SEED 256 ===
+  scheduler.step(epoch + 1)
+      EarlyStop after epoch 25: best_goal_dist=0.0892 hasn't improved for 8 epochs.
+  seed 256: epochs=25/80 goal_dist=0.0892 E=14.660 elapsed=156s
+
+
+=== MULTI-SEED SUMMARY ===
+ seed | epochs | goal_dist |  E_final | swing-up?
+-------------------------------------------------------
+    1 |     25 |    0.0886 | +14.675 | YES
+    7 |     24 |    0.3280 | +14.738 | YES
+   13 |     25 |    0.2490 | +14.744 | YES
+   42 |     25 |    0.1424 | +14.615 | YES
+   99 |     24 |    0.1900 | +14.727 | YES
+  256 |     25 |    0.0892 | +14.660 | YES
+
+  successful (<1.0): 6/6
+  mean goal_dist:    0.1812
+  best goal_dist:    0.0886
+  worst goal_dist:   0.3280
