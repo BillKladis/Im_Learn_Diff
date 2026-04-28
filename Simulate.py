@@ -261,6 +261,16 @@ def train_linearization_network(
     # own Q-weighted feedback instead of relying on f_extra.
     w_f_end_reg:          float = 0.0,
     f_end_reg_steps:      int   = 20,
+    # State-conditional f_extra penalty: penalise ‖f_extra‖² weighted by
+    # stable_zone(state) = near_goal * low_velocity, where
+    #   near_goal     = (1 + cos(q1 - q1_goal)) / 2     ∈ [0, 1]
+    #   low_velocity  = exp(-(q1d² + q2d²) / 2)         ∈ (0, 1]
+    # The penalty is ZERO during energetic swing-up (low_velocity → 0) and
+    # FULL when the pendulum has settled near the goal.  This teaches the
+    # network to stop pumping ONLY in the stable zone — without breaking
+    # the swing-up the way a time-window penalty did.
+    # w_f_stable=0 → disabled (default).
+    w_f_stable:           float = 0.0,
     # Stable-phase direct position tracking: in the last `stable_phase_steps`
     # steps, add a POSITION loss that directly drives the state toward the
     # goal (wrapped q1 error + normalised velocities/q2).  This is stronger
@@ -431,6 +441,21 @@ def train_linearization_network(
             if w_f_end_reg > 0.0 and step >= num_steps - f_end_reg_steps:
                 f_reg = w_f_end_reg * (f_extra ** 2).mean()
                 phase_pen_terms.append(f_reg)
+
+            # State-conditional f_extra penalty: stable_zone(state) gates
+            # the penalty so it only fires near the goal AND at low velocity.
+            # Verified by inference-time test (verify_smart_gate.py): the
+            # corresponding output massage takes the 0.0612 model from
+            # wrapped_dist=5.5 at 600 steps to 0.077.
+            if w_f_stable > 0.0:
+                q1_d  = current_state_detached[0]
+                q1d_d = current_state_detached[1]
+                q2d_d = current_state_detached[3]
+                near_goal = (1.0 + torch.cos(q1_d - x_goal[0])) / 2.0
+                low_vel   = torch.exp(-(q1d_d ** 2 + q2d_d ** 2) / 2.0)
+                stable_zone = torch.clamp(near_goal * low_vel, 0.0, 1.0)
+                f_stable_pen = w_f_stable * stable_zone * (f_extra ** 2).mean()
+                phase_pen_terms.append(f_stable_pen)
 
             # Stable-phase direct position tracking: explicit state-to-goal
             # loss for the last N steps.  Uses wrapped q1 error so the loss
