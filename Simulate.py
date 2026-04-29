@@ -308,6 +308,9 @@ def train_linearization_network(
     # successful trajectory (curriculum learning).  init_history[-1]
     # should equal x0 (the most recent frame is the current state).
     init_history:         Optional[torch.Tensor] = None,
+    # Early-stop patience: epochs without best_goal_dist improvement
+    # before stopping. Default 15 matches the original heuristic.
+    early_stop_patience:  int  = 15,
     # Optional external optimizer.  Default: a fresh AdamW is created each
     # call (correct for one-shot training runs).  Curriculum experiments
     # that call this function many times with num_epochs=1 MUST pass an
@@ -384,7 +387,7 @@ def train_linearization_network(
     # the swing-up basin in ~15-20 epochs and then drifts because the
     # loss landscape is path-degenerate; without early stopping the
     # final state is a different (worse) energy-matching trajectory.
-    EARLY_STOP_PATIENCE = 15
+    EARLY_STOP_PATIENCE = early_stop_patience
     epochs_since_improvement = 0
 
     loss_history    = []

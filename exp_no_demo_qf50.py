@@ -35,7 +35,7 @@ X0        = [0.0, 0.0, 0.0, 0.0]
 X_GOAL    = [math.pi, 0.0, 0.0, 0.0]
 NUM_STEPS = 170
 DT        = 0.05
-EPOCHS    = 100
+EPOCHS    = 200    # was 100; v1 early-stopped at 52, want longer patience
 LR        = 1e-3
 HORIZON   = 10
 HIDDEN_DIM = 128
@@ -163,6 +163,7 @@ def main():
         q_profile_state_phase=True,
         w_end_q_high=W_END_Q_HIGH,
         end_phase_steps=END_PHASE_STEPS,
+        early_stop_patience=40,   # was 15; want longer patience for tighter convergence
     )
     elapsed = time.time() - t0
 
