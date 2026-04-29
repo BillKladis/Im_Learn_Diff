@@ -86,13 +86,13 @@ P1_Q_GATE_KICKSTART_BIAS = -3.0
 # --- Phase 2 (hold) ---
 P2_NUM_STEPS = 500
 P2_EPOCHS    = 80
-P2_LR        = 5e-5     # gentle fine-tune
 P2_QF_DIAG   = [20.0, 20.0, 40.0, 30.0]   # KEEP default — phase 1 was tuned for it
-P2_W_HOLD_REWARD = 5.0    # was 100 (too aggressive — saturated f_extra in 1 step)
-P2_HOLD_SIGMA    = 1.0    # was 0.5 (smoother gradient, less surgical)
-P2_HOLD_START    = 170    # reward starts after arrival window
-P2_W_Q_PROFILE   = 30.0   # higher — keep gates anchored at the trained values
-                          #  (was 5.0; need stronger anchor against hold gradient)
+P2_W_HOLD_REWARD_MAX = 2.0    # ramped from 0 over the first WARMUP epochs
+P2_W_HOLD_WARMUP     = 30     # epochs of linear ramp from 0
+P2_HOLD_SIGMA        = 1.0
+P2_HOLD_START        = 170
+P2_W_Q_PROFILE       = 50.0   # strong anchor on q_profile to preserve gates
+P2_LR                = 1e-5   # 5x lower than v3 (was 5e-5) — extra-gentle
 P2_HOLD_EVAL_EVERY = 3
 P2_HOLD_EVAL_STEPS = 1000
 P2_HOLD_PATIENCE   = 12   # 36 epochs without hold improvement
@@ -282,19 +282,24 @@ def phase2(lin_net, mpc, x0, x_goal):
 
     t0 = time.time()
     for epoch in range(P2_EPOCHS):
+        # Warmup: linearly ramp w_hold_reward from 0 to MAX over WARMUP epochs.
+        # Lets the network adapt small step-by-step instead of being shocked
+        # by a full-magnitude reward gradient on iter 1.
+        ramp = min(epoch / max(P2_W_HOLD_WARMUP, 1), 1.0)
+        active_w_hold = P2_W_HOLD_REWARD_MAX * ramp
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0, x_goal=x_goal, demo=demo, num_steps=P2_NUM_STEPS,
             num_epochs=1, lr=P2_LR,
             debug_monitor=monitor, recorder=recorder, grad_debug=False,
             track_mode="energy", w_terminal_anchor=0.0,
-            w_q_profile=P2_W_Q_PROFILE,                 # tiny
+            w_q_profile=P2_W_Q_PROFILE,
             q_profile_pump=P1_Q_PROFILE_PUMP,
             q_profile_stable=P1_Q_PROFILE_STABLE,
             q_profile_state_phase=True,
-            w_end_q_high=0.0,                           # disabled in Phase 2
+            w_end_q_high=0.0,
             end_phase_steps=20,
-            w_hold_reward=P2_W_HOLD_REWARD,             # << the new signal
+            w_hold_reward=active_w_hold,
             hold_sigma=P2_HOLD_SIGMA,
             hold_start_step=P2_HOLD_START,
             external_optimizer=optimizer,
