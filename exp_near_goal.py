@@ -113,7 +113,7 @@ def main():
     pert = np.array(NEAR_PERT)
 
     best_state_dict = copy.deepcopy(lin_net.state_dict())
-    best_swingup    = float('inf')
+    best_swingup    = 0   # longest contiguous hold steps; bigger is better
 
     demo_su   = make_swingup_demo(NUM_STEPS_SU, device)
     demo_flat = make_flat_upright_demo(NUM_STEPS_NG, device)
