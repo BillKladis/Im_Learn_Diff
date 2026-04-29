@@ -322,6 +322,18 @@ def train_linearization_network(
     distill_pos_pert:     float = 0.3,    # max |δq1| in synth state
     distill_vel_pert:     float = 0.3,    # max |δq1d|, |δq2d|
     distill_q2_pert:      float = 0.1,    # max |δq2|
+    # Hold-reward loss: differentiable 'soft time in zone' signal that
+    # rewards sustained near-goal behavior. For each step >= hold_start,
+    #     in_zone_soft[t] = exp(-(wrap(q1-q1_g)² + q1d² + q2² + q2d²) / σ²)
+    # The loss subtracts w_hold_reward * mean(in_zone_soft[hold_start:]),
+    # so larger soft total time → smaller (more negative) loss → gradient
+    # pushes the network toward 'stay near upright with low velocity'.
+    # Smooth (no thresholds), gradient-safe, and CLEANLY SEPARATE from
+    # the swing-up signal (which fires before hold_start).
+    # w_hold_reward=0 disables.
+    w_hold_reward:        float = 0.0,
+    hold_sigma:           float = 0.5,    # zone width — exp(-||x-g||²/σ²)
+    hold_start_step:      int   = 170,    # first step where reward fires
     # Early-stop patience: epochs without best_goal_dist improvement
     # before stopping. Default 15 matches the original heuristic.
     early_stop_patience:  int  = 15,
@@ -448,6 +460,7 @@ def train_linearization_network(
         q2_step_terms       = []
         q1_gate_reg_terms   = []
         phase_pen_terms     = []
+        hold_reward_terms   = []   # soft 'in zone' indicator per step
         last_anchor_term    = torch.tensor(0.0, device=mpc.device, dtype=torch.float64)
         phase_split_step    = int(phase_split_frac * num_steps)
         f_extra_max_norm    = math.sqrt(mpc.N * n_u) * lin_net.f_extra_bound
@@ -572,6 +585,26 @@ def train_linearization_network(
             )
 
             next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
+
+            # ── Hold-reward (soft time-in-zone) ─────────────────────────
+            # Differentiable indicator: exp(-||x_wrapped||² / σ²) where
+            # x_wrapped = (wrap(q1-q1_g), q1d, q2, q2d). Smooth, peaks 1
+            # at exact upright, decays toward 0 as the pendulum drifts.
+            # Only fires for step >= hold_start_step so phase 1 (swing-up)
+            # is unaffected.
+            if w_hold_reward > 0.0 and step >= hold_start_step:
+                q1_err_h = torch.atan2(
+                    torch.sin(next_state[0] - x_goal[0]),
+                    torch.cos(next_state[0] - x_goal[0]),
+                )
+                wrap_sq = (
+                    q1_err_h ** 2
+                    + next_state[1] ** 2
+                    + next_state[2] ** 2
+                    + next_state[3] ** 2
+                )
+                in_zone_soft = torch.exp(-wrap_sq / (hold_sigma ** 2))
+                hold_reward_terms.append(in_zone_soft)
 
             # ── Tracking term (the main signal) ──────────────────────────
             target_idx = min(step + 1, demo_T - 1)
@@ -732,6 +765,12 @@ def train_linearization_network(
             torch.tensor(0.0, device=mpc.device, dtype=torch.float64)
         )
 
+        # Hold reward (subtracted: minimising loss → maximising reward)
+        if w_hold_reward > 0.0 and hold_reward_terms:
+            hold_reward_mean = torch.stack(hold_reward_terms).mean()
+        else:
+            hold_reward_mean = torch.tensor(0.0, device=mpc.device, dtype=torch.float64)
+
         total_loss = (
             W_TRACK    * track_loss
             + W_TERMINAL * terminal_loss
@@ -739,6 +778,7 @@ def train_linearization_network(
             + q2_loss
             + w_q1_gate_reg * q1_gate_reg_loss
             + phase_pen_loss
+            - w_hold_reward * hold_reward_mean
         )
 
         loss_history.append(total_loss.item())
