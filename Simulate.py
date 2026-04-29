@@ -285,6 +285,13 @@ def train_linearization_network(
     # at deployment time.  Pass a list/tensor of 4 σ values (one per
     # state dim).  Default: zeros = no noise.
     train_noise_sigma:    Optional[List[float]] = None,
+    # Optional initial state history.  Default behaviour: state_history is
+    # initialised to 5 copies of x0 (with optional training noise on each).
+    # Pass a (5, 4) tensor to seed the network with an in-distribution
+    # 5-frame history — useful when x0 is picked from somewhere along a
+    # successful trajectory (curriculum learning).  init_history[-1]
+    # should equal x0 (the most recent frame is the current state).
+    init_history:         Optional[torch.Tensor] = None,
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -368,7 +375,15 @@ def train_linearization_network(
         qp_fallback_start = int(getattr(mpc, "qp_fallback_count", 0))
 
         current_state_detached = x0.detach().clone()
-        state_history = [add_train_noise(current_state_detached).detach() for _ in range(5)]
+        if init_history is not None:
+            # Seed with the actual previous 5 states from a reference trajectory.
+            # Each frame is detached (no grad) and not re-noised; init_history
+            # is what the network would have observed at this point in a real
+            # rollout. We do clone to avoid aliasing.
+            state_history = [init_history[i].detach().clone()
+                             for i in range(init_history.shape[0])]
+        else:
+            state_history = [add_train_noise(current_state_detached).detach() for _ in range(5)]
         u_seq_guess = torch.zeros((mpc.N, n_u), device=mpc.device, dtype=torch.float64)
 
         track_step_terms    = []

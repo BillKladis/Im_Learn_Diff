@@ -1,21 +1,21 @@
-"""exp_traj_curriculum.py — Curriculum along a SUCCESSFUL trajectory.
+"""exp_traj_curriculum.py — Curriculum along a SUCCESSFUL trajectory,
+with proper 5-frame history seeding.
 
-Idea (from user, after diagnosing that random near-upright x0s give the
-network 5-frame histories that aren't on the physically-reached
-manifold): pick initial conditions from a known-good rollout instead.
+Refinement on the user's idea: when picking x0 = state[t] from the
+reference trajectory, also seed the network's 5-frame history with
+states {t-4, t-3, t-2, t-1, t} from the same trajectory.  This way
+the network's input is exactly what it would have seen at step t in
+a real rollout — fully in-distribution.
 
-  1. Run a 600-step rollout with the stab_state model from x0=zero.
-  2. Save every state along that trajectory.
-  3. Stage 1: pick x0 from states 30-40 steps before goal-arrival —
-     train short rollouts (60 steps) from there. Network learns to hold
-     starting from "nearly there with the right energy".
-  4. Stage 2: extend the window to ~80 steps before arrival, training
-     longer (120-step) rollouts.
-  5. Stage 3: full swing-up from x0=zero (anchor).
-
-States from a real swing-up are physically reachable, have the correct
-energy, and the 5-frame history matches the network's training
-distribution — much more in-distribution than (π+δ, ε, δ, ε) noise.
+Pipeline:
+  1. Run reference 600-step rollout from the pretrained model.
+  2. Export trajectory to CSV (saved next to the output checkpoint).
+  3. Stage 1: pick t ∈ [arrival-40, arrival-15], 80-step holds with
+     init_history = traj[t-4..t].
+  4. Stage 2: t ∈ [arrival-80, arrival-30], 140-step holds.
+  5. Stage 3: t ∈ [arrival-150, arrival-60], 200-step holds (further
+     from goal, longer hold).
+  6. Anchor: each iter, also do 1 ep canonical x0=zero swing-up.
 """
 
 import math
@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import copy
+import csv
 from datetime import datetime
 
 import numpy as np
@@ -45,10 +46,9 @@ Q_BASE_DIAG = [12.0, 5.0, 50.0, 40.0]
 W_F_STABLE = 50.0
 LR        = 3e-5
 
-# Curriculum stages
-STAGE1_OUTER = 12   # pick x0 within 30-40 steps of arrival, 80-step rollout
-STAGE2_OUTER = 12   # within 80 steps of arrival, 140-step rollout
-STAGE3_OUTER = 6    # full swing-up (anchor)
+STAGE1_OUTER = 12
+STAGE2_OUTER = 12
+STAGE3_OUTER = 8
 
 
 def make_flat_upright_demo(num_steps, device):
@@ -75,16 +75,28 @@ def wrapped_goal_dist(x_state, x_goal):
     return math.sqrt(q1_err**2 + x_state[1]**2 + x_state[2]**2 + x_state[3]**2)
 
 
+def make_init_from_traj(traj, t, device):
+    """Pick traj[t] as x0 and traj[t-4..t] as the 5-frame init history.
+
+    Returns (x0, init_history) where init_history is shape (5, 4).
+    """
+    if t < 4:
+        raise ValueError(f"Need t >= 4 to build a 5-frame history (got t={t})")
+    history_np = traj[t-4:t+1]                    # shape (5, 4)
+    init_history = torch.tensor(history_np, device=device, dtype=torch.float64)
+    x0 = init_history[-1].clone()
+    return x0, init_history
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x_goal  = torch.tensor(X_GOAL, device=device, dtype=torch.float64)
     x0_zero = torch.zeros(4, device=device, dtype=torch.float64)
 
     print("=" * 76)
-    print("  EXP TRAJ-CURRICULUM: pick x0 from a successful trajectory")
+    print("  EXP TRAJ-CURRICULUM v2: x0 + 5-frame history from reference trajectory")
     print(f"  Pretrained: {os.path.basename(PRETRAINED)}")
-    print(f"  Stages: S1={STAGE1_OUTER} (near-arrival)  "
-          f"S2={STAGE2_OUTER} (mid-swingup)  S3={STAGE3_OUTER} (full)")
+    print(f"  Stages: S1={STAGE1_OUTER}  S2={STAGE2_OUTER}  S3={STAGE3_OUTER}")
     print(f"  LR={LR}  w_f_stable={W_F_STABLE}")
     print("=" * 76)
 
@@ -94,20 +106,32 @@ def main():
 
     lin_net = network_module.LinearizationNetwork.load(PRETRAINED, device=str(device)).double()
 
-    # 1. Generate the SUCCESSFUL trajectory (from current best checkpoint)
-    print(f"\n  Generating reference trajectory (600 steps from x0=zero)...")
+    # 1. Generate reference trajectory
+    print(f"\n  Generating reference trajectory (600 steps, x0=zero)...")
     x_ref, _ = train_module.rollout(
         lin_net=lin_net, mpc=mpc, x0=x0_zero, x_goal=x_goal, num_steps=600,
     )
-    traj = x_ref.cpu().numpy()  # (601, 4)
+    traj = x_ref.cpu().numpy()
     wraps = np.array([wrapped_goal_dist(s, X_GOAL) for s in traj])
     arrival = int(np.where(wraps < 0.3)[0][0]) if (wraps < 0.3).any() else 167
-    print(f"  Goal-arrival step (wrap<0.3): {arrival}")
-    print(f"  Trajectory wrap stats: min={wraps.min():.3f}  "
-          f"@step {wraps.argmin()}  ({wraps.argmin()*DT:.2f}s)")
+    print(f"  Goal-arrival step (wrap<0.3): {arrival}  ({arrival*DT:.2f}s)")
+    print(f"  Min wrap: {wraps.min():.3f} @ step {wraps.argmin()}")
+
+    # 2. Export trajectory to CSV
+    session_name = f"stageD_trajcurr_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = os.path.join(SAVE_DIR, session_name)
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, "reference_trajectory.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["step", "time", "q1", "q1d", "q2", "q2d", "wrap_dist"])
+        for i, s in enumerate(traj):
+            w.writerow([i, f"{i*DT:.3f}", f"{s[0]:.6f}", f"{s[1]:.6f}",
+                        f"{s[2]:.6f}", f"{s[3]:.6f}", f"{wraps[i]:.6f}"])
+    print(f"  Trajectory exported to {csv_path}")
 
     # Pre-eval (extensive)
-    print(f"\n  Pre-eval (canonical):")
+    print(f"\n  Pre-eval (canonical x0=zero):")
     for n in [170, 220, 400, 600, 1000]:
         x_t, _ = train_module.rollout(
             lin_net=lin_net, mpc=mpc, x0=x0_zero, x_goal=x_goal, num_steps=n,
@@ -130,7 +154,7 @@ def main():
 
     rng = np.random.default_rng(123)
     best_state_dict = copy.deepcopy(lin_net.state_dict())
-    best_long = 0  # longest contiguous hold
+    best_long = 0
 
     def eval_and_maybe_save(label, it):
         nonlocal best_long, best_state_dict
@@ -145,42 +169,42 @@ def main():
             cur = cur + 1 if v else 0
             if cur > long: long = cur
         end_wrap = float(wr[-1])
-        # Save when the swing-up still arrives AND hold improves
-        if (wr[170:230] < 0.3).any() and long > best_long:
+        su_arrived = bool((wr[160:230] < 0.3).any())
+        if su_arrived and long > best_long:
             best_long = long
             best_state_dict = copy.deepcopy(lin_net.state_dict())
-        print(f"  [{label} {it+1}] su_arrived={'Y' if (wr[170:230]<0.3).any() else 'N'}  "
-              f"long={long}({long*DT:.1f}s)  wrap@600={end_wrap:.3f}  best_long={best_long}",
+        print(f"  [{label} {it+1}] su_ok={'Y' if su_arrived else 'N'}  "
+              f"long={long}({long*DT:.1f}s)  wrap@600={end_wrap:.3f}  best={best_long}",
               flush=True)
 
+    demo_su = make_swingup_demo(220, device)
     t0 = time.time()
 
-    # ---------------- STAGE 1: x0 from {arrival-40, ..., arrival-15} ----
-    print(f"\n  STAGE 1: x0 within 30-40 steps of arrival, 80-step holds")
-    s1_lo = max(arrival - 40, 0); s1_hi = max(arrival - 15, 1)
+    # ------------------- STAGE 1 -------------------
+    s1_lo = max(arrival - 40, 4); s1_hi = max(arrival - 15, 5)
+    print(f"\n  STAGE 1: x0 from steps [{s1_lo}, {s1_hi}]  hold=80 steps")
     demo_flat_80 = make_flat_upright_demo(80, device)
-    demo_su      = make_swingup_demo(220, device)
     for it in range(STAGE1_OUTER):
-        # Anchor: 1 ep canonical swing-up
+        # Anchor swing-up
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_zero, x_goal=x_goal, demo=demo_su, num_steps=220,
             num_epochs=1, **base_kwargs,
         )
-        # Curriculum: pick a state from the trajectory near arrival
-        idx = int(rng.integers(s1_lo, s1_hi))
-        x0_pick = torch.tensor(traj[idx], device=device, dtype=torch.float64)
+        # Curriculum: trajectory state with seeded history
+        t = int(rng.integers(s1_lo, s1_hi))
+        x0_pick, hist = make_init_from_traj(traj, t, device)
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_pick, x_goal=x_goal, demo=demo_flat_80, num_steps=80,
-            num_epochs=1, **base_kwargs,
+            num_epochs=1, init_history=hist, **base_kwargs,
         )
         if (it+1) % 2 == 0 or it == 0:
             eval_and_maybe_save("S1", it)
 
-    # ---------------- STAGE 2: x0 from {arrival-80, ..., arrival-30} ---
-    print(f"\n  STAGE 2: x0 within 30-80 steps of arrival, 140-step holds")
-    s2_lo = max(arrival - 80, 0); s2_hi = max(arrival - 30, 1)
+    # ------------------- STAGE 2 -------------------
+    s2_lo = max(arrival - 80, 4); s2_hi = max(arrival - 30, 5)
+    print(f"\n  STAGE 2: x0 from steps [{s2_lo}, {s2_hi}]  hold=140 steps")
     demo_flat_140 = make_flat_upright_demo(140, device)
     for it in range(STAGE2_OUTER):
         train_module.train_linearization_network(
@@ -188,23 +212,32 @@ def main():
             x0=x0_zero, x_goal=x_goal, demo=demo_su, num_steps=220,
             num_epochs=1, **base_kwargs,
         )
-        idx = int(rng.integers(s2_lo, s2_hi))
-        x0_pick = torch.tensor(traj[idx], device=device, dtype=torch.float64)
+        t = int(rng.integers(s2_lo, s2_hi))
+        x0_pick, hist = make_init_from_traj(traj, t, device)
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_pick, x_goal=x_goal, demo=demo_flat_140, num_steps=140,
-            num_epochs=1, **base_kwargs,
+            num_epochs=1, init_history=hist, **base_kwargs,
         )
         if (it+1) % 2 == 0 or it == 0:
             eval_and_maybe_save("S2", it)
 
-    # ---------------- STAGE 3: full canonical swing-up only -----------
-    print(f"\n  STAGE 3: full canonical swing-up consolidation")
+    # ------------------- STAGE 3 -------------------
+    s3_lo = max(arrival - 150, 4); s3_hi = max(arrival - 60, 5)
+    print(f"\n  STAGE 3: x0 from steps [{s3_lo}, {s3_hi}]  hold=200 steps")
+    demo_flat_200 = make_flat_upright_demo(200, device)
     for it in range(STAGE3_OUTER):
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_zero, x_goal=x_goal, demo=demo_su, num_steps=220,
             num_epochs=1, **base_kwargs,
+        )
+        t = int(rng.integers(s3_lo, s3_hi))
+        x0_pick, hist = make_init_from_traj(traj, t, device)
+        train_module.train_linearization_network(
+            lin_net=lin_net, mpc=mpc,
+            x0=x0_pick, x_goal=x_goal, demo=demo_flat_200, num_steps=200,
+            num_epochs=1, init_history=hist, **base_kwargs,
         )
         eval_and_maybe_save("S3", it)
 
@@ -212,21 +245,21 @@ def main():
     lin_net.load_state_dict(best_state_dict)
 
     # SAVE
-    session_name = f"stageD_trajcurr_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     network_module.ModelManager(base_dir=SAVE_DIR).save_training_session(
         model=lin_net, loss_history=[],
         training_params={
-            "experiment": "trajectory_curriculum",
+            "experiment": "trajectory_curriculum_v2_history_seeded",
             "pretrained": PRETRAINED,
             "stages": [STAGE1_OUTER, STAGE2_OUTER, STAGE3_OUTER],
             "best_long_steps": best_long,
+            "arrival_step": arrival,
         },
         session_name=session_name,
     )
-    print(f"\n  Saved → saved_models/{session_name}/")
+    print(f"\n  Saved → {out_dir}/")
 
-    # Final post-eval (extensive)
-    print(f"\n  Post-eval (canonical swing-up):")
+    # Post-eval
+    print(f"\n  Post-eval (canonical x0=zero):")
     for n in [170, 220, 300, 400, 600, 1000, 1500]:
         x_t, _ = train_module.rollout(
             lin_net=lin_net, mpc=mpc, x0=x0_zero, x_goal=x_goal, num_steps=n,
@@ -237,7 +270,7 @@ def main():
         status = "STABLE" if wrp < 0.3 else ("CLOSE" if wrp < 1.0 else "FAIL")
         print(f"    {n:>4} steps ({n*DT:>5.1f}s): raw={raw:.4f}  wrapped={wrp:.4f}  {status}")
 
-    # Sustained hold
+    # Sustained-hold
     x_t, _ = train_module.rollout(
         lin_net=lin_net, mpc=mpc, x0=x0_zero, x_goal=x_goal, num_steps=1000,
     )
