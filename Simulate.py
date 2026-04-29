@@ -308,6 +308,20 @@ def train_linearization_network(
     # successful trajectory (curriculum learning).  init_history[-1]
     # should equal x0 (the most recent frame is the current state).
     init_history:         Optional[torch.Tensor] = None,
+    # State-conditional distillation: at each epoch, sample N synthetic
+    # states near the goal (q1 ≈ goal, low velocity) and penalise the
+    # network's output AT THOSE INPUTS toward the target:
+    #     f_extra → 0      (no pumping when at goal)
+    #     gates_Q → 1      (QP penalises deviations strongly)
+    # This trains the near-goal STATE → OUTPUT mapping directly,
+    # bypassing rollout dynamics. Unlike w_f_stable (which fires only
+    # when the rollout actually reaches the stable_zone), this gradient
+    # always flows — even when the network is failing to reach the goal.
+    w_distill_goal:       float = 0.0,
+    distill_n_synth:      int   = 16,
+    distill_pos_pert:     float = 0.3,    # max |δq1| in synth state
+    distill_vel_pert:     float = 0.3,    # max |δq1d|, |δq2d|
+    distill_q2_pert:      float = 0.1,    # max |δq2|
     # Early-stop patience: epochs without best_goal_dist improvement
     # before stopping. Default 15 matches the original heuristic.
     early_stop_patience:  int  = 15,
@@ -671,6 +685,34 @@ def train_linearization_network(
             state_history.pop(0)
             # Inject training noise into the observation if configured.
             state_history.append(add_train_noise(current_state_detached).detach().clone())
+
+        # ── State-conditional distillation ──────────────────────────────
+        # Sample N synthetic near-goal states. Build 5-frame histories
+        # (each frame is the same state — sufficient since the network
+        # only needs to learn the f_extra/gates_Q mapping at these inputs).
+        # Forward pass through the SAME network and penalise toward the
+        # known-good target (zero f_extra, max gates_Q).
+        if w_distill_goal > 0.0:
+            n = distill_n_synth
+            pp = distill_pos_pert; vp = distill_vel_pert; qp2 = distill_q2_pert
+            # Uniform [-r, r] perturbations
+            d = torch.empty((n, 4), device=mpc.device, dtype=torch.float64).uniform_(-1.0, 1.0)
+            d[:, 0] *= pp        # q1 perturbation
+            d[:, 1] *= vp        # q1d
+            d[:, 2] *= qp2       # q2
+            d[:, 3] *= vp        # q2d
+            synth_states = x_goal.unsqueeze(0) + d   # (n, 4) all near goal
+            distill_terms = []
+            for i in range(n):
+                hist = synth_states[i].unsqueeze(0).expand(5, -1).contiguous()
+                gates_Q_s, _, f_extra_s, _, _, _ = lin_net(
+                    hist, q_base_diag=mpc.q_base_diag, r_base_diag=mpc.r_base_diag,
+                )
+                # f_extra should be ~0 at near-goal inputs
+                distill_terms.append((f_extra_s ** 2).mean())
+                # gates_Q should be ~1 at near-goal inputs (max stable cost)
+                distill_terms.append(((1.0 - gates_Q_s) ** 2).mean())
+            phase_pen_terms.append(w_distill_goal * torch.stack(distill_terms).mean())
 
         # ── Combine ──────────────────────────────────────────────────────
         track_loss    = torch.stack(track_step_terms).sum()    / num_steps
