@@ -118,6 +118,9 @@ class HoldMonitor:
         self._evals_since_improvement = 0
         self.should_stop = False
         self._header_shown = False
+        # Use OUR own counter for OUTER iters (the train fn's internal
+        # epoch is always 0 because num_epochs=1 per call).
+        self._call_count = 0
 
     def _header(self):
         print(f"\n{'Epoch':>6}  {'Loss':>9}  {'Track':>7}  {'fNorm':>7}  "
@@ -127,7 +130,8 @@ class HoldMonitor:
 
     def log_epoch(self, epoch, num_epochs, loss, info):
         if not self._header_shown: self._header()
-        do_eval = ((epoch + 1) % self.eval_every == 0) or epoch == 0 or epoch == num_epochs - 1
+        self._call_count += 1
+        do_eval = (self._call_count % self.eval_every == 0) or self._call_count == 1
         if do_eval:
             with torch.no_grad():
                 x_t, _ = train_module.rollout(
@@ -146,7 +150,7 @@ class HoldMonitor:
             if self._evals_since_improvement >= self.patience:
                 self.should_stop = True
             arr_str = "—" if arr is None else f"{arr}"
-            print(f"  {epoch+1:>3}  {loss:>9.3f}  "
+            print(f"  {self._call_count:>3}  {loss:>9.3f}  "
                   f"{info.get('loss_track', 0):>7.3f}  "
                   f"{info.get('mean_f_extra_norm', 0):>7.3f}  "
                   f"{arr_str:>5}  {lng:>5}  {tot:>5}  "
