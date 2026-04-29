@@ -88,10 +88,11 @@ P2_NUM_STEPS = 500
 P2_EPOCHS    = 80
 P2_LR        = 5e-5     # gentle fine-tune
 P2_QF_DIAG   = [20.0, 50.0, 40.0, 30.0]   # bumped q1d for braking
-P2_W_HOLD_REWARD = 100.0
-P2_HOLD_SIGMA    = 0.5
+P2_W_HOLD_REWARD = 5.0    # was 100 (too aggressive — saturated f_extra in 1 step)
+P2_HOLD_SIGMA    = 1.0    # was 0.5 (smoother gradient, less surgical)
 P2_HOLD_START    = 170    # reward starts after arrival window
-P2_W_Q_PROFILE   = 5.0    # tiny — keep gates near target without dominating
+P2_W_Q_PROFILE   = 30.0   # higher — keep gates anchored at the trained values
+                          #  (was 5.0; need stronger anchor against hold gradient)
 P2_HOLD_EVAL_EVERY = 3
 P2_HOLD_EVAL_STEPS = 1000
 P2_HOLD_PATIENCE   = 12   # 36 epochs without hold improvement
@@ -311,11 +312,28 @@ def phase2(lin_net, mpc, x0, x_goal):
     return lin_net, mpc, x0, x_goal
 
 
+PHASE1_PRETRAINED = "saved_models/stageD_phase1_20260429_165603/stageD_phase1_20260429_165603.pth"
+
+
 def main():
     device = torch.device("cpu")
 
-    # Phase 1
-    lin_net, mpc, x0, x_goal = phase1(device)
+    # Phase 1 — skip if checkpoint exists, just load
+    if os.path.exists(PHASE1_PRETRAINED):
+        print(f"\n  Loading existing Phase 1 model: {PHASE1_PRETRAINED}")
+        x0     = torch.tensor(X0, device=device, dtype=torch.float64)
+        x_goal = torch.tensor(X_GOAL, device=device, dtype=torch.float64)
+        mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON, device=device)
+        mpc.dt          = torch.tensor(DT, device=device, dtype=torch.float64)
+        mpc.q_base_diag = torch.tensor(Q_BASE_DIAG, device=device, dtype=torch.float64)
+        mpc.Qf          = torch.diag(torch.tensor(P1_QF_DIAG, device=device, dtype=torch.float64))
+        lin_net = network_module.LinearizationNetwork.load(PHASE1_PRETRAINED, device="cpu").double()
+        # Quick eval
+        x_t, _ = train_module.rollout(lin_net=lin_net, mpc=mpc, x0=x0, x_goal=x_goal, num_steps=200)
+        arr, lng, tot = hold_metric(x_t.cpu().numpy(), x_goal.cpu().numpy())
+        print(f"  Phase 1 loaded: arr={arr} long={lng} total={tot}")
+    else:
+        lin_net, mpc, x0, x_goal = phase1(device)
 
     # Save phase 1 model
     p1_name = f"stageD_phase1_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
