@@ -86,17 +86,13 @@ P1_Q_GATE_KICKSTART_BIAS = -3.0
 # --- Phase 2 (hold) ---
 P2_NUM_STEPS = 500
 P2_EPOCHS    = 80
-P2_QF_DIAG   = [20.0, 20.0, 40.0, 30.0]   # KEEP default — phase 1 was tuned for it
-P2_W_HOLD_REWARD_MAX = 5.0    # ramped from 0 over the first WARMUP epochs
-P2_W_HOLD_WARMUP     = 20     # epochs of linear ramp from 0
+P2_QF_DIAG   = [20.0, 50.0, 40.0, 30.0]   # KEEP default — phase 1 was tuned for it
+P2_W_HOLD_REWARD_MAX = 5.0
+P2_W_HOLD_WARMUP     = 20
 P2_HOLD_SIGMA        = 1.0
 P2_HOLD_START        = 170
-P2_W_Q_PROFILE       = 0.0    # OFF — q_profile gradient destroys the loaded policy
+P2_W_Q_PROFILE       = 0.0    # OFF — fight nothing in the loaded policy
 P2_LR                = 5e-5
-# Phase 2 loss = ONLY hold_reward + the irreducible track loss (small).
-# Everything else (q_profile, end_q_high, w_f_stable, etc.) is OFF
-# so we don't fight the loaded policy. The hold_reward signal must
-# stand alone or fail.
 P2_HOLD_EVAL_EVERY = 3
 P2_HOLD_EVAL_STEPS = 1000
 P2_HOLD_PATIENCE   = 12   # 36 epochs without hold improvement
@@ -321,7 +317,7 @@ def phase2(lin_net, mpc, x0, x_goal):
     return lin_net, mpc, x0, x_goal
 
 
-PHASE1_PRETRAINED = "saved_models/stageD_nodemo_20260428_123448/stageD_nodemo_20260428_123448.pth"
+PHASE1_PRETRAINED = "saved_models/stageD_nodemo_qf50_20260429_111711/stageD_nodemo_qf50_20260429_111711.pth"
 # ^ The proven 0.0612 baseline (arr=167, long=12, total=24, raw GoalDist=0.0612).
 #   Stronger swing-up than our re-trained Phase 1 model (which was marginal,
 #   arr=159 long=6 total=6 — too weak to survive Phase 2's first gradient step).
@@ -348,7 +344,7 @@ def main():
         lin_net, mpc, x0, x_goal = phase1(device)
 
     # Save phase 1 model
-    p1_name = f"stageD_phase1_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    p1_name = f"stageD_qf50base_p1_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     network_module.ModelManager(base_dir=SAVE_DIR).save_training_session(
         model=lin_net, loss_history=[],
         training_params={"experiment": "phased_swingup_hold", "phase": 1, "qf_diag": P1_QF_DIAG},
@@ -359,7 +355,7 @@ def main():
     # Phase 2
     lin_net, mpc, x0, x_goal = phase2(lin_net, mpc, x0, x_goal)
 
-    p2_name = f"stageD_phase2_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    p2_name = f"stageD_qf50base_p2_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     network_module.ModelManager(base_dir=SAVE_DIR).save_training_session(
         model=lin_net, loss_history=[],
         training_params={"experiment": "phased_swingup_hold", "phase": 2, "qf_diag": P2_QF_DIAG,
