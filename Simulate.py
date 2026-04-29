@@ -299,6 +299,14 @@ def train_linearization_network(
     # call and the per-iter gradient steps act as cold-start updates with
     # no adaptation, producing essentially no cumulative learning.
     external_optimizer:   Optional[torch.optim.Optimizer] = None,
+    # Whether to restore best_state_dict at function exit.  Default True
+    # is correct for one-shot training (returns the model from the best
+    # epoch). MUST be set to False for curriculum-style use:
+    # best_state_dict is captured BEFORE optimizer.step() each epoch, so
+    # with num_epochs=1 the function would compute gradients, step the
+    # optimizer, and then ROLL BACK to pre-step weights — making every
+    # such call a no-op for the network parameters.
+    restore_best:         bool = True,
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -725,7 +733,7 @@ def train_linearization_network(
             )
             break
 
-    if best_state_dict is not None:
+    if restore_best and best_state_dict is not None:
         lin_net.load_state_dict(best_state_dict)
 
     return loss_history, recorder

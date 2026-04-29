@@ -171,6 +171,7 @@ def main():
         w_end_q_high=80.0, end_phase_steps=20,
         w_f_stable=W_F_STABLE,
         external_optimizer=optimizer,
+        restore_best=False,   # CRITICAL: keep the post-step weights
     )
     base_kwargs_cur = {**base_kwargs_anc, "debug_monitor": cap_cur}
 
