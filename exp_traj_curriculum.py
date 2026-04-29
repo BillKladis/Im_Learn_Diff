@@ -44,11 +44,11 @@ HORIZON   = 10
 SAVE_DIR  = "saved_models"
 Q_BASE_DIAG = [12.0, 5.0, 50.0, 40.0]
 W_F_STABLE = 50.0
-LR        = 3e-5
+LR        = 1e-4   # bumped from 3e-5 — at 1 epoch/iter, 3e-5 was too small to move the network
 
-STAGE1_OUTER = 12
-STAGE2_OUTER = 12
-STAGE3_OUTER = 8
+STAGE1_OUTER = 15
+STAGE2_OUTER = 15
+STAGE3_OUTER = 10
 
 
 def make_flat_upright_demo(num_steps, device):
@@ -73,6 +73,19 @@ def wrap_pi(x):
 def wrapped_goal_dist(x_state, x_goal):
     q1_err = wrap_pi(x_state[0] - x_goal[0])
     return math.sqrt(q1_err**2 + x_state[1]**2 + x_state[2]**2 + x_state[3]**2)
+
+
+class LossCapture:
+    """Captures loss + final goal_dist from train_linearization_network's
+    debug_monitor callback so we can verify the gradient is doing work."""
+    def __init__(self):
+        self.last_loss = float('nan')
+        self.last_goal_dist = float('nan')
+        self.last_fnorm = float('nan')
+    def log_epoch(self, epoch, num_epochs, loss, info):
+        self.last_loss      = float(loss)
+        self.last_goal_dist = float(info.get('pure_end_error', float('nan')))
+        self.last_fnorm     = float(info.get('mean_f_extra_norm', float('nan')))
 
 
 def make_init_from_traj(traj, t, device):
@@ -141,8 +154,10 @@ def main():
         raw = float(np.linalg.norm(last - np.array(X_GOAL)))
         print(f"    {n:>4} steps: raw={raw:.4f}  wrapped={wrp:.4f}")
 
-    base_kwargs = dict(
-        lr=LR, debug_monitor=None, recorder=None, grad_debug=False,
+    cap_anc = LossCapture()
+    cap_cur = LossCapture()
+    base_kwargs_anc = dict(
+        lr=LR, debug_monitor=cap_anc, recorder=None, grad_debug=False,
         track_mode="energy", w_terminal_anchor=0.0,
         w_q_profile=100.0,
         q_profile_pump=[0.01, 0.01, 1.0, 1.0],
@@ -151,6 +166,7 @@ def main():
         w_end_q_high=80.0, end_phase_steps=20,
         w_f_stable=W_F_STABLE,
     )
+    base_kwargs_cur = {**base_kwargs_anc, "debug_monitor": cap_cur}
 
     rng = np.random.default_rng(123)
     best_state_dict = copy.deepcopy(lin_net.state_dict())
@@ -174,14 +190,16 @@ def main():
             best_long = long
             best_state_dict = copy.deepcopy(lin_net.state_dict())
         print(f"  [{label} {it+1}] su_ok={'Y' if su_arrived else 'N'}  "
-              f"long={long}({long*DT:.1f}s)  wrap@600={end_wrap:.3f}  best={best_long}",
+              f"long={long}({long*DT:.1f}s)  wrap@600={end_wrap:.3f}  best={best_long}  "
+              f"L_anc={cap_anc.last_loss:.3f}  L_cur={cap_cur.last_loss:.3f}  "
+              f"f={cap_cur.last_fnorm:.3f}",
               flush=True)
 
     demo_su = make_swingup_demo(220, device)
     t0 = time.time()
 
     # ------------------- STAGE 1 -------------------
-    s1_lo = max(arrival - 40, 4); s1_hi = max(arrival - 15, 5)
+    s1_lo = max(arrival - 20, 4); s1_hi = max(arrival - 5, 5)
     print(f"\n  STAGE 1: x0 from steps [{s1_lo}, {s1_hi}]  hold=80 steps")
     demo_flat_80 = make_flat_upright_demo(80, device)
     for it in range(STAGE1_OUTER):
@@ -189,7 +207,7 @@ def main():
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_zero, x_goal=x_goal, demo=demo_su, num_steps=220,
-            num_epochs=1, **base_kwargs,
+            num_epochs=1, **base_kwargs_anc,
         )
         # Curriculum: trajectory state with seeded history
         t = int(rng.integers(s1_lo, s1_hi))
@@ -197,27 +215,27 @@ def main():
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_pick, x_goal=x_goal, demo=demo_flat_80, num_steps=80,
-            num_epochs=1, init_history=hist, **base_kwargs,
+            num_epochs=1, init_history=hist, **base_kwargs_cur,
         )
         if (it+1) % 2 == 0 or it == 0:
             eval_and_maybe_save("S1", it)
 
     # ------------------- STAGE 2 -------------------
-    s2_lo = max(arrival - 80, 4); s2_hi = max(arrival - 30, 5)
+    s2_lo = max(arrival - 50, 4); s2_hi = max(arrival - 20, 5)
     print(f"\n  STAGE 2: x0 from steps [{s2_lo}, {s2_hi}]  hold=140 steps")
     demo_flat_140 = make_flat_upright_demo(140, device)
     for it in range(STAGE2_OUTER):
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_zero, x_goal=x_goal, demo=demo_su, num_steps=220,
-            num_epochs=1, **base_kwargs,
+            num_epochs=1, **base_kwargs_anc,
         )
         t = int(rng.integers(s2_lo, s2_hi))
         x0_pick, hist = make_init_from_traj(traj, t, device)
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_pick, x_goal=x_goal, demo=demo_flat_140, num_steps=140,
-            num_epochs=1, init_history=hist, **base_kwargs,
+            num_epochs=1, init_history=hist, **base_kwargs_cur,
         )
         if (it+1) % 2 == 0 or it == 0:
             eval_and_maybe_save("S2", it)
@@ -230,14 +248,14 @@ def main():
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_zero, x_goal=x_goal, demo=demo_su, num_steps=220,
-            num_epochs=1, **base_kwargs,
+            num_epochs=1, **base_kwargs_anc,
         )
         t = int(rng.integers(s3_lo, s3_hi))
         x0_pick, hist = make_init_from_traj(traj, t, device)
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0_pick, x_goal=x_goal, demo=demo_flat_200, num_steps=200,
-            num_epochs=1, init_history=hist, **base_kwargs,
+            num_epochs=1, init_history=hist, **base_kwargs_cur,
         )
         eval_and_maybe_save("S3", it)
 
