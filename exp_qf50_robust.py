@@ -68,14 +68,19 @@ W_END_Q_HIGH = 80.0
 END_PHASE_STEPS = 20
 Q_GATE_KICKSTART_BIAS = -3.0
 
-# NEW
-W_DISTILL_GOAL = 20.0   # state-conditional distillation weight
+# NEW: distillation enabled only AFTER warmup. The first WARMUP_EPOCHS
+# train normally so the network develops the swing-up policy without
+# being globally suppressed by the regularization.
+W_DISTILL_GOAL    = 20.0
+DISTILL_WARMUP    = 40    # turn on at epoch 40+
 
 # Hold-eval cadence
 HOLD_EVAL_EVERY = 3     # epochs
 HOLD_EVAL_STEPS = 600   # length of evaluation rollout
-HOLD_PATIENCE   = 12    # number of evals (= 36 epochs at every-3) without
-                        # improvement before stopping
+HOLD_PATIENCE   = 25    # number of evals without improvement before stopping
+                        # (25 evals × 3 epochs = 75 epochs patience; needed
+                        # because the first improvement may not come until
+                        # ~epoch 30-50, then distillation kicks in at 40)
 
 SEED = 1                # different from qf50 v2's implicit seed; tests robustness
 
@@ -174,7 +179,7 @@ def main():
     print("=" * 80)
     print("  EXP QF50 ROBUST — distillation + hold-quality early-stop")
     print(f"  SEED={SEED}  EPOCHS={EPOCHS}  LR={LR}  Qf={QF_DIAG}")
-    print(f"  w_distill_goal={W_DISTILL_GOAL}  (state-conditional output target)")
+    print(f"  w_distill_goal={W_DISTILL_GOAL}  (warmup={DISTILL_WARMUP}, off until then)")
     print(f"  hold-eval every {HOLD_EVAL_EVERY} epochs, {HOLD_EVAL_STEPS}-step rollout, patience={HOLD_PATIENCE}")
     print("=" * 80)
 
@@ -213,6 +218,9 @@ def main():
 
     t0 = time.time()
     for epoch in range(EPOCHS):
+        # Warmup: distillation OFF for first DISTILL_WARMUP epochs so the
+        # network develops a real swing-up before regularization kicks in.
+        active_distill = W_DISTILL_GOAL if epoch >= DISTILL_WARMUP else 0.0
         train_module.train_linearization_network(
             lin_net=lin_net, mpc=mpc,
             x0=x0, x_goal=x_goal, demo=demo, num_steps=NUM_STEPS,
@@ -225,7 +233,7 @@ def main():
             q_profile_state_phase=True,
             w_end_q_high=W_END_Q_HIGH,
             end_phase_steps=END_PHASE_STEPS,
-            w_distill_goal=W_DISTILL_GOAL,
+            w_distill_goal=active_distill,
             external_optimizer=optimizer,
             restore_best=False,
         )
