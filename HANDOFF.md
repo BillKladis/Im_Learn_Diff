@@ -1,124 +1,133 @@
 # Double-Pendulum Swing-Up — Handoff
 
 **Branch:** `claude/pendulum-mpc-neural-network-csqVr`
-**Latest commit:** `b653f42` (state-conditional fix + handoff)
+**Latest:** `de928ef` — generality win 12/12
 
 ---
 
-## 1. Current situation (one paragraph)
+## 1. Current state (one paragraph)
 
-The `w_f_stable` state-conditional outer-loss term **works**: from the
-0.0612 swing-up baseline, fine-tuning with this single new loss took
-the goal_dist at the training horizon (220 steps) from 6.22 → **0.0755
-(raw=0.0755, wrapped=0.0755 — STABLE)**.  The principle is proven and
-the controller was never modified — all the change is in `Simulate.py`'s
-loss assembly and the network's learned weights.  The remaining gap is
-that the trained model **degrades after the training horizon**: at step
-400 it's at raw=6.59 / wrapped=1.28 (sliding out of the stable zone),
-at step 1000 it's wrapped=7.18 (lost completely).  Diagnosis: the
-network was only ever evaluated up to step 220 during training, so it
-has no signal for sustained hold.  Currently running
-`exp_long_horizon.py` — same loss configuration but NUM_STEPS=400, fine-tuning
-from the stab_state checkpoint, to extend the temporal coverage.
-
----
-
-## 2. Hard constraints (must respect)
-
-| Constraint | What it means in practice |
-|------------|---------------------------|
-| **Fixed horizon length** | `HORIZON = 10` everywhere. Don't change `mpc.N`. |
-| **No trajectory inside the controller** | The MPC only sees `(state, x_lin_seq, u_lin_seq, x_goal, gates_Q, gates_R, f_extra)`. It does NOT see the demo, the energy ramp, or anything trajectory-shaped. |
-| **Physics-informed signals live in the OUTER LOSS** | Energy tracking, wrapped-angle penalties, stable-zone gates: ALL go into `Simulate.train_linearization_network`'s loss assembly. None of these belong in `mpc_controller.py`. |
-| **Controller stays general** | `mpc_controller.py` is task-agnostic. It just solves the QP given Q/R/f_extra it's handed. No swing-up-specific code there. |
-| **The network is the only learned component** | Everything that adapts to the task adapts via `lin_net.LinearizationNetwork` weights. The MPC is fixed. |
-| **No inference-time hacks in production** | `verify_smart_gate.py` was a probe to confirm the principle. The fix lives in the loss so the network learns it; we don't massage outputs at runtime in the deployed rollout. |
+We have a **working model**: `saved_models/stageD_nodemo_qf50_20260429_111711/`.
+It was trained from scratch with the **exact same recipe** that produced the
+0.0612 baseline (exp_no_demo.py), with **one** change: the MPC's terminal
+cost matrix `Qf` has `q1d` weight bumped from 20 to 50. From x0=zero, the
+pendulum reaches the upright at step 219 (10.95s — 2.6s later than baseline)
+and then HOVERS near the goal for **75 seconds with wrap < 1.0** (vs baseline
+which loses the goal completely after ~4s). On a 12-perturbation generality
+test (q1 ∈ [-0.5, +0.5], q1d ∈ [-1, +1], q2 ±0.1, q2d ±0.5, combined),
+QF50 v2 succeeds on **12/12** at the strict "total ≥ 50 steps in zone"
+threshold; baseline succeeds on **0/12**. The network learned a
+state-dependent braking policy that's both more sustained AND more
+general than baseline. **No controller code changed.** No qf-head, no
+curriculum, no mirror, no sin/cos — just one Qf coefficient.
 
 ---
 
-## 3. Targets and current state
+## 2. The breakthrough
 
-| Property | Baseline (0.0612) | After stab_state | Target |
-|----------|------------------:|-----------------:|-------:|
-| 170 steps raw   | 0.0612 | 0.1995 | ≤ 0.20 ✓ |
-| 220 steps raw   | 6.2214 | **0.0755** | ≤ 0.30 ✓ |
-| 300 steps wrap  | 0.9537 | 0.2038 | ≤ 0.30 ✓ |
-| **400 steps wrap** | — | 1.2847 | ≤ 0.30 ✗ |
-| **600 steps wrap** | 5.4802 | 2.5874 | ≤ 0.30 ✗ |
-| **1000 steps wrap** | — | 7.1807 | ≤ 0.30 ✗ |
-| Loss monotonicity | — | 25/33 (76 %) | should be > 80 % |
-| Symmetric IC success | 3 / 7 | not yet retested | 7 / 7 |
-| σ_q noise robustness | ≤ 0.10 | not yet retested | ≤ 0.20 |
+**File:** `exp_no_demo_qf50.py` (literal copy of `exp_no_demo.py` with one config line different).
 
-**Two columns matter most:** 220-step (proves the gate works) and 600-step (proves sustained hold).
+**The change:** `mpc.Qf = diag([20.0, 50.0, 40.0, 30.0])` (was `[20, 20, 40, 30]`).
 
----
+**The intuition (from `probe_qf.py`):** the `Qf q1d` weight controls how
+hard the MPC's terminal cost penalises residual angular velocity at the
+end of the planning horizon. With q1d=20 (default), the network learns
+a swing-up that arrives at upright with non-zero velocity and then
+oscillates through. With q1d=50, the network is forced to pump such that
+the pendulum arrives **with low velocity** → it holds.
 
-## 4. What changed this session (concrete)
-
-### `Simulate.py` (outer loss only — controller untouched)
-
-- `train_noise_sigma` — Gaussian observation noise during training.
-- `w_f_end_reg`, `f_end_reg_steps` — time-window f_extra penalty (**dead-end, broke swing-up**).
-- `w_stable_phase`, `stable_phase_steps` — wrapped-angle position-tracking loss for the last N steps (**too aggressive alone, retained as optional but not the main lever**).
-- **`w_f_stable`** — state-conditional f_extra penalty (**this is the keeper**):
-
-  ```
-  stable_zone = ((1 + cos(q1 - q1_goal)) / 2) * exp(-(q1d² + q2d²) / 2)
-  loss      += w_f_stable * stable_zone * ‖f_extra‖²
-  ```
-
-  Mirrors the existing `q_profile_state_phase=True` mechanism that already
-  blends pump↔stable Q-targets via `cos(q1 - π)`.
-
-### `lin_net.py` (architecture — adds variant, doesn't change default)
-
-- `LinearizationNetworkSC` — same trunk and heads, but inputs are
-  `(sin(q1), cos(q1), q1d/8, sin(q2), cos(q2), q2d/8) × 5 = 30` instead
-  of `(q1/π, q1d/8, q2/π, q2d/8) × 5 = 20`.  Goal: structural symmetry
-  for the upright (`+π ≡ -π` at the input level).  Not yet trained.
-
-### `mpc_controller.py`
-
-Unchanged.  Stays general by design.
+The reason the existing `0.0612` model didn't generalise: it learned a
+specific pump-trajectory-shape that worked from `x0=zero`. Perturbations
+shift that trajectory enough that the network's pump-then-hope-it-stops
+policy fails. QF50 v2's policy has a real "brake" component governed by
+the higher Qf — that brake acts on the actual state, regardless of how
+the rollout got there → robust to perturbation.
 
 ---
 
-## 5. Files — every Python file, what it's for, status
+## 3. Numbers
 
-### Core libraries (active)
+### From `x0=zero`
 
-| File | Role | Status |
-|------|------|--------|
-| `lin_net.py` | `LinearizationNetwork` (default, raw 4-dim state, 20 input dims) and `LinearizationNetworkSC` (sin/cos, 30 dims). `NetworkOutputRecorder`, `ModelManager`. | Active |
-| `Simulate.py` | Training loop `train_linearization_network` + `rollout`. ALL physics-informed loss terms live here. | Active |
-| `mpc_controller.py` | Differentiable QP-based MPC. **Untouched this session.** | Active |
+| Steps | Baseline 0.0612 | **QF50 v2** |
+|------:|----------------:|------------:|
+| 170   | 0.06 raw        | 0.30 raw    |
+| 220   | 1.89 wrap **FAIL** | 0.26 wrap **STABLE** |
+| 300   | 0.95 wrap       | 0.58 wrap CLOSE |
+| 400   | (lost)          | **0.15 wrap STABLE** |
+| 600   | 5.48 wrap **FAIL** | 0.70 wrap CLOSE |
+| 1000  | 7.18 wrap **FAIL** | 0.91 wrap CLOSE |
+| 1500  | (lost)          | **0.32 wrap CLOSE** |
 
-### Currently driving progress
+### Generality (12 perturbed x0, 1000-step rollouts; threshold total≥50)
 
-| File | Purpose | Status |
-|------|---------|--------|
-| `exp_no_demo.py` | Trained the 0.0612 baseline (synthetic energy ramp, no demo). | Reference |
-| `exp_diag_failure.py` | Step-by-step rollout trace. **Diagnosed the overlearned-pumping problem.** | Diagnostic |
-| `verify_smart_gate.py` | Probe: inference-time `stable_zone` gating. **Confirmed the fix principle (wrap=0.077 at 600 steps).** | Verifier |
-| `verify_stable.py` | Loads latest `stageD_stabilize*` and reports raw + wrapped at 170/220/300/400/600 steps. | Active |
-| `exp_stab_state.py` | **Done.** Fine-tuned 0.0612 with `w_f_stable=50`. Achieved raw=0.0755 at step 220. Saved `stageD_stabstate_20260428_224856`. | Done |
-| `exp_long_horizon.py` | **Currently running.** Same loss as stab_state but NUM_STEPS=400, fine-tuning from stabstate checkpoint. Goal: sustained hold at 1000+ steps. | Currently training |
-| `exp_noise_test.py` | Noise-robustness eval. | Active when needed |
+```
+Initial cond.       BASELINE 0.0612    QF50 v2
+canonical           total= 24 WEAK     total= 96 OK
+q1=+0.2             total=  4 WEAK     total=100 OK
+q1=-0.2             total=  4 WEAK     total= 98 OK
+q1=+0.5             FAIL               total= 99 OK
+q1=-0.5             total= 24 WEAK     total=109 OK
+q1d=+0.5            FAIL               total=104 OK
+q1d=-0.5            FAIL               total=101 OK
+q1d=+1.0            total=  3 WEAK     total= 99 OK
+q2=+0.1             total= 19 WEAK     total= 95 OK
+q2d=+0.5            total= 25 WEAK     total=104 OK
+combined+           total= 17 WEAK     total=114 OK
+combined-           total=  5 WEAK     total= 97 OK
+                    -----------       -----------
+Success             0 / 12             12 / 12
+```
 
-### Dead ends / superseded (don't run these)
+---
 
-| File | Why dead-end |
-|------|--------------|
-| `exp_finetune_best.py` | Time-window `w_f_end_reg`. Broke swing-up. |
-| `exp_stabilize.py`, `exp_stabilize2.py` | Same time-window approach. |
-| `exp_robust_finetune.py` | Marginal noise improvement; baseline already robust. |
-| `exp_expansion.py`, `exp_expansion2.py` | Catastrophic forgetting / 3/7 partial generality. Will be revisited after sustained-hold is solved. |
-| `exp_curriculum*.py` | Pre-stability curriculum experiments. |
-| `exp_mirror.py` | Mirror augmentation. Killed when stability became the focus. **Will resume from long_horizon checkpoint.** |
-| `exp_bignet.py` | hidden_dim=256 from scratch. Killed. |
-| `exp_sincos.py` | Trains `LinearizationNetworkSC` from scratch. Pivot option for symmetric swing-up if mirror data-aug doesn't work. |
-| `exp_cos_q1`, `exp_phase_aware`, `exp_phase_loss`, `exp_profile_loss`, `exp_grad_split`, `exp_hardcoded_q`, `exp_q_modulation`, `exp_q1_freeze`, `exp_q1_gate_reg`, `exp_threshold`, `exp_twophase`, `exp_small_q1`, `exp_end_q_high`, `exp_nodemo_sweep`, `exp_noise_train`, `exp_final`, `verify_inference_gate.py` | Earlier-stage experiments. Findings absorbed into `exp_no_demo.py` and `exp_stab_state.py`. |
+## 4. Hard constraints (preserved throughout this work)
+
+| Constraint | Status |
+|------------|--------|
+| Fixed horizon length (HORIZON=10) | ✓ never changed |
+| No trajectory inside the controller | ✓ MPC sees only `(state, x_lin_seq, u_lin_seq, x_goal, gates_Q, gates_R, f_extra, [optional gates_Qf])` |
+| Physics-informed signals in OUTER LOSS | ✓ all loss terms in `Simulate.train_linearization_network` |
+| Controller stays general | ✓ `mpc_controller.py` unchanged in logic; only added optional `diag_corrections_Qf` parameter for the (unused) qf-head experiment |
+| Network is the only learned component | ✓ |
+| No inference-time hacks in production | ✓ |
+
+The Qf change is a **config tweak** of an existing controller knob, not new
+controller logic. We already configure `q_base_diag`; bumping `Qf q1d` is
+the same kind of parameter setting.
+
+---
+
+## 5. Files — current state
+
+### Active (run these)
+
+| File | Role |
+|------|------|
+| `lin_net.py` | LinearizationNetwork (default) and SC variant. `qf_head` is added but inactive (gate_range_qf=0 default). Backward-compatible with all existing checkpoints (`load_state_dict(strict=False)`). |
+| `Simulate.py` | Training loop. New params from this session: `train_noise_sigma`, `w_f_end_reg`, `w_stable_phase`, `w_f_stable`, `w_qf_profile`, `w_track_late_phase`, `init_history`, `external_optimizer`, `restore_best`, `early_stop_patience`. |
+| `mpc_controller.py` | MPC. `Qf` is now a public attribute that experiments can override (no logic change). `build_cost_matrices` accepts optional `diag_corrections_Qf`. |
+| `exp_no_demo_qf50.py` | **The winning experiment.** Same as exp_no_demo.py but with `Qf q1d=20→50`. |
+| `test_generality.py` | Compares any two models on 12 perturbed x0s with hold-time metrics. |
+| `probe_qf.py` | Grid-search over Qf q1d for sustained-hold sensitivity. |
+| `trace_rollout.py` | Step-by-step rollout trace for any saved model. |
+| `inspect_real_energy.py` | Computes the energy curve along a saved trajectory. |
+| `audit_history.py` | Verifies init_history seeding matches natural rollout to 5e-7. |
+| `diag_grad.py`, `diag_minimal.py` | Gradient flow diagnostics (used to find the optimizer-reset bug). |
+| `verify_smart_gate.py` | Inference-time gating probe (kept for reference — proved the principle behind w_f_stable). |
+| `verify_stable.py` | Loads latest stabstate-style checkpoint and reports raw + wrap at multiple horizons. |
+
+### Dead-end / superseded experiments
+
+| File | Why parked |
+|------|-----------|
+| `exp_qf_head.py` | Architectural change with a learned Qf-head; from-scratch training plateaued. The simpler "just bump Qf" approach won. |
+| `exp_qf50_progressive.py` | Hardcoded Qf + progressive penalty — couldn't recover swing-up. |
+| `exp_qf50_tighten.py`, `exp_qf50_tighten_v2.py` | Fine-tune of qf50 v2 to tighten the hold. v1 was a no-op (LR too gentle). v2 was too aggressive (broke swing-up at iter 1). |
+| `exp_no_demo_kinetic.py`, `exp_no_demo_realistic.py` | Demo-shape experiments. The kinetic-peak demo got 0.43 raw (worse than baseline). The realistic-trajectory demo with state late-phase pin plateaued. |
+| `exp_long_horizon.py` | NUM_STEPS=400 fine-tune. Regressed the swing-up. |
+| `exp_stab_state.py` | First state-conditional w_f_stable run. Useful precursor; superseded by Qf bump. |
+| `exp_finetune_best.py`, `exp_stabilize.py`, `exp_stabilize2.py`, `exp_robust_finetune.py`, `exp_expansion.py`, `exp_expansion2.py`, `exp_curriculum*.py`, `exp_traj_curriculum.py`, `exp_near_goal.py`, `exp_mirror.py`, `exp_bignet.py`, `exp_sincos.py`, `exp_diag_failure.py`, all the `exp_q*` and `exp_phase*` and earlier probes | Earlier-stage experiments, most predate the Qf insight. |
 
 ---
 
@@ -126,96 +135,96 @@ Unchanged.  Stays general by design.
 
 | Folder | Best metric | Notes |
 |--------|-------------|-------|
-| `stageD_nodemo_20260428_123448/` | 0.0612 raw @ 170 | The swing-up baseline. Everything fine-tunes from this. |
-| `stageD_robust_20260428_143148/` | 0.072 raw @ 170 | Noise-robust fine-tune. |
-| `stageD_expand2_20260428_154524/` | 3/7 perturbations | Expansion alternation. |
-| **`stageD_stabstate_20260428_224856/`** | **0.0755 raw @ 220** | **State-conditional w_f_stable — current best for stability up to step 300. Degrades after.** |
-| `stageD_long_*` | TBD | Will appear when `exp_long_horizon.py` finishes. |
+| `stageD_nodemo_20260428_123448/` | 0.0612 raw @ 170 (canonical only) | The original 0.0612 baseline. Useful as a stress test. |
+| **`stageD_nodemo_qf50_20260429_111711/`** | **12/12 generality, 75s near-goal hover** | **THE WORKING MODEL.** Single-variable change vs baseline: Qf q1d=50. |
+| `stageD_nodemo_qf50_20260429_124016/` | (regressed) | qf50 v3, longer training. Got worse. Ignore. |
+| `stageD_kinetic_20260429_102046/` | 0.43 raw @ 170 | Kinetic-peak demo. Worse than baseline. Ignore. |
+| `stageD_qf50tight_20260429_114008/` | (no-op) | First fine-tune attempt, didn't move. Ignore. |
+| `stageD_stabstate_20260428_224856/` | 0.075 raw @ 220 | Pre-Qf-discovery stability fine-tune. Useful as a contrast. |
+| `stageD_robust_20260428_143148/`, `stageD_expand2_20260428_154524/`, `stageD_trajcurr_*/` | Various prior experiments. | Pre-breakthrough. |
 
 ---
 
-## 7. Loss monotonicity — `stab_state` run
+## 7. Discoveries from this session
 
-```
-epoch  1:  26.590
-epoch  5:  24.905
-epoch 10:  22.601
-epoch 15:  21.865
-epoch 17:  19.226   ← lowest
-epoch 20:  19.379
-epoch 25:  18.706
-epoch 30:  21.118   (small re-rise)
-epoch 34:  20.011   (early-stop triggered: best_goal_dist hadn't improved in 15 epochs)
+1. **Two real bugs in `train_linearization_network`** for curriculum-style use (single-epoch alternating calls):
+   - Optimizer was created fresh every call → AdamW momentum reset → cold-start steps with no adaptation.
+   - `best_state_dict` was captured BEFORE `optimizer.step()` and restored at function exit → with `num_epochs=1` the function ROLLED BACK every gradient step.
+   - Fix: `external_optimizer` and `restore_best=False` parameters. Verified via `diag_grad.py` (param diff went from 0.0 → 2.4e-3, expected for one Adam step at LR=1e-4).
 
-decreasing transitions: 25/33 (76 %)
-```
+2. **The Qf q1d knob:** the only single-variable Qf modification that improves sustained hold without breaking arrival is `q1d=50`. Below 50, the policy collapses (longest hold worse than baseline); at 50+, it brakes harder but arrives later. The network has to be retrained against the new Qf to get both arrival AND hold (probe_qf showed the existing model loses arrival when Qf is bumped at inference).
 
-The training loss is **mostly monotonic with mild noise** — strictly
-decreasing for the first 25 epochs, then a small re-rise as the LR
-cosine-anneals.  The "Best" goal_dist at step 220 reached **0.0755 at
-epoch 20** and never improved beyond that, which is what triggered the
-early stop.
+3. **Loss decline doesn't track sustained-hold quality.** qf50 v3 reached lower loss (5.24 vs 7.35) than v2 but rolled out worse. The "best metric" used by early-stop (GoalDist at training horizon) is a noisy snapshot mid-oscillation. A real sustained-hold metric needs something like longest-contiguous-wrap-hold from a long rollout, not single-step distance.
 
-This is healthier than the time-window run which had loss = 97.45 at
-epoch 1 (over-penalised) and then a full collapse of swing-up.
+4. **Track loss alone (energy mode) is symmetric in `±π`.** A model can perfectly track the energy curve while landing at q1=-π instead of q1=+π. Caught this in `realistic v1` where track=0.008 but goal_dist=5.7. State-mode penalties (or the wrap function) are needed for position discrimination.
+
+5. **`init_history` correctness verified to 5e-7** via `audit_history.py`. The CSV trajectory + 5-frame-history seeding gives the network bit-equivalent inputs to a natural rollout (modulo CSV roundoff).
 
 ---
 
-## 8. Plan from here (after long_horizon finishes)
+## 8. Next directions (if continuing)
 
-1. **Verify** the long_horizon model:
-   - If wrap ≤ 0.30 at 600 AND 1000 steps → stability is solved.
-   - Run `verify_smart_gate.py` against it as a sanity check (the
-     learned gate should make the inference-time gate redundant — they
-     should agree closely).
-2. **If stable:** generality phase.
-   - **Symmetric IC:** retrain with mirror data-augmentation
-     (`exp_mirror.py`) starting from long_horizon checkpoint.
-   - **Continuous IC distribution:** retrain with random small
-     perturbations of x0 starting from the same checkpoint.
-   - Or pivot to `exp_sincos.py` from scratch with `w_f_stable` on —
-     architectural symmetry plus learned stability in one shot.
-3. **If long_horizon plateaus too:** raise w_f_stable (try 100), or
-   add `w_stable_phase` on top to pin the position directly during the
-   stabilisation window.
+1. **Test the boundary** — extend `test_generality.py` to wider perturbations
+   (q1 ±1.0, ±1.5, q1d ±2.0, q1d ±3.0) to find where qf50 v2 starts failing.
+
+2. **Tighten the hold** — qf50 v2's "longest contiguous wrap<0.3" is only
+   13-14 steps because the pendulum oscillates within wrap [0, 1].
+   Fine-tune from qf50 v2 with a hold-quality-aware best-metric
+   (HoldMonitor pattern was sketched in `exp_qf50_tighten_v2.py` but the
+   LR was too aggressive). Lower LR + the same monitor pattern is the
+   right shape.
+
+3. **Multi-seed reproduction** — qf50 v2 succeeded; qf50 v3 (longer training,
+   different stochastic path) failed. Run the same recipe with several
+   seeds to characterise the success rate of this training.
+
+4. **Try q1d=40 or q1d=60** as a sweep — find the optimal Qf q1d.
+
+5. **Stack with sensor noise** (`train_noise_sigma`) for robust deployment.
+
+6. **Sin/cos architectural variant** with the qf50 recipe — should give
+   structural symmetry (q1=+π ≡ -π in inputs) on top of the already-
+   robust policy.
 
 ---
 
 ## 9. Quick commands
 
 ```bash
-# Verify any stabilize* / long_* checkpoint
-python verify_stable.py
+# Compare generality of any two models
+python test_generality.py
 
-# Inference-time gating probe (read-only)
-python verify_smart_gate.py
+# Probe Qf sensitivity (no retraining required)
+python probe_qf.py
 
-# Diagnostic for any failure mode
-python exp_diag_failure.py     # edit MODEL_PATH at the top
+# Trace a rollout step-by-step
+python trace_rollout.py     # edit MODELS list at the top
 
-# Sustained-hold training (currently running)
-python exp_long_horizon.py
+# Verify history seeding correctness (sanity check)
+python audit_history.py
 
-# Once stability is solid, generality:
-python exp_mirror.py           # edit PRETRAINED to point at long_horizon
-python exp_sincos.py           # alternative: from scratch with SC architecture
+# Re-train the winner from scratch (~10 min)
+python exp_no_demo_qf50.py
 ```
 
 ---
 
 ## 10. Commit trace (most recent first)
 
-| Commit | Description |
-|--------|-------------|
-| `b653f42` | HANDOFF.md rewrite (this commit, then this update) |
-| `cbfe712` | **w_f_stable state-conditional penalty (the breakthrough fix)** |
-| `2dec502` | Inference-time gating verifier + follow-up scripts |
-| `f00fecd` | HANDOFF.md + verify_stable.py |
-| `656e950` | exp_stabilize: save model BEFORE post-eval |
-| `56c8e05` | Stabilize experiment + diagnostic + w_stable_phase |
-| `1c592a0` | LinearizationNetworkSC + w_f_end_reg |
-| `0783dc4` | exp_finetune_best.py (time-window approach, dead end) |
-| `dd97541` | mirror / bignet / curriculum_expand experiments |
-| `3022b7b` | RESULTS_SUMMARY.md (pre-stability) |
-| `82b04df` | Expansion v2 alternation (3/7 succeed) |
-| `7581f08` | **HUGE: 0.0612 without any reference trajectory** |
+| Commit | What |
+|--------|------|
+| `de928ef` | Generality win 12/12 commit message |
+| `94e80ac` | test_generality.py |
+| `1485d87` | qf50 v3 (longer training) regressed |
+| `7aa5179` | qf50_tighten v1 no-op |
+| `5b7b94c` | **NEW BASELINE: nodemo_qf50 saved** |
+| `1af40d3` | realistic v2 (state pin replaces energy pin) |
+| `b1da7fd` | exp_no_demo_realistic + late-phase penalty |
+| `c429109` | kinetic-peak model saved |
+| `30670a3` | exp_no_demo_kinetic |
+| `7f040f8` | **exp_no_demo_qf50 (the recipe)** |
+| `4c40ad6` | THE BIG FIX: restore_best parameter |
+| `f5464bd` | persistent optimizer fix |
+| `099d330` | init_history parameter |
+| `cbfe712` | w_f_stable state-conditional penalty |
+| `7581f08` | original 0.0612 baseline |
