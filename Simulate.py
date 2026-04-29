@@ -294,6 +294,13 @@ def train_linearization_network(
     # at deployment time.  Pass a list/tensor of 4 σ values (one per
     # state dim).  Default: zeros = no noise.
     train_noise_sigma:    Optional[List[float]] = None,
+    # Late-phase track penalty: in the last `track_late_phase_steps` steps,
+    # add w_track_late_phase * track_step ON TOP of the normal track loss.
+    # Heavily emphasises tracking near goal arrival — encourages the network
+    # to raise Q/Qf gates so the QP locks the rollout to the demo trajectory
+    # late. Use with a REALISTIC demo (states from a known-good rollout).
+    w_track_late_phase:   float = 0.0,
+    track_late_phase_steps: int = 50,
     # Optional initial state history.  Default behaviour: state_history is
     # initialised to 5 copies of x0 (with optional training noise on each).
     # Pass a (5, 4) tensor to seed the network with an in-distribution
@@ -593,6 +600,14 @@ def train_linearization_network(
                 track_step = ((next_state - target) ** 2).sum()
             track_step = torch.clamp(track_step, max=STEP_LOSS_CLAMP)
             track_step_terms.append(track_step)
+
+            # Late-phase track penalty: in the last `track_late_phase_steps`
+            # steps, add an EXTRA copy of the track loss scaled by
+            # w_track_late_phase. Heavily emphasises matching the energy/
+            # state target near goal arrival — pressures the network to
+            # raise Q/Qf gates so the QP enforces tight tracking late.
+            if w_track_late_phase > 0.0 and step >= num_steps - track_late_phase_steps:
+                phase_pen_terms.append(w_track_late_phase * track_step)
 
             # ── Stable-phase direct position tracking ────────────────────
             if w_stable_phase > 0.0 and step >= num_steps - stable_phase_steps:
