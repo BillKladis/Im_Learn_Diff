@@ -200,7 +200,14 @@ def main():
         state_dim=STATE_DIM, control_dim=CONTROL_DIM,
         horizon=HORIZON, hidden_dim=HIDDEN_DIM,
         gate_range_q=GATE_RANGE_Q, gate_range_r=GATE_RANGE_R,
-        f_extra_bound=F_EXTRA_BOUND, f_kickstart_amp=0.0,
+        f_extra_bound=F_EXTRA_BOUND,
+        # f_kickstart_amp=1.0: initialise f_head's bias with a half-
+        # sinusoid pumping pattern across the horizon. This guarantees
+        # the FIRST rollout has a non-zero pumping torque even before
+        # gradient descent — without it, seed-dependent stochastic
+        # initialisation can leave the network stuck in 'no pumping'
+        # mode (observed with seed=1 → fNorm=0.001 for 18 iters).
+        f_kickstart_amp=1.0,
     ).to(device).double()
     apply_q1_kickstart(lin_net, STATE_DIM, HORIZON, Q_GATE_KICKSTART_BIAS)
 
