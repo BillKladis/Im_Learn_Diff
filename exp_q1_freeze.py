@@ -126,7 +126,7 @@ def main():
     # Verify initial q1 gate
     with torch.no_grad():
         dummy_hist = torch.stack([x0.clone() for _ in range(5)], dim=0)
-        gQ_init, _, _, _, _ = lin_net(dummy_hist, mpc.q_base_diag, mpc.r_base_diag)
+        gQ_init, _, _, _, _, _ = lin_net(dummy_hist, mpc.q_base_diag, mpc.r_base_diag)
     print(f"  Initial q1 gate (step 0): {gQ_init[0, 0].item():.5f}")
     print(f"  Initial q2 gate (step 0): {gQ_init[0, 2].item():.5f}")
 
@@ -145,7 +145,7 @@ def main():
 
     # Verify q1 gate is still at kickstart after training
     with torch.no_grad():
-        gQ_final, _, _, _, _ = lin_net(dummy_hist, mpc.q_base_diag, mpc.r_base_diag)
+        gQ_final, _, _, _, _, _ = lin_net(dummy_hist, mpc.q_base_diag, mpc.r_base_diag)
     print(f"\n  Final q1 gate (step 0): {gQ_final[0, 0].item():.5f}  (unchanged by freeze)")
 
     x_final, _ = train_module.rollout(

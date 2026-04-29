@@ -71,7 +71,7 @@ def rollout(lin_net, mpc, x0, x_goal, num_steps, gate_f_extra=False, gate_q_up=F
 
     for step in range(num_steps):
         with torch.no_grad():
-            gates_Q, gates_R, f_extra, _, _ = lin_net(
+            gates_Q, gates_R, f_extra, _, _, _ = lin_net(
                 torch.stack(state_history, dim=0),
                 q_base_diag=mpc.q_base_diag,
                 r_base_diag=mpc.r_base_diag,

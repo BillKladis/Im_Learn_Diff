@@ -42,6 +42,14 @@ class LinearizationNetwork(nn.Module):
         gate_range_r:     float = 0.20,
         f_extra_bound:    float = 3.0,
         f_kickstart_amp:  float = 1.0,
+        # Qf-head: optional fourth head that outputs 4 gates that scale
+        # the diagonal of the MPC's terminal cost Qf at inference.
+        # Default disabled (gate_range_qf=0) for back-compat with all
+        # existing checkpoints which have no qf_head weights.
+        # When enabled, gates_Qf = 1.0 + gate_range_qf * tanh(raw); a
+        # raw of 0 → gate of 1.0 (network can still default to "no
+        # change"). Same pattern as gates_Q.
+        gate_range_qf:    float = 0.0,
     ):
         super().__init__()
         self.state_dim   = state_dim
@@ -55,6 +63,8 @@ class LinearizationNetwork(nn.Module):
         ):
             if not (0.0 < value < 1.0):
                 raise ValueError(f"{name} must be in (0, 1), got {value}")
+        if not (0.0 <= gate_range_qf < 1.0):
+            raise ValueError(f"gate_range_qf must be in [0, 1), got {gate_range_qf}")
         if f_extra_bound <= 0:
             raise ValueError(f"f_extra_bound must be positive, got {f_extra_bound}")
         if f_kickstart_amp < 0:
@@ -62,6 +72,7 @@ class LinearizationNetwork(nn.Module):
 
         self.gate_range_q   = gate_range_q
         self.gate_range_r   = gate_range_r
+        self.gate_range_qf  = gate_range_qf
         self.f_extra_bound  = f_extra_bound
         self.f_kickstart_amp = f_kickstart_amp
 
@@ -105,6 +116,14 @@ class LinearizationNetwork(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, f_out_dim),
         )
+        # Qf-head: outputs 4 numbers (one per state dim) → terminal cost gates.
+        # Created always so loading old checkpoints with strict=False works.
+        qf_out_dim = state_dim
+        self.qf_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, qf_out_dim),
+        )
 
         self._initialize_weights()
 
@@ -115,6 +134,7 @@ class LinearizationNetwork(nn.Module):
             "horizon":         horizon,
             "gate_range_q":    gate_range_q,
             "gate_range_r":    gate_range_r,
+            "gate_range_qf":   gate_range_qf,
             "f_extra_bound":   f_extra_bound,
             "f_kickstart_amp": f_kickstart_amp,
             "architecture":    "stage_d_three_head_qrf_kickstart",
@@ -139,6 +159,11 @@ class LinearizationNetwork(nn.Module):
         # f_head: small final std on weights so output ≈ bias at initialisation,
         # then the bias kickstart below dictates the starting f_extra.
         _init_block(self.f_head,        final_std=0.001)
+        # qf_head: tiny final std so raw output ≈ 0 → gates_Qf ≈ 1.0 at init.
+        # This makes the freshly-added head a no-op until training learns to
+        # modulate it, preserving compatibility with checkpoints loaded with
+        # strict=False (qf_head will be randomly initialised with output ≈ 1).
+        _init_block(self.qf_head,       final_std=0.001)
 
         # ── Kickstart bias on f_head's final layer ──────────────────────
         # Half-sinusoid across the horizon in τ1; zero in τ2.
@@ -178,10 +203,18 @@ class LinearizationNetwork(nn.Module):
         raw_F   = self.f_head(features).reshape(self.horizon, self.control_dim)
         f_extra = self.f_extra_bound * torch.tanh(raw_F)
 
+        # Qf gates: emitted only when gate_range_qf > 0 (legacy default 0
+        # → None → MPC uses base Qf unchanged, preserving back-compat).
+        if self.gate_range_qf > 0.0:
+            raw_QF   = self.qf_head(features).reshape(self.state_dim)
+            gates_Qf = 1.0 + self.gate_range_qf * torch.tanh(raw_QF)
+        else:
+            gates_Qf = None
+
         q_diags = (q_base_diag.unsqueeze(0) * gates_Q) if q_base_diag is not None else None
         r_diags = (r_base_diag.unsqueeze(0) * gates_R) if r_base_diag is not None else None
 
-        return gates_Q, gates_R, f_extra, q_diags, r_diags
+        return gates_Q, gates_R, f_extra, q_diags, r_diags, gates_Qf
 
     # ──────────────────────────────────────────────────────────────────────
     def save(self, filepath: str, metadata: Optional[Dict] = None):
@@ -206,10 +239,13 @@ class LinearizationNetwork(nn.Module):
             horizon         = metadata.get("horizon",         10),
             gate_range_q    = metadata.get("gate_range_q",    0.95),
             gate_range_r    = metadata.get("gate_range_r",    0.20),
+            gate_range_qf   = metadata.get("gate_range_qf",   0.0),  # 0 for back-compat
             f_extra_bound   = metadata.get("f_extra_bound",   3.0),
             f_kickstart_amp = metadata.get("f_kickstart_amp", 0.0),  # 0 for back-compat
         )
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # strict=False so old checkpoints without qf_head weights load cleanly;
+        # the qf_head will keep its random init (output ~ 0 → gates_Qf ~ 1).
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         model.to(device).double()
         model.metadata = metadata
         return model

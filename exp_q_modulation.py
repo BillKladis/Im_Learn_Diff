@@ -125,7 +125,7 @@ def dump_q1_gate_stats(lin_net, mpc, x0, x_goal, num_steps, device):
 
     with torch.no_grad():
         for _ in range(num_steps):
-            gQ, gR, fE, _, _ = lin_net(
+            gQ, gR, fE, _, _, _ = lin_net(
                 x.unsqueeze(0).expand(5, -1),
                 mpc.q_base_diag, mpc.r_base_diag,
             )

@@ -154,7 +154,7 @@ def gradient_flow_smoke_test(
 
     step_losses = []
     for t in range(num_steps):
-        gates_Q, gates_R, f_extra, _, _ = lin_net(
+        gates_Q, gates_R, f_extra, _, _, gates_Qf = lin_net(
             torch.stack(state_history, dim=0),
             q_base_diag=mpc.q_base_diag,
             r_base_diag=mpc.r_base_diag,
@@ -173,6 +173,7 @@ def gradient_flow_smoke_test(
             diag_corrections_Q=gates_Q,
             diag_corrections_R=gates_R,
             extra_linear_control=extra_ctrl,
+            diag_corrections_Qf=gates_Qf,
         )
 
         next_state = mpc.true_RK4_disc(current_state, u_mpc, mpc.dt)
@@ -243,6 +244,14 @@ def train_linearization_network(
     q_profile_pump:     Optional[List[float]] = None,    # default [0.01,1,1,1]
     q_profile_stable:   Optional[List[float]] = None,    # default [1,1,1,1]
     q_profile_state_phase: bool = False,   # blend pump↔stable from cos(q1)
+    # Same idea for the network's Qf-head (terminal cost gates). Pump-phase
+    # target should be small (don't penalise terminal state away from upright
+    # while still pumping), stable-phase target should be ~1 (full Qf cost
+    # to pin the upright). Requires the network to have gate_range_qf > 0.
+    w_qf_profile:        float = 0.0,
+    qf_profile_pump:     Optional[List[float]] = None,    # default [0.01,0.01,1,1]
+    qf_profile_stable:   Optional[List[float]] = None,    # default [1,1,1,1]
+    qf_profile_state_phase: bool = False,
     # End-phase Q-gate increase: in the last `end_phase_steps` steps,
     # add penalty (1 - gates_Q[:, 0])² + (1 - gates_Q[:, 1])² to push
     # q1 and q1d gates UP for stabilisation at the goal.
@@ -337,6 +346,12 @@ def train_linearization_network(
         q_profile_stable = [1.0, 1.0, 1.0, 1.0]
     q_profile_pump_t = torch.tensor(q_profile_pump, device=mpc.device, dtype=torch.float64)
     q_profile_stable_t = torch.tensor(q_profile_stable, device=mpc.device, dtype=torch.float64)
+    if qf_profile_pump is None:
+        qf_profile_pump = [0.01, 0.01, 1.0, 1.0]
+    if qf_profile_stable is None:
+        qf_profile_stable = [1.0, 1.0, 1.0, 1.0]
+    qf_profile_pump_t   = torch.tensor(qf_profile_pump,   device=mpc.device, dtype=torch.float64)
+    qf_profile_stable_t = torch.tensor(qf_profile_stable, device=mpc.device, dtype=torch.float64)
 
     # Precompute demo's energy curve once (used by track_mode == "energy").
     with torch.no_grad():
@@ -416,7 +431,7 @@ def train_linearization_network(
         for step in range(num_steps):
             state_history_seq = torch.stack(state_history, dim=0)
 
-            gates_Q, gates_R, f_extra, q_diags, r_diags = lin_net(
+            gates_Q, gates_R, f_extra, q_diags, r_diags, gates_Qf = lin_net(
                 state_history_seq,
                 q_base_diag=mpc.q_base_diag,
                 r_base_diag=mpc.r_base_diag,
@@ -456,6 +471,19 @@ def train_linearization_network(
                     target = q_profile_pump_t if step < phase_split_step else q_profile_stable_t
                 profile_dev = ((gates_Q - target.unsqueeze(0)) ** 2).mean()
                 phase_pen_terms.append(w_q_profile * profile_dev)
+
+            # Qf-gate profile target: same idea as q_profile but for the
+            # network's terminal-cost head. Only active when the network has
+            # gate_range_qf > 0 (so gates_Qf is not None).
+            if w_qf_profile > 0.0 and gates_Qf is not None:
+                if qf_profile_state_phase:
+                    near_goal_qf = (1.0 + torch.cos(current_state_detached[0] - x_goal[0])) / 2.0
+                    near_goal_qf = torch.clamp(near_goal_qf, 0.0, 1.0)
+                    target_qf = (1.0 - near_goal_qf) * qf_profile_pump_t + near_goal_qf * qf_profile_stable_t
+                else:
+                    target_qf = qf_profile_pump_t if step < phase_split_step else qf_profile_stable_t
+                qf_profile_dev = ((gates_Qf - target_qf) ** 2).mean()
+                phase_pen_terms.append(w_qf_profile * qf_profile_dev)
 
             # End-phase Q-gate increase: in the last `end_phase_steps` steps,
             # explicitly push q1 and q1d gates UP (toward 1.0) regardless of
@@ -516,6 +544,7 @@ def train_linearization_network(
                 diag_corrections_Q=gates_Q_qp,
                 diag_corrections_R=gates_R,
                 extra_linear_control=extra_ctrl,
+                diag_corrections_Qf=gates_Qf,
             )
 
             next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
@@ -782,7 +811,7 @@ def rollout(
     for step in range(num_steps):
         with torch.no_grad():
             if lin_net is not None:
-                gates_Q, gates_R, f_extra, _, _ = lin_net(
+                gates_Q, gates_R, f_extra, _, _, _ = lin_net(
                     torch.stack(state_history, dim=0),
                     q_base_diag=mpc.q_base_diag,
                     r_base_diag=mpc.r_base_diag,

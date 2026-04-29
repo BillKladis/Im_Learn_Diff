@@ -78,7 +78,7 @@ def noisy_rollout(lin_net, mpc, x0, x_goal, num_steps, noise_sigma, seed):
     for step in range(num_steps):
         with torch.no_grad():
             if lin_net is not None:
-                gates_Q, gates_R, f_extra, _, _ = lin_net(
+                gates_Q, gates_R, f_extra, _, _, _ = lin_net(
                     torch.stack(state_history, dim=0),
                     q_base_diag=mpc.q_base_diag,
                     r_base_diag=mpc.r_base_diag,

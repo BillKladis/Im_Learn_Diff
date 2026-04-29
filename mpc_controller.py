@@ -94,8 +94,9 @@ class MPC_controller:
     # ──────────────────────────────────────────────────────────────────────
     def build_cost_matrices(
         self,
-        diag_corrections_Q: Optional[torch.Tensor] = None,
-        diag_corrections_R: Optional[torch.Tensor] = None,
+        diag_corrections_Q:  Optional[torch.Tensor] = None,
+        diag_corrections_R:  Optional[torch.Tensor] = None,
+        diag_corrections_Qf: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if diag_corrections_Q is not None:
@@ -108,7 +109,10 @@ class MPC_controller:
             Q_run,
             torch.zeros(4, device=self.device, dtype=torch.float64),
         ]))
-        Q_bar[-4:, -4:] = self.Qf
+        if diag_corrections_Qf is not None:
+            Q_bar[-4:, -4:] = torch.diag(self.Qf.diag() * diag_corrections_Qf)
+        else:
+            Q_bar[-4:, -4:] = self.Qf
 
         if diag_corrections_R is not None:
             r_k = self.r_base_diag * diag_corrections_R
@@ -293,6 +297,7 @@ class MPC_controller:
         diag_corrections_Q:   Optional[torch.Tensor] = None,
         diag_corrections_R:   Optional[torch.Tensor] = None,
         extra_linear_control: Optional[torch.Tensor] = None,
+        diag_corrections_Qf:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         x_op_list  = []
@@ -314,6 +319,7 @@ class MPC_controller:
         Q_bar, R_diag = self.build_cost_matrices(
             diag_corrections_Q=diag_corrections_Q,
             diag_corrections_R=diag_corrections_R,
+            diag_corrections_Qf=diag_corrections_Qf,
         )
 
         H, f = self.build_qp_matrices_delta(
@@ -380,6 +386,7 @@ class MPC_controller:
         diag_corrections_Q:   Optional[torch.Tensor] = None,
         diag_corrections_R:   Optional[torch.Tensor] = None,
         extra_linear_control: Optional[torch.Tensor] = None,
+        diag_corrections_Qf:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         H, f, U_bar = self.QP_formulation(
@@ -387,6 +394,7 @@ class MPC_controller:
             diag_corrections_Q=diag_corrections_Q,
             diag_corrections_R=diag_corrections_R,
             extra_linear_control=extra_linear_control,
+            diag_corrections_Qf=diag_corrections_Qf,
         )
 
         lb_delta, ub_delta = self.build_constraints_delta(U_bar)

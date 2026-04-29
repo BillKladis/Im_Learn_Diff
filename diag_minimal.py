@@ -21,7 +21,7 @@ optim = torch.optim.AdamW(lin_net.parameters(), lr=1.0)
 # Manual training step: forward, backprop, step
 state_history = torch.zeros((5, 4), dtype=torch.float64)
 state_history[:, 0] = math.pi  # near upright
-gates_Q, gates_R, f_extra, _, _ = lin_net(state_history)
+gates_Q, gates_R, f_extra, _, _, _ = lin_net(state_history)
 loss = (gates_Q.sum() + gates_R.sum() + f_extra.sum()) ** 2
 print(f"\nLoss: {loss.item():.4f}")
 
@@ -49,7 +49,7 @@ print(f"Is same .data?         {new_first_param.data is first_param.data}")
 sd_before = {k: v.detach().clone() for k, v in lin_net.state_dict().items()}
 # Take ANOTHER step
 optim.zero_grad()
-gQ, gR, fE, _, _ = lin_net(state_history); loss = (gQ.sum()) ** 2
+gQ, gR, fE, _, _, _ = lin_net(state_history); loss = (gQ.sum()) ** 2
 loss.backward()
 optim.step()
 sd_after = {k: v.detach().clone() for k, v in lin_net.state_dict().items()}

@@ -91,7 +91,7 @@ def hardcoded_rollout(lin_net, mpc, x0, x_goal, num_steps, sd_mpc):
             sh = torch.stack(state_history, dim=0)
             # Set state-dependent q_base BEFORE network call
             mpc.q_base_diag = sd_mpc.state_dep_q_base(x)
-            gQ, gR, fE, _, _ = lin_net(sh, mpc.q_base_diag, mpc.r_base_diag)
+            gQ, gR, fE, _, _, _ = lin_net(sh, mpc.q_base_diag, mpc.r_base_diag)
 
             x_lin_seq = x.unsqueeze(0).expand(mpc.N, -1).clone()
             u_lin_seq = torch.clamp(
@@ -139,7 +139,7 @@ def custom_train(lin_net, mpc, sd_mpc, x0, x_goal, demo, num_steps, num_epochs, 
         for step in range(num_steps):
             sh_t = torch.stack(sh, dim=0)
             mpc.q_base_diag = sd_mpc.state_dep_q_base(current)
-            gQ, gR, fE, _, _ = lin_net(sh_t, mpc.q_base_diag, mpc.r_base_diag)
+            gQ, gR, fE, _, _, _ = lin_net(sh_t, mpc.q_base_diag, mpc.r_base_diag)
 
             x_lin = current.unsqueeze(0).expand(mpc.N, -1).clone()
             u_lin = torch.clamp(u_guess.clone(),
