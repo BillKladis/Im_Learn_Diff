@@ -66,8 +66,20 @@ END_PHASE_STEPS  = 20
 Q_GATE_KICKSTART_BIAS = -3.0
 
 # THE TWO CHANGES
-W_TRACK_LATE_PHASE     = 10.0   # late-phase track loss multiplier
-TRACK_LATE_PHASE_STEPS = 50     # last 50 steps get the multiplier
+# w_track_late_phase was 10.0 in v1 but with track_mode=energy that's
+# only energy tracking — pendulum can match energy at q1=±π and the
+# loss can't distinguish. v2 uses w_stable_phase instead, which is
+# wrapped position + velocity tracking (= the actual STATE deviation
+# the user asked us to penalize heavily).
+W_TRACK_LATE_PHASE     = 0.0    # disabled — was a misfire (energy-only)
+TRACK_LATE_PHASE_STEPS = 50
+
+# True 'heavy state penalty in last N steps': w_stable_phase pins
+# wrapped(q1-π) + q1d + q2 + q2d in the last STABLE_PHASE_STEPS steps.
+# Network can only minimise this by raising Q-gates and arriving at
+# upright with low velocity.
+W_STABLE_PHASE         = 30.0
+STABLE_PHASE_STEPS     = 50
 
 
 def apply_q1_kickstart(lin_net, state_dim, horizon, bias_val):
@@ -144,9 +156,9 @@ def main():
     demo = load_reference_demo(REF_CSV, NUM_STEPS, device)
 
     print("=" * 80)
-    print("  EXP NO-DEMO + REALISTIC + LATE-PHASE PENALTY")
+    print("  EXP NO-DEMO + REALISTIC + STABLE-PHASE STATE PENALTY")
     print(f"  Reference CSV: {REF_CSV}")
-    print(f"  w_track_late_phase = {W_TRACK_LATE_PHASE}  steps={TRACK_LATE_PHASE_STEPS}")
+    print(f"  w_stable_phase = {W_STABLE_PHASE}  (wrapped pos+vel pin in last {STABLE_PHASE_STEPS} steps)")
     print(f"  Q_BASE_DIAG = {Q_BASE_DIAG}")
     print(f"  Qf          = [20, 20, 40, 30]   (default — Qf NOT bumped)")
     print(f"  EPOCHS={EPOCHS}  LR={LR}  NUM_STEPS={NUM_STEPS}")
@@ -189,6 +201,8 @@ def main():
         end_phase_steps=END_PHASE_STEPS,
         w_track_late_phase=W_TRACK_LATE_PHASE,
         track_late_phase_steps=TRACK_LATE_PHASE_STEPS,
+        w_stable_phase=W_STABLE_PHASE,
+        stable_phase_steps=STABLE_PHASE_STEPS,
     )
     elapsed = time.time() - t0
 
