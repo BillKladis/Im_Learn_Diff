@@ -280,6 +280,14 @@ def train_linearization_network(
     # the swing-up the way a time-window penalty did.
     # w_f_stable=0 → disabled (default).
     w_f_stable:           float = 0.0,
+    # POSITION-ONLY f_extra penalty: like w_f_stable but WITHOUT the
+    # velocity gating. Fires whenever the pendulum is near upright,
+    # REGARDLESS of velocity. This brakes during swing-through (which
+    # w_f_stable misses, because exp(-v²/2) decays rapidly with velocity
+    # — at v=2 rad/s the penalty is only 13% of full strength).
+    # Use this when the network is OSCILLATING through the upright with
+    # high velocity (a known failure mode where w_f_stable doesn't fire).
+    w_f_pos_only:         float = 0.0,
     # Stable-phase direct position tracking: in the last `stable_phase_steps`
     # steps, add a POSITION loss that directly drives the state toward the
     # goal (wrapped q1 error + normalised velocities/q2).  This is stronger
@@ -554,6 +562,16 @@ def train_linearization_network(
                 stable_zone = torch.clamp(near_goal * low_vel, 0.0, 1.0)
                 f_stable_pen = w_f_stable * stable_zone * (f_extra ** 2).mean()
                 phase_pen_terms.append(f_stable_pen)
+
+            # Position-only f_extra penalty: fires whenever near upright
+            # regardless of velocity — addresses oscillation through the
+            # goal which the velocity-gated w_f_stable can't suppress.
+            if w_f_pos_only > 0.0:
+                q1_d  = current_state_detached[0]
+                near_goal_pos = (1.0 + torch.cos(q1_d - x_goal[0])) / 2.0
+                near_goal_pos = torch.clamp(near_goal_pos, 0.0, 1.0)
+                f_pos_pen = w_f_pos_only * near_goal_pos * (f_extra ** 2).mean()
+                phase_pen_terms.append(f_pos_pen)
 
             # Stable-phase direct position tracking: explicit state-to-goal
             # loss for the last N steps.  Uses wrapped q1 error so the loss
