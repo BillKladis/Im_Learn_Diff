@@ -42,8 +42,8 @@ X0        = [0.0, 0.0, 0.0, 0.0]
 X_GOAL    = [math.pi, 0.0, 0.0, 0.0]
 NUM_STEPS = 300
 DT        = 0.05
-EPOCHS    = 60
-LR        = 1e-4
+EPOCHS    = 80
+LR        = 3e-5    # gentler than v1 (5e-5) since fine-tune from a trained model
 HORIZON   = 10
 SAVE_DIR  = "saved_models"
 
@@ -55,7 +55,7 @@ Q_PROFILE_PUMP   = [0.01, 0.01, 1.0, 1.0]
 Q_PROFILE_STABLE = [1.0,  1.0,  1.0, 1.0]   # KEEP default (max-out broke v2)
 W_END_Q_HIGH     = 80.0
 END_PHASE_STEPS  = 20
-W_F_STABLE       = 30.0   # NEW — state-conditional f_extra suppression
+W_F_STABLE       = 5.0    # gentle (was 30; the trained qf50 had high f_extra so the gradient was huge and broke swing-up at iter 1)
 
 
 def make_demo(num_steps, device):
