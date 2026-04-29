@@ -401,7 +401,9 @@ class LinearizationNetworkSC(nn.Module):
         q_diags = (q_base_diag.unsqueeze(0) * gates_Q) if q_base_diag is not None else None
         r_diags = (r_base_diag.unsqueeze(0) * gates_R) if r_base_diag is not None else None
 
-        return gates_Q, gates_R, f_extra, q_diags, r_diags
+        # SC variant doesn't have qf_head; return None to match the 6-tuple
+        # signature that Simulate.py expects since the qf-head feature was added.
+        return gates_Q, gates_R, f_extra, q_diags, r_diags, None
 
     def save(self, filepath: str, metadata: Optional[Dict] = None):
         parent = os.path.dirname(filepath)
