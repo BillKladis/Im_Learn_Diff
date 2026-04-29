@@ -154,6 +154,11 @@ def main():
         raw = float(np.linalg.norm(last - np.array(X_GOAL)))
         print(f"    {n:>4} steps: raw={raw:.4f}  wrapped={wrp:.4f}")
 
+    # CRITICAL: persistent optimizer across all train calls. Otherwise
+    # AdamW's momentum (m, v) resets each call and num_epochs=1 produces
+    # cold-start gradient steps with no adaptation — observed in v2 as
+    # canonical rollout being bit-identical for 8 outer iters.
+    optimizer = torch.optim.AdamW(lin_net.parameters(), lr=LR, weight_decay=1e-4)
     cap_anc = LossCapture()
     cap_cur = LossCapture()
     base_kwargs_anc = dict(
@@ -165,6 +170,7 @@ def main():
         q_profile_state_phase=True,
         w_end_q_high=80.0, end_phase_steps=20,
         w_f_stable=W_F_STABLE,
+        external_optimizer=optimizer,
     )
     base_kwargs_cur = {**base_kwargs_anc, "debug_monitor": cap_cur}
 

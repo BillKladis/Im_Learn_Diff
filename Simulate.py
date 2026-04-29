@@ -292,6 +292,13 @@ def train_linearization_network(
     # successful trajectory (curriculum learning).  init_history[-1]
     # should equal x0 (the most recent frame is the current state).
     init_history:         Optional[torch.Tensor] = None,
+    # Optional external optimizer.  Default: a fresh AdamW is created each
+    # call (correct for one-shot training runs).  Curriculum experiments
+    # that call this function many times with num_epochs=1 MUST pass an
+    # external optimizer — otherwise Adam's momentum (m, v) is reset every
+    # call and the per-iter gradient steps act as cold-start updates with
+    # no adaptation, producing essentially no cumulative learning.
+    external_optimizer:   Optional[torch.optim.Optimizer] = None,
 ) -> Tuple[List[float], network_module.NetworkOutputRecorder]:
 
     # ── Loss weights ──────────────────────────────────────────────────────
@@ -331,7 +338,10 @@ def train_linearization_network(
     # gradient is comparable in magnitude regardless of units.
     E_range = (E_demo.max() - E_demo.min()).clamp(min=1.0)
 
-    optimizer = torch.optim.AdamW(lin_net.parameters(), lr=lr, weight_decay=1e-4)
+    if external_optimizer is not None:
+        optimizer = external_optimizer
+    else:
+        optimizer = torch.optim.AdamW(lin_net.parameters(), lr=lr, weight_decay=1e-4)
     # Constant LR (cosine annealing was tested and didn't prevent the
     # post-swing-up drift — it just slowed it).  Early stopping on
     # best-goal-dist patience is the actual fix.
