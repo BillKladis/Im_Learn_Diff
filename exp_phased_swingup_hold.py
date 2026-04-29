@@ -312,7 +312,10 @@ def phase2(lin_net, mpc, x0, x_goal):
     return lin_net, mpc, x0, x_goal
 
 
-PHASE1_PRETRAINED = "saved_models/stageD_phase1_20260429_165603/stageD_phase1_20260429_165603.pth"
+PHASE1_PRETRAINED = "saved_models/stageD_nodemo_20260428_123448/stageD_nodemo_20260428_123448.pth"
+# ^ The proven 0.0612 baseline (arr=167, long=12, total=24, raw GoalDist=0.0612).
+#   Stronger swing-up than our re-trained Phase 1 model (which was marginal,
+#   arr=159 long=6 total=6 — too weak to survive Phase 2's first gradient step).
 
 
 def main():
