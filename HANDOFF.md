@@ -87,23 +87,33 @@ This gradual ramp PREVENTS saturation and allows gradient flow throughout the ra
 - Uses full (9,4) dQ_ref + (10,2) dR_ref from SCALE4_CKPT (both buffers)
 - lin_net frozen, 200 epochs, LR=1e-2
 
-Initial gate profile confirmed EXACT wrapper (before eval, analytical):
-```
-q1=127°  near_pi=0.801  wrapper=0.005  α=0.0045
-q1=140°  near_pi=0.883  wrapper=0.415  α=0.4151
-q1=150°  near_pi=0.933  wrapper=0.665  α=0.6651
-q1=180°  near_pi=1.000  wrapper=1.000  α=1.0000
-```
-Initial eval MUST be ≈87.2% (CVXPY compiling ~25 min).
+CONFIRMED: Initial eval = 87.2% (arr=242, post=99.1%) — exact replication of wrapper.
 
-Training can adjust:
-- thresh = -b/w (when does gate activate?)
-- width = 1/w (how steep is the ramp?)
-These are INDEPENDENTLY learnable (unlike threshold sweep where width = 1-thresh).
+v4 ep=10 result:
+- thresh moved from 0.800 → 0.7753 (training pushes threshold LOWER)
+- arr=240 (improved), post=98.8% (slightly worse), f01=87.0% (below 87.2%)
+- Training gradient: both top-start and bottom-start say "make α larger → lower threshold"
+- This is a fundamental mismatch: training loss ≠ f01 metric
 
-**Threshold sweep (exp_thresh_upper_sweep.py) — RUNNING PID 24704:**
-Fixed thresholds [0.75, 0.80, 0.825, 0.85, 0.875, 0.90, 0.925, 0.95] with full (9,4) dQ + (10,2) dR.
-Bug fixed: previous version used mean(dQ) and skipped dR → gave wrong arr=323 for thresh=0.80.
+Training dynamics: gradient always pushes toward wider activation (lower thresh) because:
+1. Top-start: "hold better → α larger → lower thresh"
+2. Bottom-start approach zone: "reach π → α larger → lower thresh"
+Neither provides countergradient for maintaining arr quality.
+
+v4-high (RUNNING PID 10031): init thresh=0.85 (w=5.0, b=-4.25) to explore upper threshold space.
+
+**Threshold sweep results so far (exp_thresh_upper_sweep.py):**
+| thresh | zone  | f01    | arr | post   |
+|--------|-------|--------|-----|--------|
+| 0.750  | 60.0° | 82.3%  | 239 | 93.4%  |
+| 0.800  | 53.1° | 87.2%★ | 242 | 99.1%  |
+
+KEY INSIGHT: thresh=0.75 (wider) → arr improves (239 vs 242) but post DROPS dramatically (93.4% vs 99.1%).
+- Width of ramp: thresh=0.75 → width=0.25 (slope=4); thresh=0.80 → width=0.20 (slope=5)
+- dQ_ref was trained specifically for thresh=0.80, so other thresholds use suboptimal dQ
+- Need results for thresh=0.825-0.95 to determine if 0.80 is the optimal
+
+Threshold sweep restarted (PID 8917) to get remaining results [0.825, 0.85, 0.875, 0.90, 0.925, 0.95].
 
 **dQ/dR shape correction (critical fix):**
 SCALE4_CKPT stores:
@@ -113,14 +123,22 @@ SCALE4_CKPT stores:
 Prior scalegate v1/v2/v3/v4 (before fix) were using mean(dQ) → (4,) which loses per-step information.
 Fixed in v4 and threshold sweep to use full tensors.
 
+**Planned experiments (not yet launched):**
+- exp_scalegate_v5.py: 3-param (w, b, scale) — adds dQ/dR magnitude control
+- exp_scalegate_v6.py: 4-param decoupled (w_fe, b_fe, w_Q, b_Q) — separate fe/Q gates
+- exp_scalegate_v7.py: 3-param velocity-aware (w, b, k) — k penalizes high q1d
+- These should be launched when v4 finishes to avoid resource contention
+
 ### RUNNING EXPERIMENTS
 
-| PID | Script | Status |
-|-----|--------|--------|
-| 23979 | exp_scalegate_v4.py | CVXPY COMPILING |
-| 24704 | exp_thresh_upper_sweep.py | CVXPY COMPILING |
+| PID | Script | Status | Notes |
+|-----|--------|--------|-------|
+| 23979 | exp_scalegate_v4.py (thresh=0.80) | ep=10 done | thresh drifted to 0.775 |
+| 10031 | exp_scalegate_v4.py (thresh=0.85) | CVXPY COMPILING | explores upper region |
+| 24704 | exp_thresh_upper_sweep.py (orig) | RUNNING (stuck at thresh=0.825) | may be slow |
+| 8917  | exp_thresh_upper_sweep.py (restart) | CVXPY COMPILING | |
 
-Logs: /tmp/scalegate_v4.log, /tmp/thresh_sweep.log
+Logs: /tmp/scalegate_v4.log, /tmp/scalegate_v4_high.log, /tmp/thresh_sweep.log, /tmp/thresh_sweep2.log
 
 ---
 
