@@ -288,6 +288,14 @@ def train_linearization_network(
     # Use this when the network is OSCILLATING through the upright with
     # high velocity (a known failure mode where w_f_stable doesn't fire).
     w_f_pos_only:         float = 0.0,
+    # Tight near-top f_extra penalty: fires only when near_pi > tight_top_thresh,
+    # using a linear ramp from 0 at tight_top_thresh to w at near_pi=1.
+    # Unlike w_f_pos_only (fires everywhere proportional to near_pi), this
+    # concentrates the penalty in the tight zone near the upright (>37°)
+    # and leaves the energy-building swing-up phase completely unpenalised.
+    # tight_top_thresh=0.8 is recommended: fires only in the last ~37° of q1.
+    w_f_tight_top:        float = 0.0,
+    tight_top_thresh:     float = 0.8,
     # Stable-phase direct position tracking: in the last `stable_phase_steps`
     # steps, add a POSITION loss that directly drives the state toward the
     # goal (wrapped q1 error + normalised velocities/q2).  This is stronger
@@ -572,6 +580,16 @@ def train_linearization_network(
                 near_goal_pos = torch.clamp(near_goal_pos, 0.0, 1.0)
                 f_pos_pen = w_f_pos_only * near_goal_pos * (f_extra ** 2).mean()
                 phase_pen_terms.append(f_pos_pen)
+
+            # Tight near-top penalty: concentrated in last ~37° of q1 around
+            # the upright (near_pi > tight_top_thresh). Ramp from 0 at thresh
+            # to full strength at near_pi=1. Leaves swing-up phase untouched.
+            if w_f_tight_top > 0.0:
+                q1_t = current_state_detached[0]
+                near_top_raw = (1.0 + torch.cos(q1_t - x_goal[0])) / 2.0
+                near_top_w = ((near_top_raw - tight_top_thresh) / max(1e-8, 1.0 - tight_top_thresh)).clamp(0.0, 1.0)
+                f_tight_pen = w_f_tight_top * near_top_w * (f_extra ** 2).mean()
+                phase_pen_terms.append(f_tight_pen)
 
             # Stable-phase direct position tracking: explicit state-to-goal
             # loss for the last N steps.  Uses wrapped q1 error so the loss
