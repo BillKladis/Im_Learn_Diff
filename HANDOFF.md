@@ -1,7 +1,54 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 4): SCALE=4-5× PEAK FOUND. 87.2% f01 = new record!** Scaling trained delta_Q by 4-5× gives 87.2% (post_arr=99.1-99.3%) without retraining. Full scale landscape mapped. Next: train from high-scale init or find gradient path to 90%+.
+**Status (2026-04-30 session 5): STAGE E LAUNCHED. Q-MAX PROBE CONFIRMS FIX POSSIBLE.** Discovered critical tanh saturation fix: atanh loss converges gates_Q[q1]: 0.013 → 1.985 in 200 gradient steps. Running alternating top/bottom training + Q-max warmup. Current record: 87.2%.
+
+---
+
+## SESSION 5 QUICK-READ (2026-04-30, continued)
+
+**KEY DISCOVERY: The tanh saturation CAN be fixed by the atanh-inverted Q-max loss.**
+
+The critical problem was: `raw_Q[q1] ≈ -3.47` at the top → `gates_Q[q1] = 1+0.99*tanh(-3.47) ≈ 0.013` (saturated).
+MSE loss on `gates_Q` has gradient: `0.99*(1-tanh²(-3.47)) ≈ 0.004` (near zero! useless).
+
+**Fix (atanh inversion):** Recover `raw_Q = atanh((gates_Q - 1) / 0.99)`, then MSE on `raw_Q → +3.0`.
+- Gradient: atanh amplifies 250× near saturation, canceling the tanh suppression → net gradient ≈ 1
+- Probe result (qmax_probe.py, 2000 steps, lr=1e-3):
+  - Step 0: gates_Q[q1] = 0.014, raw_Q = -3.052, loss = 38.97
+  - Step 200: gates_Q[q1] = **1.985**, raw_Q = +3.000, loss ≈ 0 (CONVERGED!)
+  - Stable thereafter (step 400, 600: same 1.985)
+
+**Effective Q[q1] after fix:**
+- From lin_net alone: 12 × 1.985 = **23.8** (vs 0.156 before → 153× improvement)
+- With scale=4× wrapper: 12 × (1.985 + 4.354) = **76.1**
+
+**Critical bug fixed: lin_net expects 5-step state history, NOT HORIZON=10.**
+- `lin_net.py:80`: `state_input_dim = 5 * state_dim = 20` (hardcoded)
+- Both Stage E scripts were using `expand(HORIZON, -1)` → shape (10,4) → crash
+- Fixed to `expand(5, -1)` (STATE_HIST constant)
+
+**Running experiments (as of ~20:15):**
+
+| PID | Script | Status |
+|-----|--------|--------|
+| 25595 | exp_dual_thresh.py --sweep | Running (thresh_dQ=0-0.4 all 0%, confirming no lower threshold possible) |
+| 25964 | exp_boost_v2.py (from scale=4× ckpt) | ep=10: 87.2% (stable, gradient doesn't improve) |
+| 11208 | exp_stageE_qhead_ft.py --with_wrapper | Running, compiling CVXPY (~25 min) |
+| 15267 | exp_stageE_alternating.py --with_wrapper | Running, Q-max warmup (500 steps at lr=1e-3) then CVXPY |
+
+**Stage E design (exp_stageE_alternating.py):**
+1. Q-max warmup: 500 steps at lr=1e-3 → raw_Q[q1] → +3.0 before CVXPY compiles
+2. Alternating training: 70% top epochs (tracking + Q-max aux), 30% bottom (tracking only)
+3. Q-max aux step uses atanh loss → pushes raw_Q directly, bypasses saturation
+4. Unfreezes ONLY q_head (37,668 params), trunk frozen
+
+**Prediction:** If q_head changes are state-specific (top trunk repr ≠ bottom), swing-up preserved.
+The 5-step history input ensures top and bottom states have very different trunk representations.
+
+**Dual-thresh sweep finding (confirms): scale=4× delta_Q is all-or-nothing.**
+Activating delta_Q early (thresh_dQ < 0.80) at scale=4× is catastrophic (0% for thresh=0.0-0.4).
+Cannot use lower threshold with large delta_Q — it must snap on only at top (thresh=0.80).
 
 ---
 
