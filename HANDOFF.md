@@ -24,18 +24,24 @@
 | exp_q1restore_test dq0=0.25 | **36.8%** (+10.6pp) | Done |
 | **exp_optinit_holdboost 0.987 0.987** | **82.9%** POST_ARR=93.9% | DONE ★★★ |
 | exp_boost_continue (from 82.9% init) | ep20=82.7%, ep40=82.4% | Killed (degrading) |
-| **exp_optinit trial 2 (0.987,0.987)** | — | **Running** (PID 23020) |
+| exp_optinit trial 2 (0.987,0.987) | **82.9%** — SAME! | Done — REPRODUCIBLE ★★★ |
+| **exp_robust_eval (8 x0 starts)** | — | **Running** (PID 27823) |
 
-**KEY FINDING: More training hurts.** Starting from 82.9% and continuing gradient training degrades to 82.4% at ep=40. The gradient follows the training loss (near-top tracking) which drifts away from the 2000-step eval optimum. The 82.9% at ep=20 is the sweet spot.
+**REPRODUCIBILITY CONFIRMED:** Trial 2 with different random seed gives IDENTICAL 82.9% result.
+- Trial 1: dQ_mean=[1.089, 1.023, -0.105, 0.077]
+- Trial 2: dQ_mean=[1.087, 1.001, -0.103, 0.076]
+Very consistent! The optimal delta_Q is a stable attractor for the 20-epoch training from (0.987, 0.987).
 
-**Saved checkpoint:** `saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/`
-- best_frac01_2000step: 0.8286
-- best_delta_Q mean: [1.089, 1.023, -0.105, 0.077] (per step: dq0 uniform 1.0883-1.0888, dq1 dips to 0.889 at steps 1-3)
-- best_delta_R mean: [0.081, -0.083] (step 0 has opposite sign pattern — interesting!)
+**KEY FINDING: More training hurts.** Starting from 82.9% and continuing gradient training degrades to 82.4% at ep=40. The 20-epoch sweet spot is robust.
 
-**Currently running:** PID 23020 (optinit trial 2 with different random seed, verify 82.9% is reproducible)
+**Saved checkpoint (BEST):** `saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/`
+- best_frac01_2000step: 0.8286 (82.9%)
+- best_delta_Q mean: [1.089, 1.023, -0.105, 0.077]
+- best_delta_R mean: [0.081, -0.083]
 
-**Logs:** `/tmp/optinit_trial2.log`
+**Currently running:** PID 27823 (robust eval — tests 82.9% model from 8 different x0 starts)
+
+**Logs:** `/tmp/robust_eval.log`
 
 ---
 
