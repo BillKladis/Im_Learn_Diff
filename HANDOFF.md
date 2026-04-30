@@ -1,13 +1,13 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 3): Root cause identified!** gates_Q[q1]=0.013 at top — MPC ignores q1 deviations near upright. Restoration fix being tested. Three experiments running.
+**Status (2026-04-30 session 3): BREAKTHROUGH!** dq0=0.25 alone → 36.8% (vs 26.2% baseline, +10.6pp). Full restoration dq0=0.987 expected ~40%+. Gradient fine-tuning running (PID 2096).
 
 ---
 
 ## SESSION 3 QUICK-READ (2026-04-30)
 
-**Best result:** 26.2% frac<0.10 (2000-step) from ZeroFNet inference gate (NO training needed).
+**Best result (so far):** 36.8% frac<0.10 (2000-step) from dq0=0.25 Q-restoration (no training). Full 0.987 restoration expected higher. ZeroFNet baseline: 26.2%.
 
 **Root cause discovered (session 3):** At top state [π,0,0,0], the network outputs `gates_Q[q1]≈0.013` and `gates_Q[q1d]≈0.013` (near-zero!), giving effective Q[q1]=0.156 and Q[q1d]=0.064 (vs. base 12.0 and 5.0 — 98.7% suppressed!). The MPC is essentially ignoring q1/q1d deviations near the top, causing the pendulum to oscillate rather than hold. Fix: add `delta_Q[:,0]≈+0.987` and `delta_Q[:,1]≈+0.987` to restore full Q base weights.
 
@@ -16,17 +16,18 @@
 **Experiments this session:**
 | Experiment | Result | Status |
 |---|---|---|
-| ZeroFNet (thresh=0.80, no training) | **26.2%** | BEST baseline |
-| holdboost_ft v1 (hold_reward, ep=15) | **26.5%** ↑ | Done (first positive!) |
-| holdboost_ft v2 (phase_aware) | — | Killed (3 procs too slow) |
-| exp_qboost_targeted (scalar sweep) | q=0.00→26.2%, q=0.05→24.5% | Done (scalar hurts) |
-| exp_holdboost_nearstart (near-top starts) | — | Running (PID 15927) |
-| exp_perdim_sweep (per-dim Q/R sweep) | q1=-0.30→17.0% | Running (PID 411) |
-| exp_q1restore_test (q1/q1d restoration) | — | Running (PID 15834) |
+| ZeroFNet (thresh=0.80, no training) | **26.2%** | baseline |
+| holdboost_ft v1 (hold_reward, ep=15) | **26.5%** ↑ | Done |
+| exp_qboost_targeted (scalar sweep) | q=0.05→24.5% | Done (scalar hurts) |
+| exp_holdboost_nearstart (near-top starts) | — | Killed (backprop too slow, no ckpt in 110min) |
+| exp_q1restore_test dq0=0.00 | **26.2%** | Done |
+| exp_q1restore_test dq0=0.25 | **36.8%** (+10.6pp!) | Done |
+| exp_q1restore_test dq0=0.50..1.50 | — | Running (PID 15834) |
+| **exp_optinit_holdboost 0.987 0.987** | — | **Running** (PID 2096) |
 
-**Currently running:** PID 15927 (holdboost_nearstart), PID 411 (perdim_sweep), PID 15834 (q1restore_test)
+**Currently running:** PID 15834 (q1restore, free-running), PID 2096 (optinit_holdboost from dq=0.987,0.987)
 
-**Logs:** `/tmp/holdboost_nearstart.log`, `/tmp/perdim_sweep.log`, `/tmp/q1restore_test.log`
+**Logs:** `/tmp/q1restore_test.log`, `/tmp/optinit_holdboost.log`
 
 ---
 
@@ -338,13 +339,26 @@ delta_Q[:, 3] = 0.0      # q2d already at 0.999, leave alone
 
 Why scalar boost fails: q_boost=0.05 gives +5% to q2/q2d (already at full base), causing interference that outweighs the +384% benefit to q1.
 
-### 15.5 Experiments running (~16:00 UTC)
+### 15.5 Key results (2026-04-30 ~16:51 UTC)
 
-**exp_holdboost_nearstart.py** (PID 15927): HoldBoostWrapper trained from near-top x0=[π±0.25, ±0.5, ±0.2, ±0.5], 200-step rollout (all hold phase), LR=1e-2. Should converge delta_Q[:,0] and [:,1] toward +0.987 via gradient descent on wrapped-q1 error. Log: `/tmp/holdboost_nearstart.log`.
+**BREAKTHROUGH confirmed:** Adding delta_Q[:,0]=+0.25 (partial q1 restoration) alone gives 36.8% vs 26.2% baseline (+10.6pp). This STRONGLY validates the root cause: gates_Q[q1]≈0.013 at top is the primary bottleneck.
 
-**exp_perdim_sweep.py** (PID 411): Tests each Q/R dimension independently. Q boosts: [-0.3 to +0.5]. First result: q1=-0.30→17.0% (reducing q1 hurts, as expected). Positive q1 values expected to help. Log: `/tmp/perdim_sweep.log`.
+**exp_q1restore_test.py results so far:**
+```
+  config    f<0.10    f<0.30    arr      post
+baseline     26.2%     42.3%    326     31.3%
+ q1=0.25     36.8%     51.3%    327     44.0%  ← +10.6pp with just 25% restoration
+ q1=0.50     TBD
+ q1=0.987    TBD (expected ~40-45%)
+ q1=1.50     TBD
+```
 
-**exp_q1restore_test.py** (PID 15834): Direct test of q1/q1d weight restoration. Tests dq0∈{0.0, 0.25, 0.50, 0.75, 0.987, 1.50} with dq1=0, then combined (0.987,0.987), (0.987,0.5), etc. Uses 2000-step evals. Log: `/tmp/q1restore_test.log`.
+**exp_optinit_holdboost.py** (PID 2096): Gradient fine-tuning from init delta_Q=[0.987,0.987,0,0]. This:
+1. Immediately evals at (0.987,0.987) — should reproduce q1restore result
+2. Fine-tunes via gradient (near-top x0, 200-step rollouts, LR=5e-3)
+3. Saves best checkpoint. Log: `/tmp/optinit_holdboost.log`.
+
+**exp_holdboost_nearstart** killed at 110min: backprop through QP is ~0.9s/call, 4000 calls/chunk = 60min/chunk. Way too slow.
 
 ### 15.6 cvxpylayers gotcha
 
@@ -354,7 +368,8 @@ Why scalar boost fails: q_boost=0.05 gives +5% to q2/q2d (already at full base),
 
 ### 15.7 Next steps in priority order
 
-1. **Read q1restore_test results**: Expect q1=0.987 boost to significantly exceed 26.2%. Log: `/tmp/q1restore_test.log`.
-2. **If q1_restore shows improvement**: Initialize holdboost delta_Q[:,0]=0.987, delta_Q[:,1]=X (best from test) and train from there.
-3. **Read perdim_sweep results**: Especially positive q1 values (0.05, 0.10, 0.20, 0.30, 0.50). Check q1d, q2, q2d, R dims once q1 baseline is known.
-4. **Wait for holdboost_nearstart ep=20**: LR=1e-2 + all-hold-phase training should converge delta_Q. Check that [:,0] and [:,1] grow toward +0.987.
+1. **Wait for optinit_holdboost (PID 2096)**: Log at `/tmp/optinit_holdboost.log`. Initial eval should show ~40%+ from (0.987,0.987) fixed. Gradient training may push further.
+2. **Read remaining q1restore_test results** (dq0=0.50, 0.75, 0.987, 1.50 + Phase 2 combined): If a higher dq0 is better, restart optinit with that init. Log: `/tmp/q1restore_test.log`.
+3. **If optinit converges**: Check saved model in `saved_models/stageD_optinit_holdboost_*/`, run final eval.
+4. **If optinit stalls below 40%**: Try dq0=1.5 init or two-stage (fix q1 first, then fine-tune q1d).
+5. **LQR fallback option** (not yet coded): At top, compute LQR gain from lin_net A,B matrices. Activates when near_pi>0.9. Could complement the Q-restoration approach.
