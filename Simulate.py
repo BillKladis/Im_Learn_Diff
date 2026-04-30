@@ -960,13 +960,13 @@ def rollout(
     for step in range(num_steps):
         with torch.no_grad():
             if lin_net is not None:
-                gates_Q, gates_R, f_extra, _, _, _ = lin_net(
+                gates_Q, gates_R, f_extra, _, _, gates_Qf = lin_net(
                     torch.stack(state_history, dim=0),
                     q_base_diag=mpc.q_base_diag,
                     r_base_diag=mpc.r_base_diag,
                 )
             else:
-                gates_Q, gates_R, f_extra = None, None, None
+                gates_Q, gates_R, f_extra, gates_Qf = None, None, None, None
 
         x_lin_seq = x.unsqueeze(0).expand(mpc.N, -1).clone()
         u_lin_seq = torch.clamp(
@@ -982,6 +982,7 @@ def rollout(
             diag_corrections_Q=gates_Q,
             diag_corrections_R=gates_R,
             extra_linear_control=extra_ctrl,
+            diag_corrections_Qf=gates_Qf,
         )
 
         x = mpc.true_RK4_disc(x, u_opt, mpc.dt)
