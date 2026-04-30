@@ -296,6 +296,11 @@ def train_linearization_network(
     # tight_top_thresh=0.8 is recommended: fires only in the last ~37° of q1.
     w_f_tight_top:        float = 0.0,
     tight_top_thresh:     float = 0.8,
+    # Hard ZeroFNet gate during training: zero f_extra when near_pi > f_gate_thresh.
+    # This forces Q/R gates to learn to stabilise WITHOUT feedforward near the top.
+    # Applied as a hard zero (no gradient to f_head near top); Q/R heads still adapt.
+    # f_gate_thresh=0.0 disables (default). Recommended: 0.9 (matches best ZeroFNet).
+    f_gate_thresh:        float = 0.0,
     # Stable-phase direct position tracking: in the last `stable_phase_steps`
     # steps, add a POSITION loss that directly drives the state toward the
     # goal (wrapped q1 error + normalised velocities/q2).  This is stronger
@@ -489,6 +494,14 @@ def train_linearization_network(
                 q_base_diag=mpc.q_base_diag,
                 r_base_diag=mpc.r_base_diag,
             )
+
+            # Hard ZeroFNet gate: zero f_extra when near_pi > f_gate_thresh.
+            # No gradient to f_head (detached gate); Q/R heads still adapt.
+            if f_gate_thresh > 0.0:
+                _q1_t = current_state_detached[0]
+                _near_pi = (1.0 + torch.cos(_q1_t - x_goal[0])) / 2.0
+                _zf_gate = ((_near_pi - f_gate_thresh) / max(1e-8, 1.0 - f_gate_thresh)).clamp(0.0, 1.0)
+                f_extra = f_extra * (1.0 - _zf_gate.detach())
 
             # Q1-gate regularization: penalise q1 gate for deviating above
             # q1_gate_reg_target.  Only fires when w_q1_gate_reg > 0.
