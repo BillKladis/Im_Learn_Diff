@@ -39,19 +39,53 @@ Initial eval: Differentiated model: top≈1.985, bottom≈0.111
 Alternating:  70% top (Q-max) + 30% bottom (Q-restore) to maintain differentiation
 ```
 
-**Running experiments (session 6):**
+**CRITICAL DISCOVERY: Q-restore pre-phase creates NO differentiation.**
+After 100 Q-restore steps at lr=1e-3:
+- top: 1.985 → 0.123 (dropped 94%!)
+- bottom: 1.985 → 0.113 (dropped 94%!)
 
-| PID | Script | Params | Status |
+Both states converge to SIMILAR values. The Q-restore gradient affects GLOBAL q_head weights
+equally — it does NOT selectively lower bottom Q while keeping top high. After restore, both
+are near the original values (top≈0.013 orig, bottom≈0.111 orig). Warmup has zero net benefit.
+
+**Root cause of Q-restore failure**: The q_head maps FEATURES → Q. After warmup, ALL state
+features map to high Q (globally). Q-restore at bottom features creates gradients that flow
+through the SHARED q_head weights, affecting ALL states (top included). Even though the gradient
+at top features is smaller (cos_sim=0.175), with 100 steps at lr=1e-3, the accumulated effect
+reverts top almost as much as bottom.
+
+**NEW APPROACH: PositionGateWrapper (exp_posgate.py)**
+Instead of fighting with the q_head's shared weights, ADD a tiny learned module that has
+EXPLICIT position features as input:
+- Input: [cos(q1-π), sin(q1-π), q1d, q2, q2d]  ← cos(q1-π)=+1 at top, -1 at bottom
+- Output: Q_adj[q1, q1d, q2, q2d]
+- Only 437 parameters
+- lin_net fully frozen
+
+Phase 1 (no CVXPY, fast): Supervised pre-train to match 4× wrapper behavior:
+  - top: Q_adj → dQ_4× = [4.35, 4.09, -0.42, 0.31]  ← target
+  - bottom: Q_adj → 0
+RESULT: Converges in 500 steps! top=[4.37, 4.11, -0.42, 0.31], bot≈0, f_suppress_top=0.993
+
+Phase 2 (CVXPY, slow): End-to-end fine-tune with MPC tracking loss
+  - Goal: discover better-than-hardcoded Q profile
+
+**KEY ADVANTAGE**: cos(q1-π) is trivially distinguishable. The gate can learn any smooth
+position+velocity-dependent Q adjustment. No q_head weight sharing problem.
+
+**Running experiments (session 6 after kill/restart):**
+
+| PID | Script | Key params | Status |
 |-----|--------|--------|--------|
-| 5696 | exp_stageE_alternating.py | top_frac=0.7 w_restore=2 restore_steps=200 | WARMUP |
-| 6053 | exp_stageE_alternating.py | top_frac=0.5 w_restore=5 restore_steps=300 | WARMUP |
+| 12563 | exp_posgate.py | pre-train=500, CVXPY fine-tune | CVXPY COMPILING |
+| 15802 | exp_stageE_alternating.py | warmup+Q-max(w=5), no restore, 70/30 | WARMUP |
+| 16169 | exp_stageE_alternating.py | warmup+bottom-only tracking, no aux | WARMUP |
 
-Log files: /tmp/stageE_alt_v2.log, /tmp/stageE_alt_v3.log
+Log files: /tmp/posgate.log, /tmp/stageE_alt_v4.log, /tmp/stageE_alt_v5.log
 
-**Dead experiments (session killed by interruption):**
-- exp_boost_v2 (ep=20): 87.2% — gradient training from scale=4× doesn't improve
-- exp_dual_thresh (thresh=0.6): 83.2%, arr=322 — lower threshold hurts
-- exp_stageE_alternating (v1): died in CVXPY compilation — warmup complete but no eval
+**Dead experiments (killed for bad design):**
+- v2 (restore_steps=200, lr=1e-3): killed — pre-restore reverts both top AND bottom equally
+- v3 (restore_steps=300, lr=1e-3): killed — same issue, confirmed by data
 
 ---
 
