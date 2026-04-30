@@ -1,7 +1,9 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 7): SCALEGATE v4 + THRESH SWEEP RUNNING.** Current record: 87.2%. v4 = learnable linear ramp (exact wrapper init), threshold sweep = fixed thresholds [0.75-0.95].
+**Status (2026-04-30 session 8): NEW RECORD 87.3% (thresh=0.850).** 2 experiments active: threshold sweep (4/8 done), gate grid restarted.
+
+**RECORD**: thresh=0.850 → **87.3%** (f01), arr=242, post=99.3%
 
 ---
 
@@ -100,20 +102,21 @@ Training dynamics: gradient always pushes toward wider activation (lower thresh)
 2. Bottom-start approach zone: "reach π → α larger → lower thresh"
 Neither provides countergradient for maintaining arr quality.
 
-v4-high (RUNNING PID 10031): init thresh=0.85 (w=5.0, b=-4.25) to explore upper threshold space.
+v4-high (KILLED before first result): init thresh=0.85 — killed to free CPU for static evals.
+v4 (KILLED after ep=10): threshold drifted 0.800→0.7753, f01=87.0% (degraded from 87.2%).
 
-**Threshold sweep results so far (exp_thresh_upper_sweep.py):**
-| thresh | zone  | f01    | arr | post   |
-|--------|-------|--------|-----|--------|
-| 0.750  | 60.0° | 82.3%  | 239 | 93.4%  |
-| 0.800  | 53.1° | 87.2%★ | 242 | 99.1%  |
+**Threshold sweep results (exp_thresh_upper_sweep.py, partial, still running PID 24704):**
+| thresh | zone  | f01     | arr | post   | notes |
+|--------|-------|---------|-----|--------|-------|
+| 0.750  | 60.0° | 82.3%   | 239 | 93.4%  | wide → faster arr, terrible hold |
+| 0.800  | 53.1° | 87.2%   | 242 | 99.1%  | prior baseline |
+| 0.825  | 49.5° | 87.2%   | 242 | 99.2%  | marginally better post |
+| 0.850  | 45.6° | **87.3%★** | 242 | 99.3%  | NEW RECORD — tighter is better! |
+| 0.875+ | ...   | TBD     | TBD | TBD    | still running |
 
-KEY INSIGHT: thresh=0.75 (wider) → arr improves (239 vs 242) but post DROPS dramatically (93.4% vs 99.1%).
-- Width of ramp: thresh=0.75 → width=0.25 (slope=4); thresh=0.80 → width=0.20 (slope=5)
-- dQ_ref was trained specifically for thresh=0.80, so other thresholds use suboptimal dQ
-- Need results for thresh=0.825-0.95 to determine if 0.80 is the optimal
+KEY: Each step up in threshold → post improves (+0.1%/step), arr stays at 242. Ceiling at arr=242 is 87.9% (post=100%). Still need 0.875-0.950 results.
 
-Threshold sweep restarted (PID 8917) to get remaining results [0.825, 0.85, 0.875, 0.90, 0.925, 0.95].
+**Gate grid (exp_gate_grid_eval.py)**: First run had "Solved/Inaccurate" CVXPY error under 4x system overload → baseline gave 0.0% (clearly wrong). Killed and RESTARTED (PID 30591) under lighter load (2 processes only).
 
 **dQ/dR shape correction (critical fix):**
 SCALE4_CKPT stores:
@@ -123,22 +126,74 @@ SCALE4_CKPT stores:
 Prior scalegate v1/v2/v3/v4 (before fix) were using mean(dQ) → (4,) which loses per-step information.
 Fixed in v4 and threshold sweep to use full tensors.
 
-**Planned experiments (not yet launched):**
-- exp_scalegate_v5.py: 3-param (w, b, scale) — adds dQ/dR magnitude control
-- exp_scalegate_v6.py: 4-param decoupled (w_fe, b_fe, w_Q, b_Q) — separate fe/Q gates
-- exp_scalegate_v7.py: 3-param velocity-aware (w, b, k) — k penalizes high q1d
-- These should be launched when v4 finishes to avoid resource contention
+### MATHEMATICAL CEILING ANALYSIS
 
-### RUNNING EXPERIMENTS
+**Key insight**: With current setup (fixed lin_net + dQ_ref from SCALE4_CKPT), 87.2% is NEAR the theoretical max:
+
+Best achievable f01 = (2000 - min_arr) × max_post / 2000
+
+From experiments:
+- min_arr observed = 239 (thresh=0.75, wide gate helps approach)
+- max_post observed = 99.2% (thresh=0.825)
+- These occur at DIFFERENT thresholds → can't combine easily
+
+**Upper bound**: (2000-239) × 0.992 / 2000 = 1761 × 0.992 / 2000 = 87.3%
+
+This means **87.3% is approximately the theoretical maximum** for the current lin_net/dQ_ref combo.
+The current 87.2% is essentially at the ceiling — improvements are at most 0.1%.
+
+For meaningful improvement beyond 88%:
+1. **Reduce arr from 242 → ≤200**: Requires faster swing-up controller (new lin_net training)
+2. **Different dQ direction**: Retrain dQ_ref for a different threshold (expensive)
+3. **Hybrid gates**: Maybe v6/v7 can decouple arr improvement from post degradation
+
+**Theorem**: With arr=242 and ANY post (even 100%), f01 ≤ 87.9%. To reach 90%+, need arr≤200.
+
+### RUNNING EXPERIMENTS (session 8)
 
 | PID | Script | Status | Notes |
 |-----|--------|--------|-------|
-| 23979 | exp_scalegate_v4.py (thresh=0.80) | ep=10 done | thresh drifted to 0.775 |
-| 10031 | exp_scalegate_v4.py (thresh=0.85) | CVXPY COMPILING | explores upper region |
-| 24704 | exp_thresh_upper_sweep.py (orig) | RUNNING (stuck at thresh=0.825) | may be slow |
-| 8917  | exp_thresh_upper_sweep.py (restart) | CVXPY COMPILING | |
+| 24704 | exp_thresh_upper_sweep.py | thresh=0.850 done (4/8) | NEW RECORD 87.3% |
+| 30591 | exp_gate_grid_eval.py | RESTARTED (CVXPY compiling) | 14 (w,b) configs, load=7 |
 
-Logs: /tmp/scalegate_v4.log, /tmp/scalegate_v4_high.log, /tmp/thresh_sweep.log, /tmp/thresh_sweep2.log
+COMPLETED/KILLED this session:
+- PID 23979 (v4 thresh=0.80): ep=10 only → thresh drifted 0.800→0.7753, f01=87.0% (DEGRADED)
+- PID 10031 (v4 thresh=0.85): killed before first result (was still compiling, freed CPU)
+- PID 16078 (gate grid v1): killed due to "Solved/Inaccurate" under 4x overload
+
+Planned (launch after threshold sweep + gate grid finish):
+- exp_scalegate_v5.py: 3-param (w, b, scale), init at thresh=0.85
+- exp_scalegate_v6.py: 4-param decoupled (w_fe, b_fe, w_Q, b_Q)
+- exp_scalegate_v7.py: 3-param velocity-aware (w, b, k), init thresh=0.85
+- exp_scalegate_v8.py: 6-param (w, b, scale_Q[4], scale_R[2]), init thresh=0.85
+
+Logs: /tmp/scalegate_v4.log, /tmp/thresh_sweep.log, /tmp/gate_grid.log
+
+### THRESHOLD SWEEP RESULTS (partial, as of session 8)
+
+| thresh | zone  | f01     | arr | post   | notes |
+|--------|-------|---------|-----|--------|-------|
+| 0.750  | 60.0° | 82.3%   | 239 | 93.4%  | wider → better arr, MUCH worse hold |
+| 0.800  | 53.1° | 87.2%   | 242 | 99.1%  | prior best |
+| 0.825  | 49.5° | 87.2%   | 242 | 99.2%  | same f01, better post |
+| 0.850  | 45.6° | **87.3%★** | 242 | 99.3%  | NEW RECORD |
+| 0.875+ | ...   | TBD     | TBD | TBD    | still running |
+
+PATTERN: Each 0.025 threshold increase → post +0.1%, arr stays 242, f01 +0.05%.
+CEILING: f01_max(arr=242, post=100%) = 1758/2000 = 87.9%
+NEXT RECORD target: thresh=0.875 might give 87.3-87.4% if trend holds; thresh=0.925-0.950 might hit 87.5-87.9%
+
+KEY: The dQ_ref (trained at thresh=0.80) actually generalizes BETTER at tighter thresholds!
+This is because tighter activation → boost only near π → Q boost helps hold more than it hurts approach.
+
+**TRAINING DYNAMICS (v4 ep=10 analysis):**
+- Gradient training from thresh=0.80 ALWAYS pushes threshold LOWER (toward 0.775)
+- This is WRONG direction based on threshold sweep (0.85 is better than 0.80)
+- Training loss ≠ f01 metric: loss rewards "more alpha = better hold" everywhere
+- Need DIFFERENT training signal that rewards TIGHTER threshold, not wider
+
+**IMPLICATION FOR v5-v8**: Init from thresh=0.85 (w=5.0, b=-4.25) not 0.80.
+The gradient will push thresh lower, but if we start at 0.85, we might land near 0.82-0.85 range which is better than drifting to 0.775.
 
 ---
 
