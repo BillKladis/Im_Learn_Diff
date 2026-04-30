@@ -1,11 +1,32 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
-**Branch:** `claude/pendulum-mpc-neural-network-csqVr` (will be made main)
-**Status: holding-at-top NOT yet solved.** Multi-day session of attempts. This document is a complete picture for whoever continues.
+**Branch:** `claude/continue-handoff-work-RhI5l`
+**Status (2026-04-30 session 3): First confirmed training improvement!** ZeroFNet baseline 26.2%, holdboost ep=15 gives 26.5%. Two experiments running. Full picture below.
 
 ---
 
-## TL;DR
+## SESSION 3 QUICK-READ (2026-04-30)
+
+**Best result:** 26.2% frac<0.10 (2000-step) from ZeroFNet inference gate (NO training needed).
+
+**Key breakthrough (sessions 2-3):** The root cause of all training failures was identified — any change to Q/R weights affects BOTH swing-up AND hold phases (shared parameters). The fix: **HoldBoostWrapper** adds a tiny 56-parameter correction (`delta_Q`, `delta_R`) that activates ONLY near the top via the same gate as ZeroFNet. This gives ZERO gradient coupling between swing-up and hold phases.
+
+**Experiments this session:**
+| Experiment | Result | Status |
+|---|---|---|
+| ZeroFNet (thresh=0.80, no training) | **26.2%** | BEST baseline |
+| holdboost_ft v1 (hold_reward, ep=15) | **26.5%** ↑ | First positive! |
+| holdboost_ft v2 (phase_aware, running) | — | Killed (3 procs too slow) |
+| exp_qboost_targeted (scalar sweep) | q=0.00→26.2% | Running (1 of 9 done) |
+| exp_holdboost_nearstart (near-top starts) | — | Running (pre-eval) |
+
+**Currently running:** PID 3031 (qboost_targeted), PID 15927 (holdboost_nearstart)
+
+**Logs:** `/tmp/qboost_targeted.log`, `/tmp/holdboost_nearstart.log`
+
+---
+
+## TL;DR (original)
 
 The pipeline reliably swings the pendulum **near** upright but doesn't actually **stay** there. The pendulum continuously **oscillates** or even **swings around** through the upright position. We have one model (`stageD_nodemo_qf50_20260429_111711`, "qf50 v2") that achieves 12/12 on a perturbation grid AND 35/35 on a wider grid — but those grids only measure "did it touch the loose zone wrap<0.3" not "did it hold". A detailed trace showed qf50 v2 spends **0%** of time with `wrap < 0.10` after arrival. Same for stab_state (best previous "real" hold: only 3.3% wrap<0.1). Multiple attempts to add hold-quality losses (w_stable_phase, w_f_stable, w_f_pos_only, w_hold_reward, distillation) either break the swing-up or get stuck in pre-pump phase.
 
@@ -249,3 +270,62 @@ This is a Claude (Anthropic) session log. Some honest notes on the process so th
 Without a `f_extra`-driven swing-up (which is open-loop, time-varying torque pattern that the network commits to), the QP alone cannot reliably plan a multi-second swing-up trajectory.
 
 **Future losses must not starve the f_extra pathway.** That's the real constraint.
+
+---
+
+## 15. SESSIONS 2–3 KEY FINDINGS (2026-04-30)
+
+### 15.1 ZeroFNet — 26.2% with no training
+
+Discovery: applying an inference-time soft gate that zeros `f_extra` near the top (no gradient training) gives the best hold quality so far. No parameter changes needed.
+
+```python
+gate = ((near_pi - thresh) / (1 - thresh)).clamp(0, 1)
+f_extra_effective = f_extra * (1 - gate)
+```
+
+Best threshold: 0.80 → **26.2% frac<0.10** over 2000 steps from `[0,0,0,0]`.
+Pendulum arrives at step 326, post-arrival hold quality: 31.3% of steps < 0.10.
+
+Models evaluated (all from saved_models/): the `posonly_ft_final` model from stageD_posonly_ft_20260430_083618 is the BEST swing-up model. Use this as the base.
+
+### 15.2 The Trajectory Coupling Root Cause
+
+ALL gradient-based training failed because:
+1. Full model: shared trunk corrupted by competing gradients (swing-up vs hold)
+2. Q/R-only training: weights shared across all states → changing for hold → changes swing-up
+3. Near-top initial state training: Q/R changes alter trajectory → alter f_extra
+
+The only safe approach: **additive corrections that only activate near the top**.
+
+### 15.3 HoldBoostWrapper — 56 trainable parameters
+
+```python
+q_shape = (H-1, state_dim)  # (9, 4)
+r_shape = (H, control_dim)  # (10, 2)
+delta_Q = nn.Parameter(zeros(q_shape))  # init=0 → identical to ZeroFNet
+delta_R = nn.Parameter(zeros(r_shape))
+```
+
+Forward: `gates_Q += gate * delta_Q`, `gates_R += gate * delta_R`, `f_extra *= (1-gate.detach())`
+
+DECOUPLING GUARANTEE: `∂loss_swing/∂delta_Q ≈ 0` because gate≈0 during swing-up.
+
+Result at ep=15 (hold_reward, LR=1e-3): delta_Q.mean=0.0066 → **26.5%** (first positive training result).
+
+### 15.4 Pending experiments (2026-04-30 ~15:00 UTC)
+
+**exp_qboost_targeted.py** (PID 3031): sweeps scalar Q boosts 0.0..1.5. Each eval ~5-10 min after initial 34-min compilation. First result (q_boost=0.0→26.2%) confirms baseline. Results in `/tmp/qboost_targeted.log`.
+
+**exp_holdboost_nearstart.py** (PID 15927): HoldBoostWrapper trained from near-top x0=[π±0.25, ±0.5, ±0.2, ±0.5], 200-step rollout (all hold phase), LR=1e-2. Should converge much faster than v2. Results in `/tmp/holdboost_nearstart.log`.
+
+### 15.5 cvxpylayers gotcha
+
+**Never use `torch.no_grad()` in eval loops.** The QP solver (cvxpylayers) needs autograd active even for forward-only evaluation — wrapping rollout with `no_grad()` produces wrong/zero control outputs (pendulum never arrives). The `train_module.rollout()` function already uses `no_grad()` internally for the lin_net forward pass only, which is correct.
+
+### 15.6 Next steps in priority order
+
+1. **Read qboost_targeted results**: If q_boost=X gives >30%, initialize delta_Q=X in holdboost and re-evaluate without training. This gives the optimal fixed Q boost instantly.
+2. **Wait for holdboost_nearstart ep=20**: LR=1e-2 + all-hold-phase training should converge delta_Q significantly faster. Check `/tmp/holdboost_nearstart.log`.
+3. **If holdboost_nearstart converges**: check best_delta_Q values. Per-dim optimal corrections might be different from scalar.
+4. **Try per-dim Q boost**: After scalar sweep, try boosting only the q1 dimension (dim 0) which is most relevant for hold quality. q1_weight = 12.0 in baseline; might need to be larger.
