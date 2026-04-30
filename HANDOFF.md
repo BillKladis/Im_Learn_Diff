@@ -23,16 +23,19 @@
 | exp_q1restore_test dq0=0.00 | **26.2%** | Done |
 | exp_q1restore_test dq0=0.25 | **36.8%** (+10.6pp) | Done |
 | **exp_optinit_holdboost 0.987 0.987** | **82.9%** POST_ARR=93.9% | DONE ★★★ |
-| **exp_boost_continue (from 82.9% init)** | — | **Running** (PID 11588) |
+| exp_boost_continue (from 82.9% init) | ep20=82.7%, ep40=82.4% | Killed (degrading) |
+| **exp_optinit trial 2 (0.987,0.987)** | — | **Running** (PID 23020) |
+
+**KEY FINDING: More training hurts.** Starting from 82.9% and continuing gradient training degrades to 82.4% at ep=40. The gradient follows the training loss (near-top tracking) which drifts away from the 2000-step eval optimum. The 82.9% at ep=20 is the sweet spot.
 
 **Saved checkpoint:** `saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/`
 - best_frac01_2000step: 0.8286
-- best_delta_Q mean: [1.089, 1.023, -0.105, 0.077]
-- best_delta_R mean: [0.081, -0.083]
+- best_delta_Q mean: [1.089, 1.023, -0.105, 0.077] (per step: dq0 uniform 1.0883-1.0888, dq1 dips to 0.889 at steps 1-3)
+- best_delta_R mean: [0.081, -0.083] (step 0 has opposite sign pattern — interesting!)
 
-**Currently running:** PID 11588 (boost_continue, trying to push beyond 82.9%)
+**Currently running:** PID 23020 (optinit trial 2 with different random seed, verify 82.9% is reproducible)
 
-**Logs:** `/tmp/boost_continue.log`
+**Logs:** `/tmp/optinit_trial2.log`
 
 ---
 
@@ -379,11 +382,21 @@ baseline     26.2%     42.3%      326    31.3%
 
 ### 15.7 Next steps in priority order
 
-1. **Monitor exp_boost_continue (PID 11588)**: Trying to push beyond 82.9% from the best checkpoint. EXCELLENT_HOLD bar set at 90%. Log: `/tmp/boost_continue.log`. Checkpoint: `saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/`.
-2. **Robustness testing**: Evaluate 82.9% model from multiple x0 starting positions (not just [0,0,0,0]). Check q1±0.5, q1d±1.0 perturbations at start.
-3. **Try different training x0 distributions**: The 82.9% model was trained with [π±0.25, ±0.5, ±0.2, ±0.5]. Try wider perturbations for more robust hold.
-4. **Full model retraining (Stage E)**: Integrate the delta_Q correction back into the lin_net weights so it doesn't require a wrapper. This would make the model "natively" good at holding.
-5. **Deploy final model**: Load lin_net from `stageD_posonly_ft_*` + apply FixedHoldBoost with delta_Q=[1.089,1.023,-0.105,0.077] (per-step mean) for production use.
+1. **Check trial 2 result** (PID 23020): Does a second 20-epoch run from (0.987,0.987) reproduce or exceed 82.9%? Log: `/tmp/optinit_trial2.log`. Expected ~17:42 UTC.
+2. **If trial 2 ≥ 82.9%**: Result is reproducible. Accept as final. Update HANDOFF, push.
+3. **If trial 2 < 82.9%**: Run `exp_robust_eval.py` to test 82.9% model across multiple x0 starts. Then try `exp_boost_v2.py` (fresh x0 every epoch, different LR).
+4. **Robustness testing**: `python exp_robust_eval.py` (8 different starting conditions). Requires CVXPY compilation.
+5. **For future sessions**: Full retraining of lin_net (Stage E) that doesn't need the wrapper. This would be a multi-hour training run but would produce a "natively" better model.
+
+### 15.7b What to do if we want to go beyond 82.9%
+
+Options in increasing complexity:
+1. **Different random seeds** for the 20-epoch training run (trial 2 tests this)
+2. **Different init**: Try (1.5, 0.0) or (0.987, 0.0) — different starting point for gradient
+3. **exp_boost_v2**: Fresh x0 every epoch, cosine LR — might find better optimum
+4. **State-dependent delta_Q**: Train a small linear model W×x+b for delta_Q instead of fixed. More expressive (180 params vs 36).
+5. **Direct network weight editing**: Modify q_head weights so raw_Q[q1] at top → 0. More fundamental fix.
+6. **Full Stage E retraining**: Retrain lin_net with hold-quality loss + ZeroFNet gate + stage-aware training. Would take hours but could reach 90%+.
 
 ### 15.8 How to reproduce 82.9% result
 
