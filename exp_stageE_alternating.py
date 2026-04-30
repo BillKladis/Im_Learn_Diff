@@ -58,6 +58,7 @@ SCALE4_CKPT   = "saved_models/stageD_scale4.0x_dQ_20260430_192447/stageD_scale4.
 X0            = [0.0, 0.0, 0.0, 0.0]
 X_GOAL        = [math.pi, 0.0, 0.0, 0.0]
 DT            = 0.05; HORIZON = 10; Q_BASE_DIAG = [12.0, 5.0, 50.0, 40.0]; THRESH = 0.8
+STATE_HIST    = 5    # lin_net input: last 5 states (hardcoded in lin_net.py:80)
 NUM_STEPS     = 200; SAVE_EVERY = 10; EXCELLENT_HOLD = 0.92
 
 # Near-top: q1 close to π
@@ -146,7 +147,7 @@ def q_max_aux_step(lin_net, optimizer, device, w_q_bonus):
             torch.zeros(1, device=device, dtype=torch.float64).squeeze(),
             torch.zeros(1, device=device, dtype=torch.float64).squeeze(),
         ])
-        x_seq = x_top.unsqueeze(0).expand(HORIZON, -1)
+        x_seq = x_top.unsqueeze(0).expand(STATE_HIST, -1)
 
         # Forward through lin_net (only q_head contributes to grad since trunk frozen)
         gates_Q, _, _, _, _, _ = lin_net(x_seq)
@@ -222,7 +223,7 @@ def main():
 
     # Check initial gQ[q1] at top
     x_top_test = torch.tensor([math.pi, 0, 0, 0], device=device, dtype=torch.float64)
-    x_seq_test = x_top_test.unsqueeze(0).expand(HORIZON, -1)
+    x_seq_test = x_top_test.unsqueeze(0).expand(STATE_HIST, -1)
     with torch.no_grad():
         gQ_init, _, _, _, _, _ = lin_net(x_seq_test)
     print(f"  Initial gates_Q at top: {gQ_init[0].tolist()}")

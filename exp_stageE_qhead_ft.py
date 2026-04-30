@@ -230,9 +230,9 @@ def main():
                 best_qhead_state = {k: v.clone() for k, v in lin_net.state_dict().items()
                                     if 'q_head' in k}
 
-            # Check Q-head change near top vs baseline
+            # Check Q-head change near top vs baseline (lin_net takes 5-step history)
             x_top = torch.tensor([math.pi, 0, 0, 0], device=device, dtype=torch.float64)
-            x_seq_top = x_top.unsqueeze(0).expand(HORIZON, -1)
+            x_seq_top = x_top.unsqueeze(0).expand(5, -1)
             with torch.no_grad():
                 gQ_new, _, _, _, _, _ = lin_net(x_seq_top)
                 gQ_old, _, _, _, _, _ = lin_net_orig(x_seq_top)
