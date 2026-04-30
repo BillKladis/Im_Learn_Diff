@@ -125,44 +125,65 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 GATE_RANGE_Q = 0.99   # lin_net.gate_range_q hardcoded value
 RAW_Q_TARGET = 3.0    # atanh target: gates_Q = 1 + 0.99*tanh(3.0) ≈ 1.985
 
-def q_max_aux_step(lin_net, optimizer, device, w_q_bonus):
-    """Auxiliary gradient step: push raw_Q[q1, q1d] → large positive at top states.
 
-    KEY: MSE on gates_Q has near-zero gradient when raw_Q≈-3.47 (tanh saturated).
-    Instead: invert gates_Q → raw_Q via atanh, then push raw_Q toward RAW_Q_TARGET.
-    Gradient of atanh near saturation is ~250× amplified — precisely what we need.
-    """
+def _raw_q_from_gates(gates_Q_col):
+    """Recover raw_Q from gates_Q via atanh. Large gradient near saturation."""
+    inner = ((gates_Q_col - 1.0) / GATE_RANGE_Q).clamp(-0.9999, 0.9999)
+    return torch.atanh(inner)
+
+
+def q_max_aux_step(lin_net, optimizer, device, w_q_bonus):
+    """Push raw_Q[q1, q1d] → +RAW_Q_TARGET at top states (large Q for strong hold)."""
     if w_q_bonus <= 0:
         return 0.0
 
     batch_size = 8
-    q1_samples = torch.tensor([
-        math.pi + (random.random() * 2 - 1) * TOP_PERT_Q1
-        for _ in range(batch_size)
-    ], device=device, dtype=torch.float64)
-
     losses = []
-    for q1 in q1_samples:
-        x_top = torch.stack([
-            q1,
-            torch.zeros(1, device=device, dtype=torch.float64).squeeze(),
-            torch.zeros(1, device=device, dtype=torch.float64).squeeze(),
-            torch.zeros(1, device=device, dtype=torch.float64).squeeze(),
-        ])
+    for _ in range(batch_size):
+        q1 = math.pi + (random.random() * 2 - 1) * TOP_PERT_Q1
+        x_top = torch.tensor([q1, 0.0, 0.0, 0.0], device=device, dtype=torch.float64)
         x_seq = x_top.unsqueeze(0).expand(STATE_HIST, -1)
         gates_Q, _, _, _, _, _ = lin_net(x_seq)
-
-        # Recover raw_Q via atanh inversion: gates_Q = 1 + 0.99*tanh(raw_Q)
-        # raw_Q = atanh((gates_Q - 1) / 0.99)  — clamp to avoid atanh singularity
-        inner = ((gates_Q[:, :2] - 1.0) / GATE_RANGE_Q).clamp(-0.9999, 0.9999)
-        raw_Q_q1q1d = torch.atanh(inner)
-
-        # MSE on raw_Q: gradient is large and well-conditioned even at saturation
-        target = torch.full_like(raw_Q_q1q1d, RAW_Q_TARGET)
-        loss = F.mse_loss(raw_Q_q1q1d, target)
-        losses.append(loss)
+        raw_Q = _raw_q_from_gates(gates_Q[:, :2])
+        target = torch.full_like(raw_Q, RAW_Q_TARGET)
+        losses.append(F.mse_loss(raw_Q, target))
 
     total_loss = w_q_bonus * torch.stack(losses).mean()
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+    return total_loss.item()
+
+
+def q_restore_aux_step(lin_net, lin_net_orig, optimizer, device, w_restore):
+    """Push raw_Q[q1, q1d] → ORIGINAL values at bottom states (preserve swing-up).
+
+    MOTIVATION: Q-max at top states is NOT state-specific — the q_head.4 weight
+    modifies raw_Q globally. Without this correction, after warmup gates_Q[q1]≈1.98
+    EVERYWHERE (bottom: 0.11→1.98, catastrophically high Q during swing-up).
+
+    This step anchors bottom-state Q to original, creating true state-conditional behavior.
+    """
+    if w_restore <= 0:
+        return 0.0
+
+    batch_size = 8
+    losses = []
+    for _ in range(batch_size):
+        x0_base = random.choice(BOTTOM_X0_LIST)
+        q1 = x0_base[0] + (random.random() * 2 - 1) * 0.2
+        x_bot = torch.tensor([q1, 0.0, 0.0, 0.0], device=device, dtype=torch.float64)
+        x_seq = x_bot.unsqueeze(0).expand(STATE_HIST, -1)
+
+        gates_Q, _, _, _, _, _ = lin_net(x_seq)
+        with torch.no_grad():
+            gates_Q_orig, _, _, _, _, _ = lin_net_orig(x_seq)
+
+        raw_Q_now = _raw_q_from_gates(gates_Q[:, :2])
+        raw_Q_orig = _raw_q_from_gates(gates_Q_orig[:, :2])
+        losses.append(F.mse_loss(raw_Q_now, raw_Q_orig))
+
+    total_loss = w_restore * torch.stack(losses).mean()
     optimizer.zero_grad()
     total_loss.backward()
     optimizer.step()
@@ -190,6 +211,8 @@ def main():
                         help="Fraction of epochs using near-top x0 + Q-max bonus")
     parser.add_argument("--w_q_bonus", type=float, default=2.0,
                         help="Weight for Q-max auxiliary loss at top states")
+    parser.add_argument("--w_restore", type=float, default=2.0,
+                        help="Weight for Q-restore loss at bottom states (anchors to original Q)")
     parser.add_argument("--unfreeze_trunk", action="store_true",
                         help="Also unfreeze trunk (more capacity, higher risk)")
     parser.add_argument("--with_wrapper", action="store_true",
@@ -205,6 +228,9 @@ def main():
     mpc.q_base_diag = torch.tensor(Q_BASE_DIAG, device=device, dtype=torch.float64)
 
     lin_net = network_module.LinearizationNetwork.load(POSONLY_FINAL, device=str(device)).double()
+    # Frozen reference copy for Q-restore at bottom states
+    lin_net_orig = network_module.LinearizationNetwork.load(POSONLY_FINAL, device=str(device)).double()
+    lin_net_orig.requires_grad_(False)
 
     # Selectively unfreeze
     lin_net.requires_grad_(False)
@@ -221,8 +247,8 @@ def main():
     print("=" * 80)
     print(f"  STAGE E: Alternating bottom/top training with Q-max bonus")
     print(f"  Trainable params: {total_trainable}  (unfreeze_trunk={args.unfreeze_trunk})")
-    print(f"  LR={args.lr}  top_frac={args.top_frac:.0%}  w_q_bonus={args.w_q_bonus}")
-    print(f"  Q-max target: gates_Q[q1,q1d] → {Q_MAX_TARGET} (vs 0.013 currently)")
+    print(f"  LR={args.lr}  top_frac={args.top_frac:.0%}  w_q_bonus={args.w_q_bonus}  w_restore={args.w_restore}")
+    print(f"  Q-max target: raw_Q[q1,q1d] → {RAW_Q_TARGET} at top; restore orig at bottom")
     print(f"  with_wrapper={args.with_wrapper}  prev_best=87.2%")
     print("=" * 80)
 
@@ -315,9 +341,13 @@ def main():
             external_optimizer=optimizer, restore_best=False,
         )
 
-        # Q-max auxiliary step (only for top epochs)
+        # Q-max auxiliary step (top) + Q-restore (bottom): explicit state-conditional control
         if is_top_epoch and args.w_q_bonus > 0:
             q_max_aux_step(lin_net, optimizer, device, args.w_q_bonus)
+        elif not is_top_epoch and args.w_restore > 0:
+            # Anchor bottom-state Q to original — prevents Q-max warmup from
+            # globally destroying swing-up (probe showed Q-max changes ALL states)
+            q_restore_aux_step(lin_net, lin_net_orig, optimizer, device, args.w_restore)
 
         scheduler.step()
         epoch += 1
