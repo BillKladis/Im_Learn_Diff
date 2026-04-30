@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 4): ROBUSTNESS CONFIRMED.** 82.9% frac<0.10 generalizes: avg 83.2% across 8 diverse starts, +44-61% over ZeroFNet in all cases. Boost_v2/v3/v4 experiments queued to push beyond 82.9%.
+**Status (2026-04-30 session 4): SCALE=3× BREAKTHROUGH! 87.0% without retraining.** Simply scaling trained delta_Q by 3× gives 87.0% (vs 82.9% trained) via dramatically better hold quality (98.8% post_arr). Extended sweeps running to find peak.
 
 ---
 
@@ -26,8 +26,43 @@ The 82.9% boost model (learned delta_Q) was tested from 8 different x0 values. A
 - Hold-phase failures: 6.1% of 1764 hold steps = 108 steps → 5.4% contribution  
 - Path to 92%+: reduce hold-phase fall-off (6.1% → ~0%) OR reduce swing time (arr→0)
 
-**New experiments written (not yet run):**
-- `exp_boost_v2.py`: Fresh x0 per epoch, cosine LR 1e-3→1e-5 (most promising)
+**SESSION 4 SCALE SWEEP BREAKTHROUGH:**
+
+Simply scaling the trained delta_Q by a constant factor reveals non-monotonic behavior:
+```
+ scale    f<0.10    arr    post      eff Q[q1]
+  0.00    26.2%    326    31.3%        0.16
+  0.25    23.9%    327    28.6%        3.42
+  0.50    32.8%    236    37.2%        6.69
+  0.75    83.1%    236    94.2%        9.95
+  1.00    82.9%    236    93.9%       13.22  ← trained
+  1.25    82.7%    237    93.8%       16.48
+  1.50    82.5%    237    93.5%       19.75
+  2.00    81.8%    238    92.8%       26.28
+  3.00    87.0%    239    98.8%       39.34  ← NEW BEST!
+```
+
+Key findings:
+- **87.0% at scale=3.0** — 4.1pp better than trained 82.9%, no retraining needed!
+- **post_arr=98.8%** at scale=3.0 vs 93.9% at scale=1.0 — dramatically better hold quality
+- **arr stays similar** (236-239) for scales 0.5-3.0 — swing-up not hurt by higher delta_Q
+- Non-monotonic: scale 1.0→2.0 degrades, then scale=3.0 jumps to new high
+- Why scale=3.0 works: high dQ[q1,q1d] gives strong restoring force, NEGATIVE dQ[q2]=-0.315
+  reduces Q[q2] weight (50→34), enabling natural swing-up approach
+- Extended sweeps running: [2.5-10.0] and [0.55-0.90] to find global peak
+
+**Gradient training from 82.9% always degrades (confirmed by boost_v2, boost_continue):**
+- boost_continue: 82.9% → 82.4% at ep=40 (degrading)
+- boost_v2 (fresh x0): 82.9% → 82.7% at ep=60 (degrading slower but still degrading)
+- optinit_2.0 (larger init): converges to 82.6% — same basin as 0.987 init
+
+**Key insight: The 82.9% is a stable attractor of near-top training loss, but the loss
+landscape ≠ 2000-step eval metric. Scale=3.0× gives 87.0% without gradient training.**
+
+**New experiments written:**
+- `exp_dq_scale_sweep.py`: Forward-only sweep of delta_Q scale factors (ran: 87% at scale=3.0!)
+- `exp_thresh_sweep.py`: Forward-only sweep of gate thresholds
+- `exp_dual_thresh.py`: Separate gate thresholds for delta_Q activation vs f_extra zeroing
 - `exp_boost_v3.py`: Mix near-top + swing-up training (robustness-oriented)
 - `exp_boost_v4.py`: Adds delta_Qf (terminal cost learning, new axis)
 
