@@ -1,11 +1,37 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 3): MAJOR BREAKTHROUGH!** 82.9% frac<0.10 (2000-step, post_arr=93.9%)! ZeroFNet baseline was 26.2%. 3.2× improvement via learned delta_Q correction. Continuation training running (PID 11588).
+**Status (2026-04-30 session 4): ROBUSTNESS CONFIRMED.** 82.9% frac<0.10 generalizes: avg 83.2% across 8 diverse starts, +44-61% over ZeroFNet in all cases. Boost_v2/v3/v4 experiments queued to push beyond 82.9%.
 
 ---
 
-## SESSION 3 QUICK-READ (2026-04-30)
+## SESSION 4 QUICK-READ (2026-04-30)
+
+**ROBUSTNESS CONFIRMED: avg 83.2% across 8 diverse starting conditions.**
+The 82.9% boost model (learned delta_Q) was tested from 8 different x0 values. Average boost=83.2%, average zero=26.1%. The only outlier is x0=[+0.1,0,0,0] (64.4%) which has arr=701 — a swing-up dynamics quirk where small positive q1 causes long roundabout trajectory. All others: 82-89%.
+
+| x0 | boost f<0.10 | zero f<0.10 | arr | Δ |
+|---|---|---|---|---|
+| [0,0,0,0] (standard) | 82.9% | 26.2% | 236 | +56.6% |
+| [0.1,0,0,0] | 64.4% | 20.2% | 701 | +44.2% |
+| [-0.1,0,0,0] | 85.9% | 25.3% | 248 | +60.5% |
+| [0.5,0,0,0] | 86.7% | 28.4% | 256 | +58.3% |
+| [-0.5,0,0,0] | **88.5%** | 29.5% | **214** | +59.0% |
+| [0,0.5,0,0] | 86.7% | 26.6% | 238 | +60.0% |
+| [0,-0.5,0,0] | 85.7% | 27.7% | 273 | +58.0% |
+| [0,0,0.3,0] | 85.3% | 24.4% | 281 | +60.8% |
+
+**Failure mode analysis (from [0,0,0,0]):**
+- Swing-up time: 236 steps → 11.8% failure contribution (timing only)
+- Hold-phase failures: 6.1% of 1764 hold steps = 108 steps → 5.4% contribution  
+- Path to 92%+: reduce hold-phase fall-off (6.1% → ~0%) OR reduce swing time (arr→0)
+
+**New experiments written (not yet run):**
+- `exp_boost_v2.py`: Fresh x0 per epoch, cosine LR 1e-3→1e-5 (most promising)
+- `exp_boost_v3.py`: Mix near-top + swing-up training (robustness-oriented)
+- `exp_boost_v4.py`: Adds delta_Qf (terminal cost learning, new axis)
+
+**SESSION 3 QUICK-READ (2026-04-30)**
 
 **BEST RESULT: 82.9% frac<0.10** (2000-step from [0,0,0,0]), post_arr=93.9%, arr=236 steps. Learned delta_Q=[1.089,1.023,-0.105,0.077] correction via 20 epochs of gradient training from near-top x0. ZeroFNet baseline was 26.2%. Target (>50%) EXCEEDED.
 
@@ -25,7 +51,7 @@
 | **exp_optinit_holdboost 0.987 0.987** | **82.9%** POST_ARR=93.9% | DONE ★★★ |
 | exp_boost_continue (from 82.9% init) | ep20=82.7%, ep40=82.4% | Killed (degrading) |
 | exp_optinit trial 2 (0.987,0.987) | **82.9%** — SAME! | Done — REPRODUCIBLE ★★★ |
-| **exp_robust_eval (8 x0 starts)** | — | **Running** (PID 27823) |
+| **exp_robust_eval (8 x0 starts)** | avg=83.2%, all +44-61% over zero | Done ★ |
 
 **REPRODUCIBILITY CONFIRMED:** Trial 2 with different random seed gives IDENTICAL 82.9% result.
 - Trial 1: dQ_mean=[1.089, 1.023, -0.105, 0.077]
@@ -39,9 +65,9 @@ Very consistent! The optimal delta_Q is a stable attractor for the 20-epoch trai
 - best_delta_Q mean: [1.089, 1.023, -0.105, 0.077]
 - best_delta_R mean: [0.081, -0.083]
 
-**Currently running:** PID 27823 (robust eval — tests 82.9% model from 8 different x0 starts)
+**Robust eval complete.** Avg 83.2% boost vs 26.1% zero across 8 starts. See Session 4 quick-read above.
 
-**Logs:** `/tmp/robust_eval.log`
+**Next queued:** `exp_boost_v2.py` (fresh x0 per epoch, cosine LR) — most promising next step.
 
 ---
 
