@@ -207,6 +207,8 @@ def main():
                         help="LR for Q-max warmup (higher = faster convergence)")
     parser.add_argument("--warmup_steps", type=int, default=500,
                         help="Q-max warmup steps before alternating training begins")
+    parser.add_argument("--restore_steps", type=int, default=200,
+                        help="Q-restore steps after warmup (pre-CVXPY) to differentiate bottom states")
     parser.add_argument("--top_frac", type=float, default=0.7,
                         help="Fraction of epochs using near-top x0 + Q-max bonus")
     parser.add_argument("--w_q_bonus", type=float, default=2.0,
@@ -249,6 +251,7 @@ def main():
     print(f"  Trainable params: {total_trainable}  (unfreeze_trunk={args.unfreeze_trunk})")
     print(f"  LR={args.lr}  top_frac={args.top_frac:.0%}  w_q_bonus={args.w_q_bonus}  w_restore={args.w_restore}")
     print(f"  Q-max target: raw_Q[q1,q1d] → {RAW_Q_TARGET} at top; restore orig at bottom")
+    print(f"  warmup_steps={args.warmup_steps}  restore_steps={args.restore_steps}")
     print(f"  with_wrapper={args.with_wrapper}  prev_best=87.2%")
     print("=" * 80)
 
@@ -284,6 +287,30 @@ def main():
         raw_post = math.atanh(max(-0.9999, min(0.9999, (gq1_post - 1.0) / GATE_RANGE_Q)))
         print(f"  Warmup complete: gates_Q[q1] {gQ_init[0,0].item():.4f} → {gq1_post:.4f}  "
               f"(raw_Q: {math.atanh(max(-0.9999, min(0.9999, (gQ_init[0,0].item()-1.0)/GATE_RANGE_Q))):.3f} → {raw_post:.3f})")
+
+        # Q-restore pre-phase: bring bottom-state Q back to original BEFORE CVXPY eval.
+        # Warmup raised gates_Q[q1] globally to 1.985; this restores bottom states to ~0.111
+        # so the initial eval starts from a properly differentiated model.
+        if args.restore_steps > 0:
+            print(f"\n  Q-restore pre-phase: {args.restore_steps} steps at lr={args.lr_qmax}...")
+            x_bot_test = torch.tensor([0.0, 0.0, 0.0, 0.0], device=device, dtype=torch.float64)
+            x_bot_seq = x_bot_test.unsqueeze(0).expand(STATE_HIST, -1)
+            for rs in range(args.restore_steps):
+                q_restore_aux_step(lin_net, lin_net_orig, warmup_opt, device, w_restore=1.0)
+                if (rs + 1) % 50 == 0:
+                    with torch.no_grad():
+                        gQ_top, _, _, _, _, _ = lin_net(x_seq_test)
+                        gQ_bot, _, _, _, _, _ = lin_net(x_bot_seq)
+                    gt = gQ_top[0, 0].item()
+                    gb = gQ_bot[0, 0].item()
+                    print(f"    restore step {rs+1}/{args.restore_steps}: "
+                          f"gates_Q[q1] top={gt:.4f}  bot={gb:.4f}", flush=True)
+            with torch.no_grad():
+                gQ_top_f, _, _, _, _, _ = lin_net(x_seq_test)
+                gQ_bot_f, _, _, _, _, _ = lin_net(x_bot_seq)
+            print(f"  Restore complete: top={gQ_top_f[0,0].item():.4f}  bot={gQ_bot_f[0,0].item():.4f}  "
+                  f"(target_bot={gQ_init[0,0].item():.4f})")
+
         # Reset the main optimizer so warmup Adam state doesn't contaminate
         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-6)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

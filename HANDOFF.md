@@ -1,7 +1,57 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 5): STAGE E RUNNING. Q-RESTORE CONTRASTIVE LOSS ADDED.** Q-max probe showed global (not state-specific) effect. Added Q-restore at bottom states for true state-conditional behavior. Experiments compiling CVXPY. Current record: 87.2%.
+**Status (2026-04-30 session 6): STAGE E ALTERNATING RESTARTED (v2+v3) WITH Q-RESTORE PRE-PHASE.** Stability tests confirm warmup is rock-solid. Dual-thresh sweep confirms lower threshold hurts arr. Current record: 87.2%.
+
+---
+
+## SESSION 6 QUICK-READ (2026-04-30, continued)
+
+**STABILITY TEST RESULTS (qmax_stability.py, no CVXPY needed):**
+After 500-step Q-max warmup (gates_Q[q1]: 0.013→1.985):
+
+| Test | Setup | After 200 training steps |
+|---|---|---|
+| A | 70% top (Q-max aux) + 30% bottom (param-regularize to orig) | 1.9851 → **1.9851** (ZERO CHANGE) |
+| B | 100% bottom only (worst case, no Q-max at all) | 1.9851 → **1.9849** (negligible) |
+| C | 70% top (no Q-max aux) + 30% bottom | [in progress] |
+
+**Key conclusion**: At lr=1e-4, warmup gains are EXTREMELY STABLE. Even 100% bottom training barely moves them. This means:
+1. Top Q gains persist through alternating training ✓
+2. BUT: bottom states also stay at 1.985, which likely HURTS swing-up (confirmed below)
+
+**DUAL-THRESH SWEEP NEW RESULT:**
+- thresh_dQ=0.600 → f01=83.2%, **arr=322** (vs baseline 242!)
+- Wider boost zone delays swing-up by 80 steps — confirms high Q at non-top states is harmful
+- thresh_dQ=0.800 → 87.2% (optimal is current setting)
+- Lower thresh_dQ not viable: disrupts the swing-up trajectory
+
+**NEW INSIGHT: Q-restore pre-phase added to alternating script.**
+Problem: After warmup, ALL states have gates_Q[q1]≈1.985. The eval at top would be great, but
+arr would increase (like dual-thresh showed). Solution: run Q-restore BEFORE CVXPY compilation
+to differentiate top vs bottom BEFORE the first eval:
+
+```
+Warmup phase:  500 steps lr=1e-3 → push ALL states Q[q1] → 1.985 (20 steps to converge)
+Restore phase: 200 steps lr=1e-3 → push BOTTOM states Q[q1] → original (0.111)
+               While top stays at 1.985 (high cos_sim costs → top barely affected)
+Initial eval: Differentiated model: top≈1.985, bottom≈0.111
+Alternating:  70% top (Q-max) + 30% bottom (Q-restore) to maintain differentiation
+```
+
+**Running experiments (session 6):**
+
+| PID | Script | Params | Status |
+|-----|--------|--------|--------|
+| 5696 | exp_stageE_alternating.py | top_frac=0.7 w_restore=2 restore_steps=200 | WARMUP |
+| 6053 | exp_stageE_alternating.py | top_frac=0.5 w_restore=5 restore_steps=300 | WARMUP |
+
+Log files: /tmp/stageE_alt_v2.log, /tmp/stageE_alt_v3.log
+
+**Dead experiments (session killed by interruption):**
+- exp_boost_v2 (ep=20): 87.2% — gradient training from scale=4× doesn't improve
+- exp_dual_thresh (thresh=0.6): 83.2%, arr=322 — lower threshold hurts
+- exp_stageE_alternating (v1): died in CVXPY compilation — warmup complete but no eval
 
 ---
 
