@@ -62,7 +62,9 @@ SAVE_DIR     = "saved_models"
 Q_BASE_DIAG  = [12.0, 5.0, 50.0, 40.0]
 
 THRESH        = 0.8    # ZeroFNet gate threshold (matches best eval)
-W_HOLD_REWARD = 80.0   # strong hold reward
+# phase_aware tracking: steps 0-300 = energy, steps 300-600 = wrapped q1 error
+# Wrapped q1 error gives DIRECT strong gradient vs hold_reward (exp-based, weak)
+W_HOLD_REWARD = 0.0    # off: phase_aware tracking provides stronger gradient
 HOLD_SIGMA    = 0.5
 HOLD_START    = 200
 SAVE_EVERY    = 15
@@ -171,7 +173,7 @@ def main():
     print(f"  gate = clamp((near_pi - {THRESH}) / {1-THRESH:.1f}, 0, 1)")
     print(f"  Effect: gates_Q += gate*delta_Q, gates_R += gate*delta_R, f_extra *= (1-gate)")
     print(f"  DECOUPLING: gate≈0 during swing-up → ZERO effect on swing-up trajectory")
-    print(f"  NUM_STEPS={NUM_STEPS}  w_hold_reward={W_HOLD_REWARD}  sigma={HOLD_SIGMA}")
+    print(f"  NUM_STEPS={NUM_STEPS}  track_mode=phase_aware  phase_split=step300")
     print(f"  Target: exceed 26.2% frac<0.10 (2000-step)")
     print("=" * 80)
 
@@ -214,10 +216,13 @@ def main():
             x0=x0, x_goal=x_goal, demo=demo, num_steps=NUM_STEPS,
             num_epochs=n_ep, lr=LR,
             debug_monitor=None, recorder=network_module.NetworkOutputRecorder(),
-            grad_debug=False, track_mode="energy", w_terminal_anchor=0.0,
+            grad_debug=False,
+            track_mode="phase_aware",     # energy for swing-up, wrapped-q1 for hold
+            phase_split_frac=0.5,         # split at step 300 (= ARRIVAL_STEP/NUM_STEPS)
+            w_terminal_anchor=0.0,
             w_q_profile=0.0, w_f_pos_only=0.0, w_stable_phase=0.0,
             f_gate_thresh=0.0,            # gate applied in forward() already
-            w_hold_reward=W_HOLD_REWARD,
+            w_hold_reward=W_HOLD_REWARD,  # 0.0 — phase_aware is stronger
             hold_sigma=HOLD_SIGMA,
             hold_start_step=HOLD_START,
             early_stop_patience=n_ep + 5,
