@@ -113,7 +113,7 @@ class PositionGateWrapper(nn.Module):
 
         pos_feat = self.get_position_features(x_sequence)  # (5,)
         q_adj = self.q_gate(pos_feat)          # (4,)  Q adjustment
-        gQ = gQ + q_adj.unsqueeze(0)           # broadcast over horizon
+        gQ = (gQ + q_adj.unsqueeze(0)).clamp(min=0.01)  # ensure non-negative Q weights
 
         if self.also_gate_f:
             f_suppress = self.f_gate(pos_feat)  # (1,)  ∈ [0,1]
