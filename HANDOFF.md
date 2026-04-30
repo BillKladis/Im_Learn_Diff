@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 6 CONTINUED): SCALEGATE RUNNING (v1+v2 in CVXPY eval phase).** Current record: 87.2%. Pattern confirmed: ANY premature Q boost at non-top states destroys swing-up.
+**Status (2026-04-30 session 7): SCALEGATE v4 + THRESH SWEEP RUNNING.** Current record: 87.2%. v4 = learnable linear ramp (exact wrapper init), threshold sweep = fixed thresholds [0.75-0.95].
 
 ---
 
@@ -66,16 +66,61 @@ More trivially learnable (threshold is literally on one feature). Sharper profil
 - q1=127° α=0.146 (vs 0.366 for v1)
 - q1=150°+ α=0.999
 
+### SESSION 7: SCALEGATE v3/v4 DESIGN + RUNNING
+
+**Scalegate v1 autopsy (arr=321):** α=0.366 at q1=127° — sigmoid too soft, disrupts swing-up identically to dual-thresh(0.60).
+
+**Scalegate v2 autopsy (arr=237, post=93.9%):** Better (α=0.063 at 127°), but gate saturated (α≈0 or ≈1 at all training states) → zero gradient → training stuck at 82.8%. Wrong ramp shape vs wrapper (sigmoid too steep in wrong region).
+
+**KEY INSIGHT (why 87.2% wrapper works):**
+The wrapper uses a LINEAR RAMP (not binary step): `gate = ((near_pi - 0.80) / 0.20).clamp(0,1)`
+- At q1=127° (near_pi=0.801): gate=0.005 ≈ 0 (just barely on)
+- At q1=140° (near_pi=0.883): gate=0.415 (partial)
+- At q1=150° (near_pi=0.933): gate=0.665 (partial)
+- At q1=180° (near_pi=1.000): gate=1.000 (full)
+
+This gradual ramp PREVENTS saturation and allows gradient flow throughout the ramp region.
+
+**Scalegate v4 design (exp_scalegate_v4.py) — RUNNING PID 23979:**
+- α = (w × near_pi + b).clamp(0,1), 2 learnable params
+- Init: w=5.0, b=-4.0 → EXACTLY the 87.2% wrapper formula
+- Uses full (9,4) dQ_ref + (10,2) dR_ref from SCALE4_CKPT (both buffers)
+- lin_net frozen, 200 epochs, LR=1e-2
+
+Initial gate profile confirmed EXACT wrapper (before eval, analytical):
+```
+q1=127°  near_pi=0.801  wrapper=0.005  α=0.0045
+q1=140°  near_pi=0.883  wrapper=0.415  α=0.4151
+q1=150°  near_pi=0.933  wrapper=0.665  α=0.6651
+q1=180°  near_pi=1.000  wrapper=1.000  α=1.0000
+```
+Initial eval MUST be ≈87.2% (CVXPY compiling ~25 min).
+
+Training can adjust:
+- thresh = -b/w (when does gate activate?)
+- width = 1/w (how steep is the ramp?)
+These are INDEPENDENTLY learnable (unlike threshold sweep where width = 1-thresh).
+
+**Threshold sweep (exp_thresh_upper_sweep.py) — RUNNING PID 24704:**
+Fixed thresholds [0.75, 0.80, 0.825, 0.85, 0.875, 0.90, 0.925, 0.95] with full (9,4) dQ + (10,2) dR.
+Bug fixed: previous version used mean(dQ) and skipped dR → gave wrong arr=323 for thresh=0.80.
+
+**dQ/dR shape correction (critical fix):**
+SCALE4_CKPT stores:
+- best_delta_Q: shape (9,4) — per-step values, q1d dim varies [4.35, 3.56, ..., 4.36]
+- best_delta_R: shape (10,2) — per-step values, ≈±0.41
+
+Prior scalegate v1/v2/v3/v4 (before fix) were using mean(dQ) → (4,) which loses per-step information.
+Fixed in v4 and threshold sweep to use full tensors.
+
 ### RUNNING EXPERIMENTS
 
-| PID | Script | Gate input | Status |
-|-----|--------|-----------|--------|
-| 6134 | exp_scalegate.py | [cos,sin,q1d,q2,q2d]→α | CVXPY COMPILING |
-| 8666 | exp_scalegate_v2.py | [error_norm,cos(q1-π)]→α | Pre-training |
+| PID | Script | Status |
+|-----|--------|--------|
+| 23979 | exp_scalegate_v4.py | CVXPY COMPILING |
+| 24704 | exp_thresh_upper_sweep.py | CVXPY COMPILING |
 
-Logs: /tmp/scalegate_v1.log, /tmp/scalegate_v2.log
-
-**Expected result**: ~87.2% initial eval (gate matches wrapper). Training may discover better threshold. If α at 127° is too high (0.366), might still disrupt swing-up slightly — v2 may do better.
+Logs: /tmp/scalegate_v4.log, /tmp/thresh_sweep.log
 
 ---
 
