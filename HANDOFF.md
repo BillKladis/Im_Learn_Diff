@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 3): First confirmed training improvement!** ZeroFNet baseline 26.2%, holdboost ep=15 gives 26.5%. Two experiments running. Full picture below.
+**Status (2026-04-30 session 3): Root cause identified!** gates_Q[q1]=0.013 at top — MPC ignores q1 deviations near upright. Restoration fix being tested. Three experiments running.
 
 ---
 
@@ -9,20 +9,24 @@
 
 **Best result:** 26.2% frac<0.10 (2000-step) from ZeroFNet inference gate (NO training needed).
 
-**Key breakthrough (sessions 2-3):** The root cause of all training failures was identified — any change to Q/R weights affects BOTH swing-up AND hold phases (shared parameters). The fix: **HoldBoostWrapper** adds a tiny 56-parameter correction (`delta_Q`, `delta_R`) that activates ONLY near the top via the same gate as ZeroFNet. This gives ZERO gradient coupling between swing-up and hold phases.
+**Root cause discovered (session 3):** At top state [π,0,0,0], the network outputs `gates_Q[q1]≈0.013` and `gates_Q[q1d]≈0.013` (near-zero!), giving effective Q[q1]=0.156 and Q[q1d]=0.064 (vs. base 12.0 and 5.0 — 98.7% suppressed!). The MPC is essentially ignoring q1/q1d deviations near the top, causing the pendulum to oscillate rather than hold. Fix: add `delta_Q[:,0]≈+0.987` and `delta_Q[:,1]≈+0.987` to restore full Q base weights.
+
+**Scalar Q boost confirmed harmful:** q_boost=0.05 → 24.5% (WORSE than 26.2%). Uniform boost also increases q2/q2d which already have full gates (≈1.0), causing interference.
 
 **Experiments this session:**
 | Experiment | Result | Status |
 |---|---|---|
 | ZeroFNet (thresh=0.80, no training) | **26.2%** | BEST baseline |
-| holdboost_ft v1 (hold_reward, ep=15) | **26.5%** ↑ | First positive! |
-| holdboost_ft v2 (phase_aware, running) | — | Killed (3 procs too slow) |
-| exp_qboost_targeted (scalar sweep) | q=0.00→26.2% | Running (1 of 9 done) |
-| exp_holdboost_nearstart (near-top starts) | — | Running (pre-eval) |
+| holdboost_ft v1 (hold_reward, ep=15) | **26.5%** ↑ | Done (first positive!) |
+| holdboost_ft v2 (phase_aware) | — | Killed (3 procs too slow) |
+| exp_qboost_targeted (scalar sweep) | q=0.00→26.2%, q=0.05→24.5% | Done (scalar hurts) |
+| exp_holdboost_nearstart (near-top starts) | — | Running (PID 15927) |
+| exp_perdim_sweep (per-dim Q/R sweep) | q1=-0.30→17.0% | Running (PID 411) |
+| exp_q1restore_test (q1/q1d restoration) | — | Running (PID 15834) |
 
-**Currently running:** PID 3031 (qboost_targeted), PID 15927 (holdboost_nearstart)
+**Currently running:** PID 15927 (holdboost_nearstart), PID 411 (perdim_sweep), PID 15834 (q1restore_test)
 
-**Logs:** `/tmp/qboost_targeted.log`, `/tmp/holdboost_nearstart.log`
+**Logs:** `/tmp/holdboost_nearstart.log`, `/tmp/perdim_sweep.log`, `/tmp/q1restore_test.log`
 
 ---
 
@@ -313,19 +317,44 @@ DECOUPLING GUARANTEE: `∂loss_swing/∂delta_Q ≈ 0` because gate≈0 during s
 
 Result at ep=15 (hold_reward, LR=1e-3): delta_Q.mean=0.0066 → **26.5%** (first positive training result).
 
-### 15.4 Pending experiments (2026-04-30 ~15:00 UTC)
+### 15.4 Root cause: gates_Q[q1]≈0.013 at top state
 
-**exp_qboost_targeted.py** (PID 3031): sweeps scalar Q boosts 0.0..1.5. Each eval ~5-10 min after initial 34-min compilation. First result (q_boost=0.0→26.2%) confirms baseline. Results in `/tmp/qboost_targeted.log`.
+```python
+# Diagnostic run at top state [pi, 0, 0, 0]:
+# gates_Q mean per dim: [0.0130, 0.0129, 1.0012, 0.9986]
+# Effective Q:          [0.156,  0.064,  50.06,  39.94]
+# Base Q:               [12.0,   5.0,    50.0,   40.0 ]
+#                        ^98.7% suppressed!  ^fine
+```
 
-**exp_holdboost_nearstart.py** (PID 15927): HoldBoostWrapper trained from near-top x0=[π±0.25, ±0.5, ±0.2, ±0.5], 200-step rollout (all hold phase), LR=1e-2. Should converge much faster than v2. Results in `/tmp/holdboost_nearstart.log`.
+The baseline network outputs near-zero gates for q1 and q1d at the top, so the MPC barely penalizes q1/q1d deviations. This is why the pendulum oscillates rather than holding. Required fix:
 
-### 15.5 cvxpylayers gotcha
+```python
+delta_Q[:, 0] = +0.987   # restores gates_Q[q1]  from 0.013 → 1.000
+delta_Q[:, 1] = +0.987   # restores gates_Q[q1d] from 0.013 → 1.000
+delta_Q[:, 2] = 0.0      # q2 already at 1.001, leave alone
+delta_Q[:, 3] = 0.0      # q2d already at 0.999, leave alone
+```
+
+Why scalar boost fails: q_boost=0.05 gives +5% to q2/q2d (already at full base), causing interference that outweighs the +384% benefit to q1.
+
+### 15.5 Experiments running (~16:00 UTC)
+
+**exp_holdboost_nearstart.py** (PID 15927): HoldBoostWrapper trained from near-top x0=[π±0.25, ±0.5, ±0.2, ±0.5], 200-step rollout (all hold phase), LR=1e-2. Should converge delta_Q[:,0] and [:,1] toward +0.987 via gradient descent on wrapped-q1 error. Log: `/tmp/holdboost_nearstart.log`.
+
+**exp_perdim_sweep.py** (PID 411): Tests each Q/R dimension independently. Q boosts: [-0.3 to +0.5]. First result: q1=-0.30→17.0% (reducing q1 hurts, as expected). Positive q1 values expected to help. Log: `/tmp/perdim_sweep.log`.
+
+**exp_q1restore_test.py** (PID 15834): Direct test of q1/q1d weight restoration. Tests dq0∈{0.0, 0.25, 0.50, 0.75, 0.987, 1.50} with dq1=0, then combined (0.987,0.987), (0.987,0.5), etc. Uses 2000-step evals. Log: `/tmp/q1restore_test.log`.
+
+### 15.6 cvxpylayers gotcha
 
 **Never use `torch.no_grad()` in eval loops.** The QP solver (cvxpylayers) needs autograd active even for forward-only evaluation — wrapping rollout with `no_grad()` produces wrong/zero control outputs (pendulum never arrives). The `train_module.rollout()` function already uses `no_grad()` internally for the lin_net forward pass only, which is correct.
 
-### 15.6 Next steps in priority order
+**Compilation cost:** Each fresh Python process takes ~25 min for first QP solve. Keep experiments in long-lived processes. Multiple processes compete for CPU — avoid running more than 2 heavy experiments simultaneously.
 
-1. **Read qboost_targeted results**: If q_boost=X gives >30%, initialize delta_Q=X in holdboost and re-evaluate without training. This gives the optimal fixed Q boost instantly.
-2. **Wait for holdboost_nearstart ep=20**: LR=1e-2 + all-hold-phase training should converge delta_Q significantly faster. Check `/tmp/holdboost_nearstart.log`.
-3. **If holdboost_nearstart converges**: check best_delta_Q values. Per-dim optimal corrections might be different from scalar.
-4. **Try per-dim Q boost**: After scalar sweep, try boosting only the q1 dimension (dim 0) which is most relevant for hold quality. q1_weight = 12.0 in baseline; might need to be larger.
+### 15.7 Next steps in priority order
+
+1. **Read q1restore_test results**: Expect q1=0.987 boost to significantly exceed 26.2%. Log: `/tmp/q1restore_test.log`.
+2. **If q1_restore shows improvement**: Initialize holdboost delta_Q[:,0]=0.987, delta_Q[:,1]=X (best from test) and train from there.
+3. **Read perdim_sweep results**: Especially positive q1 values (0.05, 0.10, 0.20, 0.30, 0.50). Check q1d, q2, q2d, R dims once q1 baseline is known.
+4. **Wait for holdboost_nearstart ep=20**: LR=1e-2 + all-hold-phase training should converge delta_Q. Check that [:,0] and [:,1] grow toward +0.987.
