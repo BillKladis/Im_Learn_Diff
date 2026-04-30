@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 4): SCALE=3× BREAKTHROUGH! 87.0% without retraining.** Simply scaling trained delta_Q by 3× gives 87.0% (vs 82.9% trained) via dramatically better hold quality (98.8% post_arr). Extended sweeps running to find peak.
+**Status (2026-04-30 session 4): SCALE=4-5× PEAK FOUND. 87.2% f01 = new record!** Scaling trained delta_Q by 4-5× gives 87.2% (post_arr=99.1-99.3%) without retraining. Full scale landscape mapped. Next: train from high-scale init or find gradient path to 90%+.
 
 ---
 
@@ -49,7 +49,29 @@ Key findings:
 - Non-monotonic: scale 1.0→2.0 degrades, then scale=3.0 jumps to new high
 - Why scale=3.0 works: high dQ[q1,q1d] gives strong restoring force, NEGATIVE dQ[q2]=-0.315
   reduces Q[q2] weight (50→34), enabling natural swing-up approach
-- Extended sweeps running: [2.5-10.0] and [0.55-0.90] to find global peak
+- Extended sweeps COMPLETE: peak is **87.2% at scale=4.0-5.0**. See full table:
+
+```
+ scale    f01    arr    post      eff Q[q1]
+  0.00   26.2%   326   31.3%        0.16
+  0.60   64.8%   236   73.5%        7.99
+  0.65   83.1%   236   94.2%        8.65  ← threshold jump
+  0.70   83.0%   236   94.1%
+  1.00   82.9%   236   93.9%       13.22  ← gradient-trained attractor
+  1.50   82.5%   237   93.5%
+  2.00   81.8%   238   92.8%
+  2.50   86.8%   238   98.5%       32.81  ← second regime starts
+  3.00   87.0%   239   98.8%       39.34
+  4.00   87.2%   242   99.1%       52.41  ← CURRENT BEST (tied)
+  5.00   87.2%   243   99.3%       65.47  ← CURRENT BEST (tied)
+  7.00   87.1%   243   99.1%       91.60
+ 10.00    0.0%  None    N/A       130.79  ← catastrophic failure
+```
+
+- Checkpoints saved: `stageD_scale4.0x_dQ_20260430_192447`, `stageD_scale5.0x_dQ_20260430_192447`
+- Two distinct performance regimes: 83% (scale 0.65-2.0), 87% (scale 2.5-7.0)
+- Gradient training converges to the 83% regime; scale=4-5 is NOT reachable by near-top gradient
+- Why scale=4-5 works: Q[q1]=52.4 (4× base), Q[q2]=29.1 (42% reduction) → strong q1 hold + relaxed q2
 
 **Gradient training from 82.9% always degrades (confirmed by boost_v2, boost_continue):**
 - boost_continue: 82.9% → 82.4% at ep=40 (degrading)
