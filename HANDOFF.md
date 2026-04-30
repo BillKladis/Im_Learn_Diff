@@ -1,13 +1,13 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 3): BREAKTHROUGH!** dq0=0.25 alone → 36.8% (vs 26.2% baseline, +10.6pp). Full restoration dq0=0.987 expected ~40%+. Gradient fine-tuning running (PID 2096).
+**Status (2026-04-30 session 3): MAJOR BREAKTHROUGH!** 82.9% frac<0.10 (2000-step, post_arr=93.9%)! ZeroFNet baseline was 26.2%. 3.2× improvement via learned delta_Q correction. Continuation training running (PID 11588).
 
 ---
 
 ## SESSION 3 QUICK-READ (2026-04-30)
 
-**Best result (so far):** 36.8% frac<0.10 (2000-step) from dq0=0.25 Q-restoration (no training). Full 0.987 restoration expected higher. ZeroFNet baseline: 26.2%.
+**BEST RESULT: 82.9% frac<0.10** (2000-step from [0,0,0,0]), post_arr=93.9%, arr=236 steps. Learned delta_Q=[1.089,1.023,-0.105,0.077] correction via 20 epochs of gradient training from near-top x0. ZeroFNet baseline was 26.2%. Target (>50%) EXCEEDED.
 
 **Root cause discovered (session 3):** At top state [π,0,0,0], the network outputs `gates_Q[q1]≈0.013` and `gates_Q[q1d]≈0.013` (near-zero!), giving effective Q[q1]=0.156 and Q[q1d]=0.064 (vs. base 12.0 and 5.0 — 98.7% suppressed!). The MPC is essentially ignoring q1/q1d deviations near the top, causing the pendulum to oscillate rather than hold. Fix: add `delta_Q[:,0]≈+0.987` and `delta_Q[:,1]≈+0.987` to restore full Q base weights.
 
@@ -21,13 +21,18 @@
 | exp_qboost_targeted (scalar sweep) | q=0.05→24.5% | Done (scalar hurts) |
 | exp_holdboost_nearstart (near-top starts) | — | Killed (backprop too slow, no ckpt in 110min) |
 | exp_q1restore_test dq0=0.00 | **26.2%** | Done |
-| exp_q1restore_test dq0=0.25 | **36.8%** (+10.6pp!) | Done |
-| exp_q1restore_test dq0=0.50..1.50 | — | Running (PID 15834) |
-| **exp_optinit_holdboost 0.987 0.987** | — | **Running** (PID 2096) |
+| exp_q1restore_test dq0=0.25 | **36.8%** (+10.6pp) | Done |
+| **exp_optinit_holdboost 0.987 0.987** | **82.9%** POST_ARR=93.9% | DONE ★★★ |
+| **exp_boost_continue (from 82.9% init)** | — | **Running** (PID 11588) |
 
-**Currently running:** PID 15834 (q1restore, free-running), PID 2096 (optinit_holdboost from dq=0.987,0.987)
+**Saved checkpoint:** `saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/`
+- best_frac01_2000step: 0.8286
+- best_delta_Q mean: [1.089, 1.023, -0.105, 0.077]
+- best_delta_R mean: [0.081, -0.083]
 
-**Logs:** `/tmp/q1restore_test.log`, `/tmp/optinit_holdboost.log`
+**Currently running:** PID 11588 (boost_continue, trying to push beyond 82.9%)
+
+**Logs:** `/tmp/boost_continue.log`
 
 ---
 
@@ -339,26 +344,32 @@ delta_Q[:, 3] = 0.0      # q2d already at 0.999, leave alone
 
 Why scalar boost fails: q_boost=0.05 gives +5% to q2/q2d (already at full base), causing interference that outweighs the +384% benefit to q1.
 
-### 15.5 Key results (2026-04-30 ~16:51 UTC)
+### 15.5 Key results (2026-04-30 ~17:00 UTC) — MAJOR BREAKTHROUGH
 
-**BREAKTHROUGH confirmed:** Adding delta_Q[:,0]=+0.25 (partial q1 restoration) alone gives 36.8% vs 26.2% baseline (+10.6pp). This STRONGLY validates the root cause: gates_Q[q1]≈0.013 at top is the primary bottleneck.
+**exp_optinit_holdboost.py** with init (0.987, 0.987):
+- Initial eval (fixed, no training): 26.0% (dq1=0.987 alone is harmful!)
+- After 20 epochs gradient training (near-top x0, 200-step rollout, LR=5e-3):
+  **82.9% frac<0.10**, frac<0.30=83.7%, arr=236, post_arr=93.9%
 
-**exp_q1restore_test.py results so far:**
+Training converged in 3.6 minutes (218s) and triggered early stop at EXCELLENT_HOLD=50%.
+
+**Why it works:** The gradient training learned the optimal near-top Q matrix:
+- Q[q1] = 12.0 × (0.013 + 1.089) = **13.2** (full restoration + slight boost)
+- Q[q1d] = 5.0 × (0.013 + 1.023) = **5.2** (full restoration — contrary to naive expectation)
+- Q[q2] = 50.0 × (1.001 - 0.105) = **44.8** (slight reduction — reduces over-control)
+- Q[q2d] = 40.0 × (0.987 + 0.077) = **42.6** (slight increase — more damping)
+Combined with f_extra=0 (no oscillation driver), the MPC now properly tracks q1 at all horizon steps.
+
+**Why naive fixed dq1=0.987 gave only 26.0%:** The initial fixed (0.987, 0.987) was suboptimal. Gradient training found the right balance within 20 epochs.
+
+**exp_holdboost_nearstart** killed at 110min: backprop through QP is ~0.9s/call, BUT the effective training was much faster when only one process ran (CPU freed = 3.6min/chunk instead of 60min). Key insight: avoid running competing heavy processes.
+
+**exp_q1restore_test.py results (partial, stopped after 2 evals):**
 ```
-  config    f<0.10    f<0.30    arr      post
-baseline     26.2%     42.3%    326     31.3%
- q1=0.25     36.8%     51.3%    327     44.0%  ← +10.6pp with just 25% restoration
- q1=0.50     TBD
- q1=0.987    TBD (expected ~40-45%)
- q1=1.50     TBD
+  config    f<0.10    frac<0.30    arr    post
+baseline     26.2%     42.3%      326    31.3%
+ q1=0.25     36.8%     51.3%      327    44.0%  ← partial fix already +10.6pp
 ```
-
-**exp_optinit_holdboost.py** (PID 2096): Gradient fine-tuning from init delta_Q=[0.987,0.987,0,0]. This:
-1. Immediately evals at (0.987,0.987) — should reproduce q1restore result
-2. Fine-tunes via gradient (near-top x0, 200-step rollouts, LR=5e-3)
-3. Saves best checkpoint. Log: `/tmp/optinit_holdboost.log`.
-
-**exp_holdboost_nearstart** killed at 110min: backprop through QP is ~0.9s/call, 4000 calls/chunk = 60min/chunk. Way too slow.
 
 ### 15.6 cvxpylayers gotcha
 
@@ -368,8 +379,31 @@ baseline     26.2%     42.3%    326     31.3%
 
 ### 15.7 Next steps in priority order
 
-1. **Wait for optinit_holdboost (PID 2096)**: Log at `/tmp/optinit_holdboost.log`. Initial eval should show ~40%+ from (0.987,0.987) fixed. Gradient training may push further.
-2. **Read remaining q1restore_test results** (dq0=0.50, 0.75, 0.987, 1.50 + Phase 2 combined): If a higher dq0 is better, restart optinit with that init. Log: `/tmp/q1restore_test.log`.
-3. **If optinit converges**: Check saved model in `saved_models/stageD_optinit_holdboost_*/`, run final eval.
-4. **If optinit stalls below 40%**: Try dq0=1.5 init or two-stage (fix q1 first, then fine-tune q1d).
-5. **LQR fallback option** (not yet coded): At top, compute LQR gain from lin_net A,B matrices. Activates when near_pi>0.9. Could complement the Q-restoration approach.
+1. **Monitor exp_boost_continue (PID 11588)**: Trying to push beyond 82.9% from the best checkpoint. EXCELLENT_HOLD bar set at 90%. Log: `/tmp/boost_continue.log`. Checkpoint: `saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/`.
+2. **Robustness testing**: Evaluate 82.9% model from multiple x0 starting positions (not just [0,0,0,0]). Check q1±0.5, q1d±1.0 perturbations at start.
+3. **Try different training x0 distributions**: The 82.9% model was trained with [π±0.25, ±0.5, ±0.2, ±0.5]. Try wider perturbations for more robust hold.
+4. **Full model retraining (Stage E)**: Integrate the delta_Q correction back into the lin_net weights so it doesn't require a wrapper. This would make the model "natively" good at holding.
+5. **Deploy final model**: Load lin_net from `stageD_posonly_ft_*` + apply FixedHoldBoost with delta_Q=[1.089,1.023,-0.105,0.077] (per-step mean) for production use.
+
+### 15.8 How to reproduce 82.9% result
+
+```python
+import torch, math
+import lin_net as network_module
+import mpc_controller as mpc_module
+import Simulate as train_module
+
+POSONLY = "saved_models/stageD_posonly_ft_20260430_083618/stageD_posonly_ft_20260430_083618.pth"
+BEST_CKPT = "saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519.pth"
+
+# Load best delta_Q from checkpoint
+ckpt = torch.load(BEST_CKPT, map_location='cpu', weights_only=False)
+tp = ckpt['metadata']['training_params']
+best_dQ = torch.tensor(tp['best_delta_Q'], dtype=torch.float64)  # shape (9,4)
+best_dR = torch.tensor(tp['best_delta_R'], dtype=torch.float64)  # shape (10,2)
+
+# Load lin_net (frozen) + apply FixedHoldBoost wrapper
+lin_net = network_module.LinearizationNetwork.load(POSONLY, device='cpu').double()
+# Then use HoldBoostWrapper(lin_net, thresh=0.8, dQ_init=best_dQ, dR_init=best_dR)
+# → 82.9% frac<0.10 on 2000-step eval from [0,0,0,0]
+```
