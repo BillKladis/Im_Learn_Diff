@@ -182,6 +182,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr_qmax", type=float, default=1e-3,
+                        help="LR for Q-max warmup (higher = faster convergence)")
+    parser.add_argument("--warmup_steps", type=int, default=500,
+                        help="Q-max warmup steps before alternating training begins")
     parser.add_argument("--top_frac", type=float, default=0.7,
                         help="Fraction of epochs using near-top x0 + Q-max bonus")
     parser.add_argument("--w_q_bonus", type=float, default=2.0,
@@ -233,6 +237,31 @@ def main():
         gQ_init, _, _, _, _, _ = lin_net(x_seq_test)
     print(f"  Initial gates_Q at top: {gQ_init[0].tolist()}")
     print(f"  Initial gates_Q[q1] = {gQ_init[0, 0].item():.4f}  (target={Q_MAX_TARGET})")
+
+    # Q-max warmup: push raw_Q[q1,q1d] → RAW_Q_TARGET BEFORE any CVXPY compilation.
+    # Probe showed atanh loss converges in ~200 steps at lr=1e-3.
+    # We run this warmup before the first eval so CVXPY compiles concurrently.
+    if args.warmup_steps > 0:
+        print(f"\n  Q-max warmup: {args.warmup_steps} steps at lr={args.lr_qmax} (before CVXPY eval)...")
+        warmup_opt = torch.optim.AdamW(trainable_params, lr=args.lr_qmax, weight_decay=0)
+        for ws in range(args.warmup_steps):
+            q_max_aux_step(lin_net, warmup_opt, device, w_q_bonus=1.0)
+            if (ws + 1) % 100 == 0:
+                with torch.no_grad():
+                    gQ_w, _, _, _, _, _ = lin_net(x_seq_test)
+                gq1 = gQ_w[0, 0].item()
+                raw_q1 = math.atanh(max(-0.9999, min(0.9999, (gq1 - 1.0) / GATE_RANGE_Q)))
+                print(f"    warmup step {ws+1}/{args.warmup_steps}: gates_Q[q1]={gq1:.4f}  raw_Q[q1]={raw_q1:.3f}", flush=True)
+        with torch.no_grad():
+            gQ_post, _, _, _, _, _ = lin_net(x_seq_test)
+        gq1_post = gQ_post[0, 0].item()
+        raw_post = math.atanh(max(-0.9999, min(0.9999, (gq1_post - 1.0) / GATE_RANGE_Q)))
+        print(f"  Warmup complete: gates_Q[q1] {gQ_init[0,0].item():.4f} → {gq1_post:.4f}  "
+              f"(raw_Q: {math.atanh(max(-0.9999, min(0.9999, (gQ_init[0,0].item()-1.0)/GATE_RANGE_Q))):.3f} → {raw_post:.3f})")
+        # Reset the main optimizer so warmup Adam state doesn't contaminate
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-6)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-7)
 
     # Optional scale=4x wrapper for eval
     dQ_w, dR_w = (None, None)
