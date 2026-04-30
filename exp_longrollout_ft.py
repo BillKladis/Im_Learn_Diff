@@ -54,6 +54,10 @@ Q_BASE_DIAG  = [12.0, 5.0, 50.0, 40.0]
 F_GATE_THRESH    = 0.8  # matches best soft-ramp result (26.2%)
 W_F_POS_ONLY     = 0.0  # NO: collapses fNorm through f_head weights
 W_Q_PROFILE      = 0.0  # NO: keep Q-gates free to adapt to hold
+# Stable phase: direct position tracking in last stable_phase_steps of 600-step rollout
+# With arrival at ~294 and stable_phase firing at steps 500-600, this covers hold.
+W_STABLE_PHASE   = 20.0   # direct velocity + position penalty during hold
+STABLE_PHASE_STEPS = 100  # last 100 of 600 steps = steps 500-600 (deep into hold)
 END_PHASE_STEPS  = 20
 SAVE_EVERY       = 10
 
@@ -169,7 +173,8 @@ def main():
     print(f"  Pretrained: {src_label}")
     print(f"  NUM_STEPS={NUM_STEPS}  ARRIVAL_STEP={ARRIVAL_STEP}  f_gate_thresh={F_GATE_THRESH}")
     print(f"  KEY: 600-step rollout covers hold phase (arrival ~294, training 300-600)")
-    print(f"  Q/R gates adapt from hold gradient with f_extra gated at top")
+    print(f"  w_stable_phase={W_STABLE_PHASE}  stable_phase_steps={STABLE_PHASE_STEPS}")
+    print(f"  Q/R gates adapt from stable_phase hold gradient with f_extra gated")
     print(f"  Evaluation: ZeroFNetWrapper(thresh={F_GATE_THRESH})")
     print(f"  Target: exceed 26.2% frac<0.10 (2000-step)")
     print("=" * 80)
@@ -213,6 +218,8 @@ def main():
             w_q_profile=W_Q_PROFILE,
             q_profile_state_phase=True,
             w_f_pos_only=W_F_POS_ONLY,
+            w_stable_phase=W_STABLE_PHASE,
+            stable_phase_steps=STABLE_PHASE_STEPS,
             f_gate_thresh=F_GATE_THRESH,
             early_stop_patience=SAVE_EVERY + 5,
             external_optimizer=optimizer,
