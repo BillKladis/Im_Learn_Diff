@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 5): STAGE E LAUNCHED. Q-MAX PROBE CONFIRMS FIX POSSIBLE.** Discovered critical tanh saturation fix: atanh loss converges gates_Q[q1]: 0.013 → 1.985 in 200 gradient steps. Running alternating top/bottom training + Q-max warmup. Current record: 87.2%.
+**Status (2026-04-30 session 5): STAGE E RUNNING. Q-RESTORE CONTRASTIVE LOSS ADDED.** Q-max probe showed global (not state-specific) effect. Added Q-restore at bottom states for true state-conditional behavior. Experiments compiling CVXPY. Current record: 87.2%.
 
 ---
 
@@ -28,27 +28,59 @@ MSE loss on `gates_Q` has gradient: `0.99*(1-tanh²(-3.47)) ≈ 0.004` (near zer
 - Both Stage E scripts were using `expand(HORIZON, -1)` → shape (10,4) → crash
 - Fixed to `expand(5, -1)` (STATE_HIST constant)
 
-**Running experiments (as of ~20:15):**
+**CRITICAL DISCOVERY: Q-max effect is GLOBAL, not state-specific.**
+
+Probe (qmax_probe.py) ran 2000 steps of atanh Q-max at lr=1e-3:
+- gates_Q[q1] at TOP: 0.013 → **1.985** (target achieved, converges in 200 steps ✓)
+- gates_Q[q1] at BOTTOM (q1=0): 0.111 → **1.976** (ALSO increased! global change!)
+- ALL states (q1=0-π): gates_Q[q1] ≈ 1.98 everywhere
+
+Why? The q_head.4 output layer is shared for all inputs. Gradient from top states also
+increases raw_Q[q1] for bottom-state trunk representations (they're correlated, not orthogonal).
+
+**Original gates_Q[q1] profile (posonly_ft):**
+| q1 | gates_Q[q1] | eff Q[q1] |
+|---|---|---|
+| 0.0 (bottom) | 0.111 | 1.33 |
+| 1.0 | 0.049 | 0.59 |
+| 2.0 | 0.021 | 0.25 |
+| π (top) | 0.013 | 0.16 |
+
+Pattern: monotonically decreasing! Network learned to care LESS about q1 as it approaches π.
+After Q-max: uniform 1.98 everywhere → breaks this learned pattern.
+
+**Risk: Global Q[q1]=23.8 during swing-up might disrupt f_extra-based energy pumping.**
+Threshold sweep confirmed: scale=4× (Q[q1]=76 during swing-up) → catastrophic (0%).
+Scale=1× (Q[q1]=23.8) during swing-up: unknown, might be OK or harmful.
+
+**Fix: Q-restore contrastive loss for bottom states.**
+Added `q_restore_aux_step()`: pushes raw_Q at bottom states → ORIGINAL raw_Q (atanh of orig gates_Q).
+This creates true state-conditional behavior without relying on trunk discrimination.
+
+**Running experiments (as of ~20:30):**
 
 | PID | Script | Status |
 |-----|--------|--------|
-| 25595 | exp_dual_thresh.py --sweep | Running (thresh_dQ=0-0.4 all 0%, confirming no lower threshold possible) |
-| 25964 | exp_boost_v2.py (from scale=4× ckpt) | ep=10: 87.2% (stable, gradient doesn't improve) |
-| 11208 | exp_stageE_qhead_ft.py --with_wrapper | Running, compiling CVXPY (~25 min) |
-| 15267 | exp_stageE_alternating.py --with_wrapper | Running, Q-max warmup (500 steps at lr=1e-3) then CVXPY |
+| 25595 | exp_dual_thresh.py --sweep | thresh=0.0-0.5 all 0%, confirming threshold is all-or-nothing |
+| 25964 | exp_boost_v2.py (from scale=4× ckpt) | ep=10: 87.2% (gradient doesn't improve from 4× init) |
+| 11208 | exp_stageE_qhead_ft.py --with_wrapper | Running, compiling CVXPY (tracking loss only, no Q-max) |
+| 28128 | exp_stageE_alternating.py --with_wrapper | Q-max warmup + Q-restore, compiling CVXPY |
 
-**Stage E design (exp_stageE_alternating.py):**
-1. Q-max warmup: 500 steps at lr=1e-3 → raw_Q[q1] → +3.0 before CVXPY compiles
-2. Alternating training: 70% top epochs (tracking + Q-max aux), 30% bottom (tracking only)
-3. Q-max aux step uses atanh loss → pushes raw_Q directly, bypasses saturation
-4. Unfreezes ONLY q_head (37,668 params), trunk frozen
+**Stage E design (exp_stageE_alternating.py v3):**
+1. Q-max warmup: 500 steps at lr=1e-3 → gates_Q[q1]≈1.985 everywhere (fast convergence)
+2. Q-restore warmup: bottom epochs push raw_Q back to original over time
+3. Alternating training: 70% top (tracking + Q-max aux), 30% bottom (tracking + Q-restore)
+4. w_q_bonus=2.0, w_restore=2.0 — balanced competition between top gain and bottom anchor
 
-**Prediction:** If q_head changes are state-specific (top trunk repr ≠ bottom), swing-up preserved.
-The 5-step history input ensures top and bottom states have very different trunk representations.
+**Dual-thresh sweep (COMPLETE prediction): no improvement possible via lower threshold.**
+thresh_dQ=0.0-0.5: all 0% (catastrophic). thresh=0.6-0.8 will recover to ~87.2%. thresh=0.85-0.90: slightly lower.
+This confirms scale=4× delta_Q cannot be activated smoothly — must snap on at threshold=0.80.
 
-**Dual-thresh sweep finding (confirms): scale=4× delta_Q is all-or-nothing.**
-Activating delta_Q early (thresh_dQ < 0.80) at scale=4× is catastrophic (0% for thresh=0.0-0.4).
-Cannot use lower threshold with large delta_Q — it must snap on only at top (thresh=0.80).
+**Theoretical ceiling with current wrapper approach:**
+- arr≈242 (fixed by swing-up dynamics), post≈99.1-99.3%
+- Max f01 = (2000-242)/2000 × 1.0 = 87.9%
+- To exceed 88%: need arr < 242 (faster swing-up) via bottom training
+- Stage E alternating's bottom epochs MIGHT achieve this by improving swing-up Q profile
 
 ---
 
