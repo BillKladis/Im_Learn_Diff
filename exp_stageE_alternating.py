@@ -122,16 +122,19 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
     return float((wraps < 0.10).mean()), float((wraps < 0.30).mean()), arr, post
 
 
-def q_max_aux_step(lin_net, optimizer, device, w_q_bonus):
-    """Auxiliary gradient step: push gates_Q[q1, q1d] → Q_MAX_TARGET at top states.
+GATE_RANGE_Q = 0.99   # lin_net.gate_range_q hardcoded value
+RAW_Q_TARGET = 3.0    # atanh target: gates_Q = 1 + 0.99*tanh(3.0) ≈ 1.985
 
-    This runs independently of the MPC/rollout — just a direct regression
-    on the q_head's output for top-state inputs.
+def q_max_aux_step(lin_net, optimizer, device, w_q_bonus):
+    """Auxiliary gradient step: push raw_Q[q1, q1d] → large positive at top states.
+
+    KEY: MSE on gates_Q has near-zero gradient when raw_Q≈-3.47 (tanh saturated).
+    Instead: invert gates_Q → raw_Q via atanh, then push raw_Q toward RAW_Q_TARGET.
+    Gradient of atanh near saturation is ~250× amplified — precisely what we need.
     """
     if w_q_bonus <= 0:
         return 0.0
 
-    # Sample a batch of near-top states
     batch_size = 8
     q1_samples = torch.tensor([
         math.pi + (random.random() * 2 - 1) * TOP_PERT_Q1
@@ -140,7 +143,6 @@ def q_max_aux_step(lin_net, optimizer, device, w_q_bonus):
 
     losses = []
     for q1 in q1_samples:
-        # Create a state sequence at this near-top state
         x_top = torch.stack([
             q1,
             torch.zeros(1, device=device, dtype=torch.float64).squeeze(),
@@ -148,13 +150,16 @@ def q_max_aux_step(lin_net, optimizer, device, w_q_bonus):
             torch.zeros(1, device=device, dtype=torch.float64).squeeze(),
         ])
         x_seq = x_top.unsqueeze(0).expand(STATE_HIST, -1)
-
-        # Forward through lin_net (only q_head contributes to grad since trunk frozen)
         gates_Q, _, _, _, _, _ = lin_net(x_seq)
 
-        # Push gates_Q[q1] and gates_Q[q1d] toward Q_MAX_TARGET
-        target = torch.full_like(gates_Q[:, :2], Q_MAX_TARGET)
-        loss = F.mse_loss(gates_Q[:, :2], target)
+        # Recover raw_Q via atanh inversion: gates_Q = 1 + 0.99*tanh(raw_Q)
+        # raw_Q = atanh((gates_Q - 1) / 0.99)  — clamp to avoid atanh singularity
+        inner = ((gates_Q[:, :2] - 1.0) / GATE_RANGE_Q).clamp(-0.9999, 0.9999)
+        raw_Q_q1q1d = torch.atanh(inner)
+
+        # MSE on raw_Q: gradient is large and well-conditioned even at saturation
+        target = torch.full_like(raw_Q_q1q1d, RAW_Q_TARGET)
+        loss = F.mse_loss(raw_Q_q1q1d, target)
         losses.append(loss)
 
     total_loss = w_q_bonus * torch.stack(losses).mean()
@@ -294,11 +299,13 @@ def main():
                 eval_model = BoostEvalWrapper(lin_net, dQ=dQ_w, dR=dR_w)
             f01, f03, arr, post = eval2k(eval_model, mpc, x0_eval, x_goal)
 
-            # Check gates_Q at top
+            # Check gates_Q and raw_Q at top
             with torch.no_grad():
                 gQ_now, _, _, _, _, _ = lin_net(x_seq_test)
             gQ_q1 = gQ_now[0, 0].item()
             gQ_q1d = gQ_now[0, 1].item()
+            inner_q1 = ((gQ_q1 - 1.0) / GATE_RANGE_Q)
+            raw_Q_q1 = math.atanh(max(-0.9999, min(0.9999, inner_q1)))
 
             mark = ""
             if f01 > best_f01:
@@ -310,7 +317,7 @@ def main():
             lr_now = optimizer.param_groups[0]['lr']
             print(f"  [ep={epoch:3d}]  {f01:.1%}  arr={arr}  "
                   f"post={f'{post:.1%}' if post else 'N/A'}  "
-                  f"gQ[q1]={gQ_q1:.3f}(↑target {Q_MAX_TARGET})  "
+                  f"gQ[q1]={gQ_q1:.3f}(raw={raw_Q_q1:.2f}→target {RAW_Q_TARGET})  "
                   f"gQ[q1d]={gQ_q1d:.3f}  top/bot={top_count}/{bot_count}"
                   f"  lr={lr_now:.1e}  t={time.time()-t0:.0f}s{mark}", flush=True)
 
