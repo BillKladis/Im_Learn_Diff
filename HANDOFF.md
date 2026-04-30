@@ -200,7 +200,49 @@ python exp_no_demo.py
 
 ---
 
-## 13. THE ONE THING TO REMEMBER
+## 13. HOW I WORKED (self-debrief)
+
+This is a Claude (Anthropic) session log. Some honest notes on the process so the next agent (or human) doesn't repeat the same patterns:
+
+**Approach that worked:**
+- Aggressive parallel experiments (2-3 trainings at once on a 4-core CPU). Found qf50 v2 fast, found the optimizer-reset bug fast, found the trace-revealed oscillation fast.
+- Diagnostic scripts (`trace_qf50.py`, `diag_grad.py`, `audit_history.py`, `probe_qf.py`) caught real bugs and revealed misleading metrics. **The "12/12 generality" was an artifact** until `trace_qf50.py` showed actual oscillation.
+- Hard constraints upheld throughout (no controller logic changes, all signals in outer loss).
+- Frequent commits + detailed messages — restoring context after reboots was painless.
+
+**Mistakes made:**
+- **Trusted aggregate metrics too long.** "12/12 OK" and "35/35 boundary" were claimed wins for hours before tracing revealed the underlying oscillation. The eval threshold (`total time in zone ≥ 50` over 1000 steps) was too lenient — passing-through goal repeatedly satisfies it. **Lesson: validate the evaluation metric BEFORE trusting it.**
+- **Over-engineered "robust" attempts.** SAM-approximation, distillation, sin/cos encoding, weight decay sweeps — most were one-off attempts that didn't pan out. Should have done a careful single-variable ablation before stacking 3+ losses.
+- **Killed promising runs prematurely.** qf50 v2's first run was killed at epoch 40 with `GoalDist=0.80` thinking it would diverge; it was actually converging. Re-ran it and got the 12/12 result.
+- **Didn't periodically save checkpoints.** Two system reboots killed multi-hour trainings. Should have added `save_every_N_epochs` early.
+- **Stalled when waiting for monitors.** The monitor pattern (background process emitting events) timed out at 30 min repeatedly; I'd "wait" passively rather than poll the log file directly. Better: use `Bash` with `until grep -q` for blocking waits on specific signals.
+- **Got pulled into the "gates-Q only" trap repeatedly.** Multiple attempts produced models with `fnorm ≈ 0` (no f_extra) without recognizing the problem until late. This is now flagged in section 2.
+
+**Communication patterns:**
+- Reported every milestone tersely (1-2 sentences). User noted some events were "stalls" — I was waiting for monitor events but should have been polling actively.
+- Asked the user for direction at decision points; could have been more autonomous on small calls.
+- Named all experiments with descriptive prefixes (`exp_combined_v3`, `exp_pin_warmup`, etc.) so they're self-documenting.
+
+**Tools used:**
+- `Monitor` for streaming log events (with persistent + non-persistent variants)
+- `Bash run_in_background` + `until grep -q` for blocking waits on specific log lines
+- `git commit && git push` after every meaningful change to survive reboots
+- `TodoWrite` for tracking multi-step plans
+- `Edit` for surgical file changes; `Write` only for new files
+- The `Skill` tool (e.g. `simplify`, `claude-api`) was not needed for this work
+
+**Total session footprint:**
+- ~30 experiment scripts written (most parked as dead-ends)
+- ~15 saved models (most don't truly hold)
+- 80+ commits to the working branch
+- 2 real bugs fixed (optimizer reset, restore_best rollback)
+- 1 working-ish model (`qf50 v2` — wide basin but oscillates)
+
+**For the next agent:** read sections 2 (no Q-only swing-up), 7 (velocity-asymmetry trap), and 11 (next directions) before writing any new training script. The HANDOFF is the truth; the experiments themselves are exploratory artifacts.
+
+---
+
+## 14. THE ONE THING TO REMEMBER
 
 **Track loss (energy) and gates-Q can both be satisfied without the pendulum actually holding still at upright.** Energy is symmetric (kinetic vs potential trade-off — the pendulum can have any energy at any q1 given matching q1d). Gates are state-shaping but the QP only plans 10 steps ahead.
 
