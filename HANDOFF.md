@@ -1,11 +1,85 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 6): STAGE E ALTERNATING RESTARTED (v2+v3) WITH Q-RESTORE PRE-PHASE.** Stability tests confirm warmup is rock-solid. Dual-thresh sweep confirms lower threshold hurts arr. Current record: 87.2%.
+**Status (2026-04-30 session 6 CONTINUED): SCALEGATE RUNNING (v1+v2 in CVXPY eval phase).** Current record: 87.2%. Pattern confirmed: ANY premature Q boost at non-top states destroys swing-up.
 
 ---
 
-## SESSION 6 QUICK-READ (2026-04-30, continued)
+## SESSION 6 LATEST (continued past context window)
+
+### UNIVERSAL FAILURE PATTERN — CONFIRMED ACROSS 5 EXPERIMENTS
+
+| Experiment | Why it failed | Result |
+|---|---|---|
+| dual-thresh(0.60) | wider zone → earlier boost | arr=322 (baseline 242) → 83% |
+| scale=4× (global) | Q[q1]=76 everywhere | 0% (known) |
+| Q-max warmup (v4,v5) | Q[q1]=23.8 everywhere after warmup | 0% both |
+| posgate (smooth) | α=2.27 at q1=90° (60° from top) | 0% |
+
+**IRON LAW**: Any Q[q1] boost that activates at q1=90° or earlier destroys swing-up. The swing-up energy-pumping trajectory REQUIRES low Q[q1] outside |q1-π| < ~53° (en < 0.8).
+
+The 87.2% model's hardcoded threshold (error_norm < 0.80) is near-optimal. The learned gate must MATCH or SHARPEN this threshold.
+
+### POSGATE FINAL AUTOPSY (exp_posgate.py, PID 12563 — KILLED)
+
+Supervised pre-train produced SMOOTH activation profile:
+- q1=60°: Q_adj[q1]=1.078 (activating during swing-up!)
+- q1=90°: Q_adj[q1]=2.271 (half the full boost at exactly the wrong time)
+- Only matches wrapper at q1=150°+
+
+Root cause: pre-train had only TOP (q1≈π) and BOTTOM (q1≈0) examples. The MLP interpolated smoothly between them, activating at all intermediate angles. No negative examples in the 60°-127° zone.
+
+Initial eval: 0.0% (catastrophic). Training loop started but killed — training from 0.0% is very slow and the root cause is pre-training design.
+
+### v4/v5 FINAL AUTOPSY (exp_stageE_alternating.py — BOTH KILLED)
+
+Both got 0.0% because Q-max warmup made gates_Q[q1]=1.9851 GLOBALLY (all states). The stability test (lr=1e-4) showed warmup is TOO STABLE — bottom states can't recover their original low Q[q1].
+
+Shared q_head weights = global effect. No state-conditional behavior possible.
+
+### NEW APPROACH: SCALEGATE (exp_scalegate.py)
+
+User said: "Maybe the network can learn to scale a single scalar. That thing that created the switch instead of hard coding it in."
+
+Design:
+- Single scalar α ∈ [0,1] scales the FIXED dQ direction (Q_adj = α × dQ_ref)
+- lin_net fully frozen
+- Only 57 parameters (5→8→1 with Sigmoid)
+- Supervised pre-train with BALANCED sampling:
+  - Active examples: error_norm < 0.80 (near-top, q1≈π±25°, small velocities)
+  - Inactive examples: bottom states + INTERMEDIATE states (60°-127° from top)
+  - Binary cross-entropy loss (clean, binary targets)
+
+**v1 gate profile after 1000-step pre-train (CORRECT):**
+```
+q1=  0°  cos=-1.000  en=3.142  wrapper=off  α=0.0000  ✓
+q1= 60°  cos=-0.500  en=2.094  wrapper=off  α=0.0000  ✓ (posgate was 1.078!)
+q1= 90°  cos=+0.000  en=1.571  wrapper=off  α=0.0000  ✓ (posgate was 2.271!)
+q1=120°  cos=+0.500  en=1.047  wrapper=off  α=0.0542  ✓ (nearly off)
+q1=127°  cos=+0.602  en=0.925  wrapper=off  α=0.3657  ~ (transition zone)
+q1=150°  cos=+0.866  en=0.524  wrapper=ON   α=0.9944  ✓
+q1=180°  cos=+1.000  en=0.000  wrapper=ON   α=0.9994  ✓
+```
+
+**v2 design** (exp_scalegate_v2.py): error_norm as DIRECT INPUT → 2-input gate [error_norm, cos(q1-π)].
+More trivially learnable (threshold is literally on one feature). Sharper profile:
+- q1=127° α=0.146 (vs 0.366 for v1)
+- q1=150°+ α=0.999
+
+### RUNNING EXPERIMENTS
+
+| PID | Script | Gate input | Status |
+|-----|--------|-----------|--------|
+| 6134 | exp_scalegate.py | [cos,sin,q1d,q2,q2d]→α | CVXPY COMPILING |
+| 8666 | exp_scalegate_v2.py | [error_norm,cos(q1-π)]→α | Pre-training |
+
+Logs: /tmp/scalegate_v1.log, /tmp/scalegate_v2.log
+
+**Expected result**: ~87.2% initial eval (gate matches wrapper). Training may discover better threshold. If α at 127° is too high (0.366), might still disrupt swing-up slightly — v2 may do better.
+
+---
+
+## SESSION 6 QUICK-READ (earlier portion, 2026-04-30)
 
 **STABILITY TEST RESULTS (qmax_stability.py, no CVXPY needed):**
 After 500-step Q-max warmup (gates_Q[q1]: 0.013→1.985):
@@ -26,19 +100,6 @@ After 500-step Q-max warmup (gates_Q[q1]: 0.013→1.985):
 - thresh_dQ=0.800 → 87.2% (optimal is current setting)
 - Lower thresh_dQ not viable: disrupts the swing-up trajectory
 
-**NEW INSIGHT: Q-restore pre-phase added to alternating script.**
-Problem: After warmup, ALL states have gates_Q[q1]≈1.985. The eval at top would be great, but
-arr would increase (like dual-thresh showed). Solution: run Q-restore BEFORE CVXPY compilation
-to differentiate top vs bottom BEFORE the first eval:
-
-```
-Warmup phase:  500 steps lr=1e-3 → push ALL states Q[q1] → 1.985 (20 steps to converge)
-Restore phase: 200 steps lr=1e-3 → push BOTTOM states Q[q1] → original (0.111)
-               While top stays at 1.985 (high cos_sim costs → top barely affected)
-Initial eval: Differentiated model: top≈1.985, bottom≈0.111
-Alternating:  70% top (Q-max) + 30% bottom (Q-restore) to maintain differentiation
-```
-
 **CRITICAL DISCOVERY: Q-restore pre-phase creates NO differentiation.**
 After 100 Q-restore steps at lr=1e-3:
 - top: 1.985 → 0.123 (dropped 94%!)
@@ -54,38 +115,12 @@ through the SHARED q_head weights, affecting ALL states (top included). Even tho
 at top features is smaller (cos_sim=0.175), with 100 steps at lr=1e-3, the accumulated effect
 reverts top almost as much as bottom.
 
-**NEW APPROACH: PositionGateWrapper (exp_posgate.py)**
-Instead of fighting with the q_head's shared weights, ADD a tiny learned module that has
-EXPLICIT position features as input:
-- Input: [cos(q1-π), sin(q1-π), q1d, q2, q2d]  ← cos(q1-π)=+1 at top, -1 at bottom
-- Output: Q_adj[q1, q1d, q2, q2d]
-- Only 437 parameters
-- lin_net fully frozen
-
-Phase 1 (no CVXPY, fast): Supervised pre-train to match 4× wrapper behavior:
-  - top: Q_adj → dQ_4× = [4.35, 4.09, -0.42, 0.31]  ← target
-  - bottom: Q_adj → 0
-RESULT: Converges in 500 steps! top=[4.37, 4.11, -0.42, 0.31], bot≈0, f_suppress_top=0.993
-
-Phase 2 (CVXPY, slow): End-to-end fine-tune with MPC tracking loss
-  - Goal: discover better-than-hardcoded Q profile
-
-**KEY ADVANTAGE**: cos(q1-π) is trivially distinguishable. The gate can learn any smooth
-position+velocity-dependent Q adjustment. No q_head weight sharing problem.
-
-**Running experiments (session 6 after kill/restart):**
-
-| PID | Script | Key params | Status |
-|-----|--------|--------|--------|
-| 12563 | exp_posgate.py | pre-train=500, CVXPY fine-tune | CVXPY COMPILING |
-| 15802 | exp_stageE_alternating.py | warmup+Q-max(w=5), no restore, 70/30 | WARMUP |
-| 16169 | exp_stageE_alternating.py | warmup+bottom-only tracking, no aux | WARMUP |
-
-Log files: /tmp/posgate.log, /tmp/stageE_alt_v4.log, /tmp/stageE_alt_v5.log
-
-**Dead experiments (killed for bad design):**
+**Dead experiments:**
 - v2 (restore_steps=200, lr=1e-3): killed — pre-restore reverts both top AND bottom equally
 - v3 (restore_steps=300, lr=1e-3): killed — same issue, confirmed by data
+- v4 (warmup+70%top): 0.0% initial eval — global Q-max disrupts swing-up
+- v5 (warmup+100%bottom): 0.0% initial eval — same root cause
+- posgate (437 params): 0.0% initial eval — smooth pre-train activates at q1=60°
 
 ---
 
