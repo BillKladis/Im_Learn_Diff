@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-05-01 session 12): RECORD BROKEN! 87.5% at v10g ep=20. v10h RUNNING (PID 16796). Frozen lambda/mu fix for ep=30 collapse. Key: structural pos_gate(0.85) + frozen dQ direction.**
+**Status (2026-05-01 session 12): RECORD 87.3% CONFIRMED (v10h converged to it). v10g briefly hit 87.5% (ep=20) but collapsed ep=30 due to lambda head distortion. v10h proved MLP can learn optimal gate but can't exceed 87.3% ceiling with current lin_net/dQ_ref. To beat: need faster swing-up OR better dQ_ref.**
 
 **RECORD**: thresh=0.850 natural diagonal → **87.3%** (f01), arr=242, post=99.3%
 **CONFIRMED BY**: threshold sweep, gate grid, AND scale=5.0 eval — all peak at 87.3%
@@ -304,8 +304,44 @@ V10H FIX (PID 16796, /tmp/v10h.log): FREEZE LAMBDA/MU
   dQ_ref direction stays exactly as from scale4 checkpoint (proven optimal).
   All state-conditioning learned through alpha_eff (how much to apply) not lam (which direction).
 
-  Same initial profile as v10g: init=87.2%, training expected to push toward 87.5-87.9%.
-  CVXPY compiling. Waiting for initial eval then ep=10.
+  Same initial profile as v10g: init=87.2%.
+
+V10H FINAL RESULTS (KILLED ep=70, converged):
+  init: 87.2%, arr=240, post=99.0%
+  ep=10: 87.2%  α_raw@π=0.756  α_eff@127°=0.038  (growing, no collapse ✓)
+  ep=20: 87.2%★ α_raw@π=0.819  α_eff@127°=0.045
+  ep=30: 87.3%★ α_raw@π=0.920  α_eff@127°=0.060  (matches record)
+  ep=40: 87.3%  α_raw@π=0.985  α_eff@127°=0.074  (plateau)
+  ep=50: 87.3%  α_raw@π=0.997  α_eff@127°=0.078  (saturating)
+  ep=60: 87.3%  α_raw@π=0.999  α_eff@127°=0.079
+  ep=70: 87.3%  α_raw@π=1.000  α_eff@127°=0.079  (fully converged, KILLED)
+
+  KEY FINDINGS:
+  1. MLP LEARNED THE OPTIMAL GATE through training alone (matched 87.3% static gate ✓)
+  2. Structural pos_gate(0.85) was ESSENTIAL — prevented gate expansion into swing-up zone
+  3. Frozen lambda/mu ESSENTIAL — without them, ep=30 collapse in v10g
+  4. α_raw@π → 1.0 (trunk learned to maximize alpha near π via top-start gradient)
+  5. α_eff@127° = 0.079 (constant = pos_gate(0.80) × 1.0, structural guarantee)
+  6. CEILING CONFIRMED: 87.3% is the practical max for this lin_net/dQ_ref combination
+     → arr=241, post=99.2% (0.8% hold failures = ~14 steps where wrap drifts > 0.10)
+     → To beat: need arr < 235 OR post > 99.5%, requires different controller/dQ
+
+V10 EXPERIMENT SERIES — COMPLETE SUMMARY:
+  v10c: clamp→gradient=0 (dead gate)
+  v10d: uniform alpha harmful, gradient→0
+  v10e: skip connection ✓, dead trunk ✗ (zeroed weights)
+  v10f: active trunk ✓, BUT expands gate to swing-up zone at ep=30 → 0%
+  v10g: structural pos_gate ✓, BUT lambda/mu learned badly → collapse ep=30
+  v10h: structural pos_gate + frozen lambda/mu → STABLE CONVERGENCE to 87.3% ★
+
+  STRUCTURAL INDUCTIVE BIASES NEEDED FOR SUCCESS:
+  A. structural pos_gate = sigmoid(50×(near_pi-0.85)) — prevents swing-up disruption
+  B. frozen lambda/mu (lam=ones, mu=ones) — preserves proven dQ_ref direction
+  C. vel_gate = clamp(1-k×q1d², 0, 1) — velocity-based suppression near top
+  D. near_pi skip connection (W=6, b=-5) — state-conditional alpha from init
+
+  RESULT: 87.3% matches the static gate record. MLP provides no advantage over
+  the optimal static gate for this architecture. To improve, need different foundation.
 
 V7 ep=80-110: DECLINING (82.2% at ep=110)
   Threshold drifted 0.850→0.707 over 110 epochs (too far below optimal).
