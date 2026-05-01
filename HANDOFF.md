@@ -177,23 +177,48 @@ Logs: /tmp/scalegate_v4.log, /tmp/thresh_sweep.log, /tmp/gate_grid.log
 | 0.800  | 53.1° | 87.2%   | 242 | 99.1%  | prior best |
 | 0.825  | 49.5° | 87.2%   | 242 | 99.2%  | same f01, better post |
 | 0.850  | 45.6° | **87.3%★** | 242 | 99.3%  | NEW RECORD |
-| 0.875+ | ...   | TBD     | TBD | TBD    | still running |
+| 0.875  | 41.4° | 87.2%   | 241 | 99.1%  | too narrow — drops below 0.850 |
+| 0.900  | 36.9° | 87.2%   | 242 | 99.1%  | confirmed plateau |
+| 0.925+ | ...   | TBD     | TBD | TBD    | expected ≤87.2% |
 
-PATTERN: Each 0.025 threshold increase → post +0.1%, arr stays 242, f01 +0.05%.
-CEILING: f01_max(arr=242, post=100%) = 1758/2000 = 87.9%
-NEXT RECORD target: thresh=0.875 might give 87.3-87.4% if trend holds; thresh=0.925-0.950 might hit 87.5-87.9%
+SHAPE ANALYSIS:
+- 0.750→0.800: big jump (+4.9pp), because post 93.4%→99.1% (early activation hurts hold)
+- 0.800→0.825: flat (0pp improvement), post tiny +0.1%
+- 0.825→0.850: +0.1pp, post +0.1%  ← CURRENT BEST
+- 0.850→0.875: -0.1pp, post -0.2%  ← TOO NARROW
+WHY: Natural diagonal formula is gate=(near_pi-thresh)/(1-thresh). At thresh=0.850, the integrated
+Q boost over [0.850,1.0] is HIGHER than at thresh=0.875, even though 0.875 activates later with
+steeper slope. The integrated boost determines hold quality; 0.850 wins.
 
-KEY: The dQ_ref (trained at thresh=0.80) actually generalizes BETTER at tighter thresholds!
-This is because tighter activation → boost only near π → Q boost helps hold more than it hurts approach.
+CEILING: f01_max(arr=242, post=100%) = 1758/2000 = 87.9%  [current gap: 0.6%]
+Path to 88%+: need arr≤230, which requires faster swing-up (NOT achievable via gate tuning)
 
 **TRAINING DYNAMICS (v4 ep=10 analysis):**
 - Gradient training from thresh=0.80 ALWAYS pushes threshold LOWER (toward 0.775)
-- This is WRONG direction based on threshold sweep (0.85 is better than 0.80)
+- This is WRONG direction: threshold sweep shows 0.85 > 0.80
 - Training loss ≠ f01 metric: loss rewards "more alpha = better hold" everywhere
-- Need DIFFERENT training signal that rewards TIGHTER threshold, not wider
+- Fundamental mismatch: gradient pushes toward wider gate, wider gate is actually WORSE
 
 **IMPLICATION FOR v5-v8**: Init from thresh=0.85 (w=5.0, b=-4.25) not 0.80.
-The gradient will push thresh lower, but if we start at 0.85, we might land near 0.82-0.85 range which is better than drifting to 0.775.
+Gradient will push thresh lower, but if we start at 0.85, we might stabilize near 0.82-0.85 range.
+
+**v6 DECOUPLED GATE — KEY RESULTS:**
+
+First run (wrong Q gate: w=5, b=-4.25, max_alpha_Q=0.75 at π):
+  f01=86.8%, arr=238, post=98.5%  [suboptimal Q hurt post, but arr=238 CONFIRMED fe helps!]
+
+SCIENTIFIC FINDING: Early fe suppression at thresh=0.75 INDEPENDENTLY reduces arr from 242 → 238.
+This is 4 steps faster arrival without the Q boost being widened.
+
+Root cause of low post: Q gate formula (w=5, b=-4.25) gives max alpha_Q=0.75 at π (not 1.0!).
+Correct natural diagonal for thresh=0.85: w_Q=6.667, b_Q=-5.667 → full activation at π.
+
+**v6 proper (RUNNING PID 11634): fe=(4.0, -3.0, thresh=0.75), Q=(6.667, -5.667, thresh=0.85)**
+Expected: arr=238, post≈99.3% → f01=(2000-238)×0.993/2000 = **87.5% (NEW RECORD if confirmed!)**
+
+**CRITICAL BUG FIXED**: gate grid had `torch.no_grad()` in eval2k (breaks cvxpylayers).
+HANDOFF section 15.6 explicitly says NEVER wrap rollout with no_grad. Fixed in commit 46676ef.
+Gate grid restarted (PID 10134) without the bug — confirmed "Solved/Inaccurate" is GONE.
 
 ---
 
