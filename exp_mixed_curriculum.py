@@ -88,9 +88,11 @@ STABLE = [1.5,  1.5,  1.0, 1.0]   # high Q[q1/q1d] at top   → QP stabilises
 W_STABLE_PHASE     = 3.0
 STABLE_PHASE_STEPS = N_TOP
 
-# Top-specific: direct f_extra suppression near π (gradient direct to f_head)
-# Teaches f_head to output near-zero f_extra when near the upright.
-W_F_POS_ONLY_TOP = 0.5
+# Top-specific: direct f_extra suppression near π.
+# Set to 0.0 — even 0.5 overwhelms the bottom energy-tracking gradient
+# (w_f_pos_only gradient ~500× larger than bottom tracking signal).
+# State-conditional f_extra will emerge naturally via trunk learning.
+W_F_POS_ONLY_TOP = 0.0
 
 # Top-specific: hard-zero f_extra near top AND completely decouple f_head
 # from top-episode QP gradient.
