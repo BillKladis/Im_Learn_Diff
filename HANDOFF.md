@@ -165,8 +165,8 @@ For meaningful improvement beyond 88%:
 | PID | Script | Status | Notes |
 |-----|--------|--------|-------|
 | 2470 | eval_grid_remaining.py | **DONE** — all 5/5 complete | /tmp/gate_grid_remaining.log |
-| 2471 | exp_scalegate_v7.py | RUNNING — ep=30: 87.3% ★ | plateauing, watching ep=40 |
-| 6337 | exp_scalegate_v10b.py | RUNNING — CVXPY compiling | lr=0.001, top_frac=0.5, NO PRETRAIN |
+| 2471 | exp_scalegate_v7.py | RUNNING — ep=60: 87.3% ★ | converged, passively finishing |
+| 20655 | exp_scalegate_v10d.py | RUNNING — CVXPY compiling | sigmoid fix, lr=0.01, NO PRETRAIN |
 
 V7 TRAINING PROGRESS (CONVERGED AT 87.3%):
   ep=10: 87.2% thresh=0.834 k=0.048
@@ -188,19 +188,21 @@ V10B — ALL ATTEMPTS FAILED (killed):
   the velocity-position interaction without structural help.
   Secondary cause: NUM_STEPS=200 < arr=242 → bottom-start never reaches π → no velocity signal.
 
-V10C (PID 11572) — RUNNING: MLP gate + structural velocity suppressor
-  alpha_eff = alpha_raw(MLP) × clamp(1 - k_eff × q1d², 0, 1)
-  k_eff = softplus(k_raw) ≥ 0, init ≈ 0.313 → gate off at q1d ≥ 1.79 rad/s
-  NUM_STEPS=300 (>arr=242) so bottom-start sees both swing-up AND hold phases
-  LR=0.001, top_frac=0.5, 400 epochs, NO pretraining
-  Log: /tmp/v10c.log
-
+V10C (PID 11572) — KILLED after ep=10: dead gradient bug confirmed
   INITIAL EVAL: 5.1%, arr=328, post=6.2%
-    ← Expected: alpha=0 everywhere = no hold assist = pure unaugmented lin_net
-    ← arr=328 vs v7's arr=242: lin_net alone (no hold-Q boost) swings up slower
-    ← Training loop running (CVXPY compiled). Waiting for ep=10.
-    ← Structural velocity suppressor protects swing-up: even if MLP learns alpha_raw>0
-       at all near-π states, alpha_eff=0 when q1d≥1.79 rad/s (approach velocity)
+  ep=10: 5.1% (NO CHANGE) — k=0.3133→0.3146 (only weight decay, not loss gradient)
+  ROOT CAUSE: clamp(0,1) at EXACT zero boundary kills PyTorch gradient.
+    alpha_head weight=0, bias=0 → output=0 → at lower boundary of clamp → gradient=0
+    No loss gradient flows to alpha_head → no learning → identical to initial eval.
+    k_eff drifted ONLY because of AdamW weight decay, not loss signal.
+
+V10D (PID 20655) — RUNNING: dead gradient fix
+  CHANGE: sigmoid(alpha_head) instead of clamp(0,1)
+  CHANGE: alpha_head.bias init = -3.0 → sigmoid(-3)=0.047 (non-zero gradient ≈ 0.045)
+  CHANGE: LR = 0.01 (safe: velocity suppressor blocks high-velocity catastrophe)
+  Initial gate profile: alpha_raw=0.0474 uniformly (non-zero, gradients will flow)
+  Log: /tmp/v10d.log
+  Waiting for initial eval (~25 min CVXPY compile) then ep=10.
 
 Gate grid remaining COMPLETE RESULTS (4/5 done):
   w=8.000 b=-6.400: 87.2%  arr=243  post=99.2%  [steeper at thresh=0.800 — no improvement]
