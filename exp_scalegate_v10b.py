@@ -247,7 +247,7 @@ def main():
     print(f"  Trunk: 4→{args.hidden}→{args.hidden}  |  alpha_head: 1  |  lambda_head: 4  |  mu_head: 2")
     print(f"  Total trainable params: {n_params}")
     print(f"  Apply: gQ += alpha * (lambda ⊙ dQ_ref)  [preserves per-step structure]")
-    print(f"  Init: alpha→linear ramp(0.850), lambda→ones, mu→ones  →  expect 87.3%")
+    print(f"  Init: alpha_head zeros (α=0), lambda_head ones (λ=1), pretrain_steps={args.pretrain_steps}")
     print(f"  LR={args.lr}  top_frac={args.top_frac:.0%}  epochs={args.epochs}")
     print("=" * 80)
 
