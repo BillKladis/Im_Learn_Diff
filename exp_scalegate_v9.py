@@ -1,4 +1,4 @@
-"""exp_scalegate_v9.py — Learned gate: small MLP [q1,q1d,q2,q2d] → alpha.
+"""exp_scalegate_v9.py — Learned gate: small MLP [near_pi,q1d,q2,q2d] → alpha.
 
 MOTIVATION:
   All v4-v8 used hard-coded gate formulas (linear ramp, velocity penalty).
@@ -6,8 +6,10 @@ MOTIVATION:
 
 DESIGN:
   - Gate: LearnedGate, a 2-layer MLP with ReLU hidden layers + clamp(0,1) output
-    Input: [q1, q1d, q2, q2d] (4 state dims)
+    Input: [near_pi, q1d, q2, q2d] (4 features; near_pi=(1+cos(q1-π))/2 ∈ [0,1])
     Hidden: 16 → 8 → 1 (scalar alpha)
+    near_pi is used instead of raw q1 because q1 can accumulate beyond [0,2π]
+    during rollouts (out-of-distribution for a network trained on [0,2π]).
     No sigmoid output — use clamp to avoid saturation
   - lin_net frozen; dQ_ref/dR_ref frozen (from SCALE4_CKPT)
   - 57 parameters total (comparable to v4's 2 params but more expressive)
@@ -83,7 +85,9 @@ class LearnedGate(nn.Module):
 
     def get_alpha(self, x_sequence):
         x_last = x_sequence[-1]  # (4,)
-        raw = self.gate_net(x_last.unsqueeze(0)).squeeze()
+        near_pi = (1.0 + torch.cos(x_last[0] - math.pi)) / 2.0
+        features = torch.stack([near_pi, x_last[1], x_last[2], x_last[3]])
+        raw = self.gate_net(features.unsqueeze(0)).squeeze()
         return raw.clamp(0.0, 1.0)
 
     def forward(self, x_sequence, q_base_diag=None, r_base_diag=None):
@@ -104,10 +108,9 @@ def imitation_pretrain(model, device, thresh=IMITATION_THRESH, n_steps=5000, lr=
         q1d = torch.empty(256, dtype=torch.float64, device=device).uniform_(-3, 3)
         q2  = torch.empty(256, dtype=torch.float64, device=device).uniform_(-1, 1)
         q2d = torch.empty(256, dtype=torch.float64, device=device).uniform_(-3, 3)
-        state = torch.stack([q1, q1d, q2, q2d], dim=1)  # (256, 4)
-
         near_pi = (1.0 + torch.cos(q1 - math.pi)) / 2.0
         target = ((near_pi - thresh) / (1.0 - thresh)).clamp(0.0, 1.0)
+        state = torch.stack([near_pi, q1d, q2, q2d], dim=1)  # (256, 4) — near_pi first
 
         pred = model.gate_net(state).squeeze().clamp(0.0, 1.0)
         loss = F.mse_loss(pred, target)
@@ -121,7 +124,7 @@ def imitation_pretrain(model, device, thresh=IMITATION_THRESH, n_steps=5000, lr=
         for deg in [0, 90, 127, 140, 150, 165, 180]:
             q1_val = math.radians(deg)
             np_val = (1 + math.cos(q1_val - math.pi)) / 2
-            s = torch.tensor([[q1_val, 0, 0, 0]], dtype=torch.float64, device=device)
+            s = torch.tensor([[np_val, 0.0, 0.0, 0.0]], dtype=torch.float64, device=device)
             alpha = model.gate_net(s).squeeze().clamp(0,1).item()
             tgt = max(0, min(1, (np_val - thresh) / (1 - thresh)))
             print(f"    q1={deg:3d}°  near_pi={np_val:.3f}  α={alpha:.4f}  target={tgt:.4f}", flush=True)
@@ -202,7 +205,7 @@ def main():
 
     n_params = sum(p.numel() for p in model.gate_net.parameters())
     print("=" * 80)
-    print(f"  EXP SCALEGATE v9: Learned gate MLP [q1,q1d,q2,q2d] → alpha")
+    print(f"  EXP SCALEGATE v9: Learned gate MLP [near_pi,q1d,q2,q2d] → alpha")
     print(f"  Architecture: 4 → {args.hidden} → {args.hidden//2} → 1 ({n_params} params)")
     print(f"  Imitation target: linear ramp thresh={IMITATION_THRESH}")
     print(f"  LR={args.lr}  top_frac={args.top_frac:.0%}  epochs={args.epochs}")

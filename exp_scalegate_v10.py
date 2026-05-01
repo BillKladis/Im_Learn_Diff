@@ -5,7 +5,8 @@ LAYER PEELED vs v9:
   v10: learned gate (WHEN) + learned direction (WHAT to boost) — no external dQ_ref
 
 DESIGN:
-  CombinedGate: [q1,q1d,q2,q2d] → (alpha scalar) AND (delta_q 4-dim vector)
+  CombinedGate: [near_pi,q1d,q2,q2d] → (alpha scalar) AND (delta_q 4-dim vector)
+    near_pi = (1+cos(q1-π))/2 ∈ [0,1] — angle-wrapped, always in-distribution
     alpha = clamp(linear_head(hidden), 0, 1)
     delta_q = direction_head(hidden)   [unconstrained, learned direction]
   Apply: gQ += alpha * delta_q.unsqueeze(0).expand(H-1, -1)
@@ -92,15 +93,19 @@ class CombinedGate(nn.Module):
         nn.init.zeros_(self.dQ_head.weight)
         nn.init.zeros_(self.dR_head.weight)
 
+    def _features(self, x_last):
+        near_pi = (1.0 + torch.cos(x_last[0] - math.pi)) / 2.0
+        return torch.stack([near_pi, x_last[1], x_last[2], x_last[3]])
+
     def get_alpha(self, x_sequence):
         x_last = x_sequence[-1]
-        h = self.trunk(x_last.unsqueeze(0))
+        h = self.trunk(self._features(x_last).unsqueeze(0))
         return self.alpha_head(h).squeeze().clamp(0.0, 1.0)
 
     def forward(self, x_sequence, q_base_diag=None, r_base_diag=None):
         gQ, gR, fe, qd, rd, gQf = self.lin_net(x_sequence, q_base_diag, r_base_diag)
         x_last = x_sequence[-1]
-        h = self.trunk(x_last.unsqueeze(0))
+        h = self.trunk(self._features(x_last).unsqueeze(0))
         alpha = self.alpha_head(h).squeeze().clamp(0.0, 1.0)
         dq = self.dQ_head(h).squeeze()   # (4,)
         dr = self.dR_head(h).squeeze()   # (2,)
@@ -126,10 +131,9 @@ def imitation_pretrain(model, dQ_target, dR_target, device,
         q1d = torch.empty(256, dtype=torch.float64, device=device).uniform_(-3, 3)
         q2  = torch.empty(256, dtype=torch.float64, device=device).uniform_(-1, 1)
         q2d = torch.empty(256, dtype=torch.float64, device=device).uniform_(-3, 3)
-        state = torch.stack([q1, q1d, q2, q2d], dim=1)  # (256, 4)
-
         near_pi = (1.0 + torch.cos(q1 - math.pi)) / 2.0
         alpha_target = ((near_pi - thresh) / (1.0 - thresh)).clamp(0.0, 1.0)
+        state = torch.stack([near_pi, q1d, q2, q2d], dim=1)  # (256, 4) — near_pi first
 
         h = model.trunk(state)
         alpha_pred = model.alpha_head(h).squeeze().clamp(0.0, 1.0)
@@ -155,7 +159,7 @@ def imitation_pretrain(model, dQ_target, dR_target, device,
         for deg in [0, 90, 127, 150, 180]:
             q1_val = math.radians(deg)
             np_val = (1 + math.cos(q1_val - math.pi)) / 2
-            s = torch.tensor([[q1_val, 0, 0, 0]], dtype=torch.float64, device=device)
+            s = torch.tensor([[np_val, 0.0, 0.0, 0.0]], dtype=torch.float64, device=device)
             h = model.trunk(s)
             alpha = model.alpha_head(h).squeeze().clamp(0,1).item()
             dq = model.dQ_head(h).squeeze().tolist()
