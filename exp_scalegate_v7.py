@@ -84,7 +84,7 @@ class VelocityAwareGate(nn.Module):
     def forward(self, x_sequence, q_base_diag=None, r_base_diag=None):
         gQ, gR, fe, qd, rd, gQf = self.lin_net(x_sequence, q_base_diag, r_base_diag)
         alpha = self.get_alpha(x_sequence)
-        gQ = (gQ + alpha * self.dQ_ref).clamp(min=0.01)
+        gQ = gQ + alpha * self.dQ_ref
         gR = gR + alpha * self.dR_ref
         fe = fe * (1.0 - alpha)
         return gQ, gR, fe, qd, rd, gQf

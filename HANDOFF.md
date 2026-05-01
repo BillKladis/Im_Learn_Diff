@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-04-30 session 8): NEW RECORD 87.3% (thresh=0.850).** 2 experiments active: threshold sweep (4/8 done), gate grid restarted.
+**Status (2026-05-01 session 9): RECORD 87.3% holds. Threshold sweep COMPLETE. Gate grid running (14 configs). v6 proper training (initial 87.1%).**
 
 **RECORD**: thresh=0.850 → **87.3%** (f01), arr=242, post=99.3%
 
@@ -105,18 +105,28 @@ Neither provides countergradient for maintaining arr quality.
 v4-high (KILLED before first result): init thresh=0.85 — killed to free CPU for static evals.
 v4 (KILLED after ep=10): threshold drifted 0.800→0.7753, f01=87.0% (degraded from 87.2%).
 
-**Threshold sweep results (exp_thresh_upper_sweep.py, partial, still running PID 24704):**
+**Threshold sweep results (exp_thresh_upper_sweep.py — COMPLETE):**
 | thresh | zone  | f01     | arr | post   | notes |
 |--------|-------|---------|-----|--------|-------|
 | 0.750  | 60.0° | 82.3%   | 239 | 93.4%  | wide → faster arr, terrible hold |
 | 0.800  | 53.1° | 87.2%   | 242 | 99.1%  | prior baseline |
-| 0.825  | 49.5° | 87.2%   | 242 | 99.2%  | marginally better post |
-| 0.850  | 45.6° | **87.3%★** | 242 | 99.3%  | NEW RECORD — tighter is better! |
-| 0.875+ | ...   | TBD     | TBD | TBD    | still running |
+| 0.825  | 49.5° | 87.2%   | 242 | 99.2%  | marginal improvement |
+| 0.850  | 45.6° | **87.3%★** | 242 | 99.3%  | PEAK — natural diagonal optimum |
+| 0.875  | 41.4° | 87.2%   | 241 | 99.1%  | drops off |
+| 0.900  | 36.9° | 87.2%   | 242 | 99.1%  | plateau |
+| 0.925  | 31.8° | 86.8%   | 238 | 98.5%  | cliff — earlier arr but WORSE post |
+| 0.950  | 25.8° | 83.0%   | 237 | 94.1%  | severe degradation |
 
-KEY: Each step up in threshold → post improves (+0.1%/step), arr stays at 242. Ceiling at arr=242 is 87.9% (post=100%). Still need 0.875-0.950 results.
+KEY FINDING: Clear peak at thresh=0.850. Above that, high-threshold gates concentrate activation 
+very close to goal — this gives slightly EARLIER arrival (arr 242→237) but drastically worse hold 
+(post 99.3%→94.1%). The narrow activation zone can't sustain the hold.
 
-**Gate grid (exp_gate_grid_eval.py)**: First run had "Solved/Inaccurate" CVXPY error under 4x system overload → baseline gave 0.0% (clearly wrong). Killed and RESTARTED (PID 30591) under lighter load (2 processes only).
+At thresh=0.925/0.950: the gate activates like a sharp impulse at near_pi=0.93+ which is too 
+late for gradual Q-cost buildup. Post drops because the hold isn't established gradually.
+
+**Gate grid (exp_gate_grid_eval.py, PID 10134)**: Fixed torch.no_grad() bug → restarted. Warmup 
+confirmed 87.2% ✓. Now running 14 (w,b) off-diagonal configs. First result (baseline BASELINE 
+w=5,b=-4): 87.2% ✓. Results still coming in (~12 min per config).
 
 **dQ/dR shape correction (critical fix):**
 SCALE4_CKPT stores:
@@ -149,49 +159,42 @@ For meaningful improvement beyond 88%:
 
 **Theorem**: With arr=242 and ANY post (even 100%), f01 ≤ 87.9%. To reach 90%+, need arr≤200.
 
-### RUNNING EXPERIMENTS (session 8)
+### RUNNING EXPERIMENTS (session 9)
 
 | PID | Script | Status | Notes |
 |-----|--------|--------|-------|
-| 24704 | exp_thresh_upper_sweep.py | thresh=0.850 done (4/8) | NEW RECORD 87.3% |
-| 30591 | exp_gate_grid_eval.py | RESTARTED (CVXPY compiling) | 14 (w,b) configs, load=7 |
+| 10134 | exp_gate_grid_eval.py | RUNNING — 1/14 configs done | off-diagonal (w,b) grid |
+| 11634 | exp_scalegate_v6.py | RUNNING — training started | initial=87.1%, training |
+| TBD | exp_scalegate_v7.py | LAUNCHING — thresh_sweep freed CPU | velocity-aware gate |
 
-COMPLETED/KILLED this session:
-- PID 23979 (v4 thresh=0.80): ep=10 only → thresh drifted 0.800→0.7753, f01=87.0% (DEGRADED)
-- PID 10031 (v4 thresh=0.85): killed before first result (was still compiling, freed CPU)
-- PID 16078 (gate grid v1): killed due to "Solved/Inaccurate" under 4x overload
+COMPLETED this session:
+- PID 24704 (thresh_sweep): COMPLETE — peak 87.3% at thresh=0.850, cliff at 0.925+
+- PID 10134 gate grid warmup: 87.2% ✓ (no_grad bug fix confirmed working)
 
-Planned (launch after threshold sweep + gate grid finish):
-- exp_scalegate_v5.py: 3-param (w, b, scale), init at thresh=0.85
-- exp_scalegate_v6.py: 4-param decoupled (w_fe, b_fe, w_Q, b_Q)
-- exp_scalegate_v7.py: 3-param velocity-aware (w, b, k), init thresh=0.85
-- exp_scalegate_v8.py: 6-param (w, b, scale_Q[4], scale_R[2]), init thresh=0.85
+Logs: /tmp/scalegate_v6.log, /tmp/gate_grid.log, /tmp/thresh_sweep.log
 
-Logs: /tmp/scalegate_v4.log, /tmp/thresh_sweep.log, /tmp/gate_grid.log
-
-### THRESHOLD SWEEP RESULTS (partial, as of session 8)
+### THRESHOLD SWEEP RESULTS (COMPLETE — session 9)
 
 | thresh | zone  | f01     | arr | post   | notes |
 |--------|-------|---------|-----|--------|-------|
 | 0.750  | 60.0° | 82.3%   | 239 | 93.4%  | wider → better arr, MUCH worse hold |
 | 0.800  | 53.1° | 87.2%   | 242 | 99.1%  | prior best |
 | 0.825  | 49.5° | 87.2%   | 242 | 99.2%  | same f01, better post |
-| 0.850  | 45.6° | **87.3%★** | 242 | 99.3%  | NEW RECORD |
-| 0.875  | 41.4° | 87.2%   | 241 | 99.1%  | too narrow — drops below 0.850 |
-| 0.900  | 36.9° | 87.2%   | 242 | 99.1%  | confirmed plateau |
-| 0.925+ | ...   | TBD     | TBD | TBD    | expected ≤87.2% |
+| 0.850  | 45.6° | **87.3%★** | 242 | 99.3%  | PEAK — natural diagonal optimum |
+| 0.875  | 41.4° | 87.2%   | 241 | 99.1%  | drops off |
+| 0.900  | 36.9° | 87.2%   | 242 | 99.1%  | plateau |
+| 0.925  | 31.8° | 86.8%   | 238 | 98.5%  | steep drop (arr earlier, post much worse) |
+| 0.950  | 25.8° | 83.0%   | 237 | 94.1%  | cliff — near-total collapse of hold |
 
 SHAPE ANALYSIS:
-- 0.750→0.800: big jump (+4.9pp), because post 93.4%→99.1% (early activation hurts hold)
-- 0.800→0.825: flat (0pp improvement), post tiny +0.1%
-- 0.825→0.850: +0.1pp, post +0.1%  ← CURRENT BEST
-- 0.850→0.875: -0.1pp, post -0.2%  ← TOO NARROW
-WHY: Natural diagonal formula is gate=(near_pi-thresh)/(1-thresh). At thresh=0.850, the integrated
-Q boost over [0.850,1.0] is HIGHER than at thresh=0.875, even though 0.875 activates later with
-steeper slope. The integrated boost determines hold quality; 0.850 wins.
+- 0.750→0.800: +4.9pp (post 93.4%→99.1% — early activation hurts hold)
+- 0.825→0.850: +0.1pp, post +0.1%  ← PEAK
+- 0.850→0.875: -0.1pp (begins drop)
+- 0.850→0.925: arr improves 242→238 BUT post collapses 99.3%→98.5% → net loss
+- 0.925→0.950: catastrophic — narrow zone can't maintain hold
 
 CEILING: f01_max(arr=242, post=100%) = 1758/2000 = 87.9%  [current gap: 0.6%]
-Path to 88%+: need arr≤230, which requires faster swing-up (NOT achievable via gate tuning)
+Path to 88%+: need arr≤230, NOT achievable via gate tuning alone (requires faster swing-up)
 
 **TRAINING DYNAMICS (v4 ep=10 analysis):**
 - Gradient training from thresh=0.80 ALWAYS pushes threshold LOWER (toward 0.775)
@@ -214,7 +217,10 @@ Root cause of low post: Q gate formula (w=5, b=-4.25) gives max alpha_Q=0.75 at 
 Correct natural diagonal for thresh=0.85: w_Q=6.667, b_Q=-5.667 → full activation at π.
 
 **v6 proper (RUNNING PID 11634): fe=(4.0, -3.0, thresh=0.75), Q=(6.667, -5.667, thresh=0.85)**
-Expected: arr=238, post≈99.3% → f01=(2000-238)×0.993/2000 = **87.5% (NEW RECORD if confirmed!)**
+Initial eval result: f01=87.1%, arr=240, post=98.9% — BELOW 87.3% record. Training started.
+The decoupled gate (early fe + natural Q) does NOT beat coupled 0.850 at initialization.
+Possible reason: early fe suppression (0.75-0.85 range) without Q boost creates guidance vacuum.
+Training may improve params. Watching for training epochs > 87.3%.
 
 **CRITICAL BUG FIXED**: gate grid had `torch.no_grad()` in eval2k (breaks cvxpylayers).
 HANDOFF section 15.6 explicitly says NEVER wrap rollout with no_grad. Fixed in commit 46676ef.
