@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-05-01 session 12): RECORD 87.3% stands. v10g RUNNING (PID 13801). Structural pos_gate(0.85) prevents swing-up zone expansion. v10f collapsed at ep=30 (0.0%) due to gate expanding to α@127°=0.632.**
+**Status (2026-05-01 session 12): RECORD BROKEN! 87.5% at v10g ep=20. v10h RUNNING (PID 16796). Frozen lambda/mu fix for ep=30 collapse. Key: structural pos_gate(0.85) + frozen dQ direction.**
 
 **RECORD**: thresh=0.850 natural diagonal → **87.3%** (f01), arr=242, post=99.3%
 **CONFIRMED BY**: threshold sweep, gate grid, AND scale=5.0 eval — all peak at 87.3%
@@ -286,7 +286,26 @@ V10G FIX (PID 13801, /tmp/v10g.log): STRUCTURAL POSITIONAL GUARD
   Initial gate profile: q1=127°: α_eff=0.036 ✓, q1=165°: α_eff=0.710 ✓, q1=180°: α_eff=0.731 ✓
   Structural guarantee: pos_gate prevents expansion into swing-up zone regardless of trunk growth.
 
-  Waiting for initial eval (~25 min) then ep=10.
+V10G RESULTS — RECORD BROKEN, THEN COLLAPSED ep=30:
+  Initial eval: 87.2%, arr=240, post=99.0% (structural pos_gate gives near-optimal initial profile!)
+  ep=10: 87.4%★  arr=241  post=99.3%  α_raw@π=0.803↑  α_eff@127°=0.043 ✓  NEW RECORD
+  ep=20: 87.5%★  arr=240  post=99.4%  α_raw@π=0.894↑  α_eff@127°=0.056 ✓  NEW RECORD AGAIN
+  ep=30: 0.0%    arr=238  post=N/A    α_raw@π=0.980   α_eff@127°=0.073
+    CATASTROPHIC COLLAPSE. Pendulum arrives (arr=238) but post=0.0%.
+    Root cause: lambda_head and mu_head learning from kaiming trunk's non-zero h.
+      By ep=30, lambda_head changed lam from ones → likely amplified some Q dimension badly.
+      e.g. lam[q1d] very large → over-stiff hold → oscillation → 0% hold quality.
+    Structural pos_gate still held (α_eff@127°=0.073 < 0.10) — swing-up NOT the issue.
+    The collapse is in the HOLD phase (post=0.0%), not the swing-up.
+
+V10H FIX (PID 16796, /tmp/v10h.log): FREEZE LAMBDA/MU
+  Remove lambda_head and mu_head from optimizer → lam=ones, mu=ones always (frozen).
+  Only train: trunk + alpha_head + gate_k_raw (371 params).
+  dQ_ref direction stays exactly as from scale4 checkpoint (proven optimal).
+  All state-conditioning learned through alpha_eff (how much to apply) not lam (which direction).
+
+  Same initial profile as v10g: init=87.2%, training expected to push toward 87.5-87.9%.
+  CVXPY compiling. Waiting for initial eval then ep=10.
 
 V7 ep=80-110: DECLINING (82.2% at ep=110)
   Threshold drifted 0.850→0.707 over 110 epochs (too far below optimal).
