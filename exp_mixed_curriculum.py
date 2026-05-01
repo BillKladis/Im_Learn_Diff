@@ -1,33 +1,44 @@
-"""exp_mixed_curriculum.py — Mixed curriculum: swing-up + hold, fully learned.
+"""exp_mixed_curriculum.py — Mixed curriculum v7: swing-up + hold, fully learned.
+
+v7 key insight: detach_f_extra_for_qp=True in the TOP episode.
+
+ROOT CAUSE IDENTIFIED (via gradient diagnostic):
+  Bottom-only training: fe@bot INCREASES correctly (5.46→5.51 over 9 steps).
+  Bootstrapping is working — energy tracking gradient consistently pushes f_head
+  toward better pumping.
+
+  v6 failure: even with f_gate_thresh=0.8, the pendulum falls out of the gate
+  zone after ~12 steps. The remaining ~88 top-episode steps have gate inactive
+  (near_pi < 0.8), so gradient DOES flow to f_head from these recovery states.
+  These gradients pull fe@bot DOWN (opposite direction to bottom episode).
+
+FIX (detach_f_extra_for_qp=True in top episode only):
+  Added to Simulate.py: `detach_f_extra_for_qp` parameter.
+  When True: f_extra = f_extra.detach() before entering QP.
+  The QP loss gradient CANNOT propagate back through f_extra to f_head —
+  only the Q/R paths (trunk → Q-head → Q → QP → loss) carry gradient.
+  Result:
+    → f_head receives ZERO gradient from the top episode (ALL states, not just near π)
+    → Adam momentum for f_head: built purely from bottom-episode gradients
+    → Q/trunk/encoder still trained from both episodes (complementary signals)
+    → Top episode forces Q[q1]→STABLE for hold via Q-only path
 
 PHILOSOPHY:
   No frozen modules. No hand-tuned gate formulas. No delta_Q corrections.
-  Two episodes per meta-epoch, both routed through train_linearization_network()
-  with a shared AdamW optimizer (restore_best=False, num_epochs=1 per call).
+  Mixed curriculum: N_BOTTOM_PER_TOP bottom episodes + 1 top episode per
+  meta-epoch, all through train_linearization_network() with shared AdamW.
 
   BOTTOM episode (x0=[0,0,0,0]):
     track_mode="energy" + state-conditional Q-profile (PUMP→STABLE)
-    → teaches swing-up; Q[q1] low at bottom, rising toward π via profile blend
+    → f_head learns resonant energy pumping (clean gradient, no top interference)
+    → diagnostic: bottom-only training shows fe@bot growing 5.46→5.51+ in 9 steps
 
   TOP episode (x0 near π, random perturbation):
-    track_mode="cos_q1" + same Q-profile + w_stable_phase on ALL steps
-    → reinforces Q[q1] high near π + teaches position hold
-
-  State-conditional Q-profile (q_profile_state_phase=True):
-    near_goal = (1 + cos(q1 - π)) / 2  ∈ [0,1]
-    target_Q = (1 - near_goal) × PUMP + near_goal × STABLE
-    → PUMP=[0.01,0.01,1,1]: low Q[q1] at bottom (let f_extra do the pumping)
-    → STABLE=[1.5,1.5,1,1]: high Q[q1] at top (QP stabilises strongly)
-
-  Both episodes reinforce the SAME state-conditional Q mapping, so gradients
-  are synergistic, not competing. The 140× imbalance of the previous design is
-  gone: profile loss dominates both episodes in similar magnitude.
-
-GRADIENT CHAIN (one step, both episodes, via train_linearization_network):
-  loss → next_state = RK4(x_det, u_mpc)
-       → u_mpc = QP(gQ, gR, fe)   [cvxpylayers, differentiable]
-       → gQ, gR, fe = lin_net(5-frame history)
-  States detached between steps.
+    track_mode="cos_q1" + detach_f_extra_for_qp=True + f_gate_thresh + w_stable_phase
+    → f_extra detached from QP gradient: f_head gets ZERO gradient from top episode
+    → Q[q1] gradient path intact: Q-head learns STABLE profile from hold loss
+    → f_gate_thresh=0.8: hard-zeros f_extra near top (so QP doesn't get bad FF)
+    → Q differentiation forced: hold works only via Q, not f_extra cheating
 """
 
 import math
@@ -63,32 +74,37 @@ F_EXTRA_BOUND   = 3.0
 F_KICKSTART_AMP = 1.0
 Q_BIAS_Q1       = -3.0
 
-META_EPOCHS  = 200
-N_BOTTOM     = 170    # match exp_no_demo.py proven step count
-N_TOP        = 100    # hold episode length
-LR           = 1e-3
-WEIGHT_DECAY = 1e-4
+META_EPOCHS      = 200
+N_BOTTOM_PER_TOP = 3      # bottom gradient steps per top step
+N_BOTTOM         = 170    # match exp_no_demo.py proven step count
+N_TOP            = 100    # hold episode length
+LR               = 1e-3
+WEIGHT_DECAY     = 1e-4
 
 # Q-profile (state-conditional, shared by both episodes)
 W_Q_PROFILE = 100.0
 PUMP   = [0.01, 0.01, 1.0, 1.0]   # low Q[q1/q1d] at bottom → f_extra pumps
 STABLE = [1.5,  1.5,  1.0, 1.0]   # high Q[q1/q1d] at top  → QP stabilises
 
-# Top-specific: position hold loss on ALL steps of the top episode
+# Top-specific: hold loss on ALL steps
 W_STABLE_PHASE     = 3.0
-STABLE_PHASE_STEPS = N_TOP   # fire from step 0 (num_steps - N_TOP = 0)
+STABLE_PHASE_STEPS = N_TOP   # fire from step 0
 
-# Top-specific: suppress f_extra near top — forces Q to provide stabilisation
-# (prevents feedforward trap where network uses f_extra as position controller)
-W_F_POS_ONLY  = 1.0
+# Top-specific: hard-zero f_extra near top AND completely decouple f_head
+# from top-episode gradient via detach_f_extra_for_qp.
+# f_gate_thresh: zeroes f_extra when near_pi > threshold (good for QP behavior).
+# detach_f_extra_for_qp: severs f_extra→QP gradient chain entirely, so f_head
+# gets ZERO gradient from ANY top-episode state (not just near-top).
+F_GATE_THRESH_TOP       = 0.8   # zero f_extra near top (near_pi > 0.8)
+DETACH_F_EXTRA_TOP      = True  # cut f_head gradient path entirely in top episode
 
-# Top-start perturbation ranges (random near-top initial conditions)
+# Top-start perturbation ranges
 TOP_PERT_Q1  = 0.30
 TOP_PERT_Q1D = 0.60
 TOP_PERT_Q2  = 0.20
 TOP_PERT_Q2D = 0.50
 
-EVAL_EVERY = 20
+EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
 LOG_FILE   = "/tmp/mixed_curriculum.log"
@@ -171,13 +187,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v4c{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v7{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.LinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v4c",
+            "experiment": "mixed_curriculum_v7",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -185,6 +201,9 @@ def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
             "stable": STABLE,
             "n_bottom": N_BOTTOM,
             "n_top":    N_TOP,
+            "n_bottom_per_top": N_BOTTOM_PER_TOP,
+            "f_gate_thresh_top": F_GATE_THRESH_TOP,
+            "detach_f_extra_top": DETACH_F_EXTRA_TOP,
         },
         session_name=name,
     )
@@ -204,14 +223,14 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 76)
-    out("  EXP: MIXED CURRICULUM v4c — no detach, f_pos_only top, w_q_profile=100")
+    out("  EXP: MIXED CURRICULUM v7 — detach_f_extra_for_qp in top episode")
     out(f"  device: {device}")
-    out(f"  Bottom: {N_BOTTOM} steps | energy tracking | w_q_profile={W_Q_PROFILE}")
-    out(f"  Top:    {N_TOP} steps   | cos_q1 tracking | w_stable_phase={W_STABLE_PHASE}")
+    out(f"  Bottom: {N_BOTTOM}steps × {N_BOTTOM_PER_TOP}/meta | energy | w_q_profile={W_Q_PROFILE}")
+    out(f"  Top: {N_TOP}steps × 1/meta | cos_q1 | w_stable={W_STABLE_PHASE} | f_gate={F_GATE_THRESH_TOP}")
     out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional)")
-    out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
-    out(f"  Bottom: no detach — energy tracking trains Q+f_extra; profile keeps Q@bot low")
-    out(f"  Top:    w_f_pos_only={W_F_POS_ONLY} (suppress f_extra near top → Q holds)")
+    out(f"  detach_f_extra_for_qp=True in top: f_head gets ZERO gradient from top episode")
+    out(f"  f_gate_thresh_top={F_GATE_THRESH_TOP}: also hard-zeros f_extra near π during rollout")
+    out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  EVAL_EVERY={EVAL_EVERY}")
     out("=" * 76)
 
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON, device=device)
@@ -250,29 +269,33 @@ def main():
     t0 = time.time()
 
     for meta in range(META_EPOCHS):
-        # ── Bottom episode: swing-up from x0=[0,0,0,0] ────────────────
-        # No detach: energy tracking gradient flows through Q+f_extra.
-        # The q_profile (w=100, PUMP target at q1=0) keeps Q@bot near 0.01
-        # WITHOUT needing detach — profile gradient dominates at low velocity.
-        # This matches exp_no_demo.py which learned swing-up in ~15-20 epochs.
-        loss_b, _ = train_module.train_linearization_network(
-            lin_net=model, mpc=mpc,
-            x0=x0, x_goal=x_goal, demo=demo_bottom,
-            num_steps=N_BOTTOM, num_epochs=1, lr=LR,
-            track_mode="energy",
-            w_q_profile=W_Q_PROFILE,
-            q_profile_pump=PUMP,
-            q_profile_stable=STABLE,
-            q_profile_state_phase=True,
-            external_optimizer=optimizer,
-            restore_best=False,
-        )
-        L_bot = loss_b[0] if loss_b else float("nan")
+        # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
+        # f_head gradient is 100% from these bottom episodes (since top
+        # episode uses f_gate_thresh which detaches gradient to f_head).
+        # N_BOTTOM_PER_TOP gradient steps amplify the swing-up gradient.
+        L_bot_last = float("nan")
+        for _ in range(N_BOTTOM_PER_TOP):
+            loss_b, _ = train_module.train_linearization_network(
+                lin_net=model, mpc=mpc,
+                x0=x0, x_goal=x_goal, demo=demo_bottom,
+                num_steps=N_BOTTOM, num_epochs=1, lr=LR,
+                track_mode="energy",
+                w_q_profile=W_Q_PROFILE,
+                q_profile_pump=PUMP,
+                q_profile_stable=STABLE,
+                q_profile_state_phase=True,
+                external_optimizer=optimizer,
+                restore_best=False,
+            )
+            L_bot_last = loss_b[0] if loss_b else float("nan")
 
         # ── Top episode: hold from near-top random start ───────────────
-        # w_f_pos_only suppresses f_extra near top so the stable_phase
-        # gradient MUST flow through Q (not f_extra) to learn holding.
-        # detach_gates_Q NOT used here: cos_q1+stable gradient must reach Q.
+        # detach_f_extra_for_qp=True: completely severs gradient from QP back
+        # to f_head. f_head receives ZERO gradient from this episode regardless
+        # of where the pendulum is (near top or fallen to bottom).
+        # f_gate_thresh=F_GATE_THRESH_TOP: additionally hard-zeros f_extra near π
+        # so the QP doesn't receive destabilizing feedforward near the goal.
+        # Only Q (via trunk → Q-head) gets gradient → forced Q differentiation.
         x0_top = sample_top(device)
         loss_t, _ = train_module.train_linearization_network(
             lin_net=model, mpc=mpc,
@@ -285,7 +308,8 @@ def main():
             q_profile_state_phase=True,
             w_stable_phase=W_STABLE_PHASE,
             stable_phase_steps=STABLE_PHASE_STEPS,
-            w_f_pos_only=W_F_POS_ONLY,
+            f_gate_thresh=F_GATE_THRESH_TOP,
+            detach_f_extra_for_qp=DETACH_F_EXTRA_TOP,
             external_optimizer=optimizer,
             restore_best=False,
         )
@@ -306,7 +330,7 @@ def main():
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
                 mark = " ★"
 
-        line = (f"  [{meta+1:>3}]  {L_bot:>8.3f}  {L_top:>8.3f}  "
+        line = (f"  [{meta+1:>3}]  {L_bot_last:>8.3f}  {L_top:>8.3f}  "
                 f"  {p['bot']['Q_q1']:.3f}  {p['mid']['Q_q1']:.3f}  {p['top']['Q_q1']:.3f}  "
                 f"  {p['bot']['fe_norm']:.3f}   {p['top']['fe_norm']:.3f}  "
                 f"  {f01_str}  {arr_str}  {post_str}{mark}")

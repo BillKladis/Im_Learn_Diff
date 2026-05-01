@@ -263,6 +263,13 @@ def train_linearization_network(
     # penalty, which gives it a clean state-dependent supervision signal
     # without interference from the energy-tracking gradient trap.
     detach_gates_Q_for_qp: bool = False,
+    # Detach f_extra from the gradient graph before passing to QP.
+    # When True, f_extra is treated as a constant in the QP formulation.
+    # The loss gradient cannot flow back through f_extra to f_head — only
+    # the Q/R paths reach trunk and encoder.  Use in top/hold episodes to
+    # completely decouple f_head training from the hold task; f_head is then
+    # learned exclusively by the bottom/swing-up episode.
+    detach_f_extra_for_qp: bool = False,
     # f_extra end-phase regularisation: in the last `f_end_reg_steps` steps,
     # penalise large feedforward output with w_f_end_reg * ||f_extra||².
     # Prevents the network from applying large pumping torques near the goal
@@ -619,7 +626,10 @@ def train_linearization_network(
                 max=mpc.MPC_dynamics.u_max.unsqueeze(0),
             )
 
-            extra_ctrl = f_extra.reshape(-1)
+            # detach_f_extra_for_qp: cuts gradient path from QP back to f_head.
+            # Used in hold/top episodes so f_head is trained only by swing-up.
+            f_extra_qp = f_extra.detach() if detach_f_extra_for_qp else f_extra
+            extra_ctrl = f_extra_qp.reshape(-1)
 
             # Optionally detach gates_Q so QP gradient doesn't flow back to
             # q_head (which is trained only by the profile penalty).
