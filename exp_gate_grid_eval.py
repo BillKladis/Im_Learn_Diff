@@ -121,7 +121,13 @@ def main():
         full = (1-b)/w
         print(f"    w={w:.3f} b={b:.3f}: thresh={thresh:.3f}  full={full:.3f}  [{desc}]")
 
-    print(f"\n  Evaluating (compiling CVXPY first — ~7-25 min)...")
+    print(f"\n  Warm-up eval (compiling CVXPY + first QP solve — ~7-25 min)...")
+    warmup_model = LinearRampGate(lin_net, dQ_ref, dR_ref, w=5.0, b=-4.0)
+    f01_warmup, arr_warmup, post_warmup = eval2k(warmup_model, mpc, x0_eval, x_goal)
+    print(f"  Warmup (w=5.0 b=-4.0): f01={f01_warmup:.1%}  arr={arr_warmup}  "
+          f"post={f'{post_warmup:.1%}' if post_warmup else 'N/A'}  [expected 87.2%]", flush=True)
+
+    print(f"\n  Starting grid evaluation ({len(configs)} configs)...")
     t0 = time.time()
 
     results = {}
