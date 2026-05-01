@@ -50,7 +50,7 @@ class LinearRampGate(torch.nn.Module):
         q1 = x_sequence[-1, 0]
         near_pi = (1.0 + torch.cos(q1 - math.pi)) / 2.0
         alpha = (self.w * near_pi + self.b).clamp(0.0, 1.0)
-        gQ = (gQ + alpha * self.dQ_ref).clamp(min=0.01)
+        gQ = gQ + alpha * self.dQ_ref
         gR = gR + alpha * self.dR_ref
         fe = fe * (1.0 - alpha)
         return gQ, gR, fe, qd, rd, gQf
