@@ -1,27 +1,25 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v7: swing-up + hold, fully learned.
+"""exp_mixed_curriculum.py — Mixed curriculum v8: swing-up + hold, fully learned.
 
-v7 key insight: detach_f_extra_for_qp=True in the TOP episode.
+GRADIENT SEPARATION ARCHITECTURE (v8):
+  Bottom episode → f_head only (detach_gates_Q_for_qp=True, no w_q_profile)
+  Top episode    → q_head only (detach_f_extra_for_qp=True) + direct f_extra
+                   suppression via w_f_pos_only (teaches f_head to zero near-π)
 
-ROOT CAUSE IDENTIFIED (via gradient diagnostic):
-  Bottom-only training: fe@bot INCREASES correctly (5.46→5.51 over 9 steps).
-  Bootstrapping is working — energy tracking gradient consistently pushes f_head
-  toward better pumping.
+v7 failure post-mortem:
+  Epoch 6: pendulum first swings up to near-π in bottom episode.
+  w_q_profile=100 fires with target=STABLE=[1.5,...] → massive Q gradient.
+  Q gates jump from 0.015 → 0.077 in one step → Q-dominated MPC → chaotic L_bot.
 
-  v6 failure: even with f_gate_thresh=0.8, the pendulum falls out of the gate
-  zone after ~12 steps. The remaining ~88 top-episode steps have gate inactive
-  (near_pi < 0.8), so gradient DOES flow to f_head from these recovery states.
-  These gradients pull fe@bot DOWN (opposite direction to bottom episode).
+v8 root fix — remove ALL Q training from bottom episode:
+  detach_gates_Q_for_qp=True: q_head gets ZERO gradient from bottom episode.
+  No w_q_profile in bottom: no STABLE target triggered during swing-up.
+  → Q gates ONLY trained by top episode where near-π is the primary state.
 
-FIX (detach_f_extra_for_qp=True in top episode only):
-  Added to Simulate.py: `detach_f_extra_for_qp` parameter.
-  When True: f_extra = f_extra.detach() before entering QP.
-  The QP loss gradient CANNOT propagate back through f_extra to f_head —
-  only the Q/R paths (trunk → Q-head → Q → QP → loss) carry gradient.
-  Result:
-    → f_head receives ZERO gradient from the top episode (ALL states, not just near π)
-    → Adam momentum for f_head: built purely from bottom-episode gradients
-    → Q/trunk/encoder still trained from both episodes (complementary signals)
-    → Top episode forces Q[q1]→STABLE for hold via Q-only path
+v8 also adds direct f_extra suppression in top episode:
+  w_f_pos_only=0.5: penalises f_extra×near_pi → teaches f_head to zero f_extra
+  at near-π states. Uses original (not detached) f_extra → DIRECT gradient to
+  f_head. Combined with bottom episode driving f_extra up at near-zero states,
+  f_head learns: large f_extra at bottom, near-zero at top.
 
 PHILOSOPHY:
   No frozen modules. No hand-tuned gate formulas. No delta_Q corrections.
@@ -29,16 +27,16 @@ PHILOSOPHY:
   meta-epoch, all through train_linearization_network() with shared AdamW.
 
   BOTTOM episode (x0=[0,0,0,0]):
-    track_mode="energy" + state-conditional Q-profile (PUMP→STABLE)
-    → f_head learns resonant energy pumping (clean gradient, no top interference)
-    → diagnostic: bottom-only training shows fe@bot growing 5.46→5.51+ in 9 steps
+    track_mode="energy" + detach_gates_Q_for_qp=True
+    → f_head learns resonant energy pumping via QP gradient
+    → q_head receives ZERO gradient (Q stays near init until top teaches it)
 
   TOP episode (x0 near π, random perturbation):
-    track_mode="cos_q1" + detach_f_extra_for_qp=True + f_gate_thresh + w_stable_phase
-    → f_extra detached from QP gradient: f_head gets ZERO gradient from top episode
-    → Q[q1] gradient path intact: Q-head learns STABLE profile from hold loss
-    → f_gate_thresh=0.8: hard-zeros f_extra near top (so QP doesn't get bad FF)
-    → Q differentiation forced: hold works only via Q, not f_extra cheating
+    track_mode="cos_q1" + w_q_profile=100 + detach_f_extra_for_qp=True
+    + w_f_pos_only=0.5 + f_gate_thresh=0.8 + w_stable_phase=3.0
+    → Q-head trained exclusively from top (hold via Q, stable profile)
+    → f_head: zero gradient from QP (detached), small gradient from w_f_pos_only
+    → f_gate_thresh: hard-zeros f_extra for QP near π (clean feedforward)
 """
 
 import math
@@ -76,27 +74,28 @@ Q_BIAS_Q1       = -3.0
 
 META_EPOCHS      = 200
 N_BOTTOM_PER_TOP = 3      # bottom gradient steps per top step
-N_BOTTOM         = 170    # match exp_no_demo.py proven step count
+N_BOTTOM         = 170    # swing-up episode length
 N_TOP            = 100    # hold episode length
 LR               = 1e-3
 WEIGHT_DECAY     = 1e-4
 
-# Q-profile (state-conditional, shared by both episodes)
+# Q-profile: ONLY used in top episode (no Q learning in bottom)
 W_Q_PROFILE = 100.0
 PUMP   = [0.01, 0.01, 1.0, 1.0]   # low Q[q1/q1d] at bottom → f_extra pumps
-STABLE = [1.5,  1.5,  1.0, 1.0]   # high Q[q1/q1d] at top  → QP stabilises
+STABLE = [1.5,  1.5,  1.0, 1.0]   # high Q[q1/q1d] at top   → QP stabilises
 
-# Top-specific: hold loss on ALL steps
+# Top-specific: hold loss applied on ALL steps of top episode
 W_STABLE_PHASE     = 3.0
-STABLE_PHASE_STEPS = N_TOP   # fire from step 0
+STABLE_PHASE_STEPS = N_TOP
+
+# Top-specific: direct f_extra suppression near π (gradient direct to f_head)
+# Teaches f_head to output near-zero f_extra when near the upright.
+W_F_POS_ONLY_TOP = 0.5
 
 # Top-specific: hard-zero f_extra near top AND completely decouple f_head
-# from top-episode gradient via detach_f_extra_for_qp.
-# f_gate_thresh: zeroes f_extra when near_pi > threshold (good for QP behavior).
-# detach_f_extra_for_qp: severs f_extra→QP gradient chain entirely, so f_head
-# gets ZERO gradient from ANY top-episode state (not just near-top).
-F_GATE_THRESH_TOP       = 0.8   # zero f_extra near top (near_pi > 0.8)
-DETACH_F_EXTRA_TOP      = True  # cut f_head gradient path entirely in top episode
+# from top-episode QP gradient.
+F_GATE_THRESH_TOP  = 0.8
+DETACH_F_EXTRA_TOP = True   # f_head gets ZERO QP gradient from top episode
 
 # Top-start perturbation ranges
 TOP_PERT_Q1  = 0.30
@@ -187,13 +186,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v7{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v8{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.LinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v7",
+            "experiment": "mixed_curriculum_v8",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -202,8 +201,9 @@ def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
             "n_bottom": N_BOTTOM,
             "n_top":    N_TOP,
             "n_bottom_per_top": N_BOTTOM_PER_TOP,
-            "f_gate_thresh_top": F_GATE_THRESH_TOP,
+            "f_gate_thresh_top":  F_GATE_THRESH_TOP,
             "detach_f_extra_top": DETACH_F_EXTRA_TOP,
+            "w_f_pos_only_top":   W_F_POS_ONLY_TOP,
         },
         session_name=name,
     )
@@ -222,16 +222,18 @@ def main():
     x0     = torch.tensor(X0,     dtype=torch.float64, device=device)
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
-    out("=" * 76)
-    out("  EXP: MIXED CURRICULUM v7 — detach_f_extra_for_qp in top episode")
+    out("=" * 80)
+    out("  EXP: MIXED CURRICULUM v8 — clean gradient separation")
     out(f"  device: {device}")
-    out(f"  Bottom: {N_BOTTOM}steps × {N_BOTTOM_PER_TOP}/meta | energy | w_q_profile={W_Q_PROFILE}")
-    out(f"  Top: {N_TOP}steps × 1/meta | cos_q1 | w_stable={W_STABLE_PHASE} | f_gate={F_GATE_THRESH_TOP}")
-    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional)")
-    out(f"  detach_f_extra_for_qp=True in top: f_head gets ZERO gradient from top episode")
-    out(f"  f_gate_thresh_top={F_GATE_THRESH_TOP}: also hard-zeros f_extra near π during rollout")
-    out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  EVAL_EVERY={EVAL_EVERY}")
-    out("=" * 76)
+    out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
+        f"detach_Q=True, no w_q_profile")
+    out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
+        f"detach_f=True | w_f_pos_only={W_F_POS_ONLY_TOP}")
+    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (top episode only)")
+    out(f"  f_head trains from: bottom (QP path) + top (direct penalty w_f_pos_only)")
+    out(f"  q_head trains from: top only (Q-profile + w_stable_phase)")
+    out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
+    out("=" * 80)
 
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON, device=device)
     mpc.dt          = torch.tensor(DT, dtype=torch.float64, device=device)
@@ -270,9 +272,10 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # f_head gradient is 100% from these bottom episodes (since top
-        # episode uses f_gate_thresh which detaches gradient to f_head).
-        # N_BOTTOM_PER_TOP gradient steps amplify the swing-up gradient.
+        # ONLY f_head trains here:
+        #   detach_gates_Q_for_qp=True → q_head gets ZERO gradient from bottom.
+        #   No w_q_profile → no STABLE target triggered when pendulum reaches π.
+        # This prevents Q explosion when swing-up first succeeds (v7 root cause).
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
             loss_b, _ = train_module.train_linearization_network(
@@ -280,22 +283,16 @@ def main():
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
-                w_q_profile=W_Q_PROFILE,
-                q_profile_pump=PUMP,
-                q_profile_stable=STABLE,
-                q_profile_state_phase=True,
+                detach_gates_Q_for_qp=True,
                 external_optimizer=optimizer,
                 restore_best=False,
             )
             L_bot_last = loss_b[0] if loss_b else float("nan")
 
         # ── Top episode: hold from near-top random start ───────────────
-        # detach_f_extra_for_qp=True: completely severs gradient from QP back
-        # to f_head. f_head receives ZERO gradient from this episode regardless
-        # of where the pendulum is (near top or fallen to bottom).
-        # f_gate_thresh=F_GATE_THRESH_TOP: additionally hard-zeros f_extra near π
-        # so the QP doesn't receive destabilizing feedforward near the goal.
-        # Only Q (via trunk → Q-head) gets gradient → forced Q differentiation.
+        # ONLY q_head trains via QP gradient (detach_f_extra_for_qp=True).
+        # f_head gets a SMALL direct gradient from w_f_pos_only to suppress
+        # f_extra near π — teaches state-conditional f_extra without QP coupling.
         x0_top = sample_top(device)
         loss_t, _ = train_module.train_linearization_network(
             lin_net=model, mpc=mpc,
@@ -308,6 +305,7 @@ def main():
             q_profile_state_phase=True,
             w_stable_phase=W_STABLE_PHASE,
             stable_phase_steps=STABLE_PHASE_STEPS,
+            w_f_pos_only=W_F_POS_ONLY_TOP,
             f_gate_thresh=F_GATE_THRESH_TOP,
             detach_f_extra_for_qp=DETACH_F_EXTRA_TOP,
             external_optimizer=optimizer,
