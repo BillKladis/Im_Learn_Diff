@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-05-01 session 12): RECORD 87.3% stands. v10f RUNNING (PID 9751). ep=10: 83.0%★, α@π=0.769↑ — trunk active, gradient flowing. Waiting for ep=20+ to see gate sharpening.**
+**Status (2026-05-01 session 12): RECORD 87.3% stands. v10g RUNNING (PID 13801). Structural pos_gate(0.85) prevents swing-up zone expansion. v10f collapsed at ep=30 (0.0%) due to gate expanding to α@127°=0.632.**
 
 **RECORD**: thresh=0.850 natural diagonal → **87.3%** (f01), arr=242, post=99.3%
 **CONFIRMED BY**: threshold sweep, gate grid, AND scale=5.0 eval — all peak at 87.3%
@@ -252,16 +252,41 @@ V10E (PID 25881) — RUNNING: skip connection + structural vel suppressor
     alpha_head.W_trunk still zero-init (initial alpha = skip only, same profile).
     Log: /tmp/v10f.log  PID: 9751
 
-V10F RESULTS SO FAR:
+V10F RESULTS — CATASTROPHIC COLLAPSE AT ep=30:
   Initial eval: 82.7%, arr=239, post=93.9% — same as v10e (correct, alpha_head.W_trunk=0 at init)
-  ep=10: 83.0%★  arr=328  post=99.2%  k=0.3001  α@π=0.7684↑  α@127°=0.4970↑  top/bot=9/1
-    KEY: α@π INCREASED (0.731→0.769) — unlike v10e where it DECREASED. TRUNK IS ACTIVE. ★
-    Concern: arr=328 (vs 239 baseline) — gate opening at α@127°=0.497 slows swing-up.
-             Trunk improved hold (post 93.9%→99.2%) but also opened at intermediate angles.
-    Net: +0.3% f01 despite higher arr. Training signal from 30% bottom-start should eventually
-         teach trunk to close gate at 127° (different phase signature than hold phase).
-  Waiting for ep=20+: critical question is whether arr decreases as trunk learns to
-    distinguish swing-up approach at 127° (high q1d, q2 swinging) from hold phase at 127°.
+  ep=10: 83.0%★  arr=328  post=99.2%  k=0.3001  α@π=0.769↑  α@127°=0.497↑  top/bot=9/1
+    KEY: α@π INCREASED (0.731→0.769) — unlike v10e where it DECREASED. TRUNK IS ACTIVE ★
+    Concern: arr=328 (vs 239 baseline) — gate also widening at intermediate angles.
+  ep=20: 83.2%★  arr=324  post=99.2%  k=0.2934  α@π=0.816↑  α@127°=0.561↑
+    Both α@π and α@127° still rising. arr improving slightly (328→324) but far from 239.
+  ep=30: 0.0%    arr=None  post=N/A   k=0.3004  α@π=0.861   α@127°=0.632
+    CATASTROPHIC COLLAPSE. α@127°=0.632 → fe suppressed 63% at 127° → pendulum can't reach top.
+    KILLED.
+
+  ROOT CAUSE: Training gradient (70% top-start) pushes alpha up everywhere. 30% bottom-start
+    gradient not strong enough to prevent gate expansion. Velocity suppressor (k_eff=0.31)
+    fails at q1=127° slow approaches (q1d < 1.79 during gradual multi-swing buildup).
+    Same iron-law violation as all predecessors, just delayed to ep=30 by bootstrapping.
+
+V10G FIX (PID 13801, /tmp/v10g.log): STRUCTURAL POSITIONAL GUARD
+  Add non-learnable pos_gate = sigmoid(50 × (near_pi - 0.85)):
+    near_pi=0.80 (127°): pos_gate=0.079 → α_eff ≈ 0.036×alpha_raw ≈ 0
+    near_pi=0.85 (148°): pos_gate=0.5   → α_eff ≈ 0.5×alpha_raw
+    near_pi=0.90 (155°): pos_gate=0.924 → α_eff ≈ full
+    near_pi=1.00 (180°): pos_gate=1.0   → α_eff = alpha_raw
+
+  KEY property: d(alpha_eff)/d(alpha_raw) = pos_gate → MLP gradient at near_pi<0.80 is
+    ~zero → trunk CANNOT learn to fire at swing-up angles, regardless of training.
+
+  MLP still LEARNS within the 0.85–1.0 zone:
+    - Push α_raw@π from 0.731 → 1.0+ (trunk positive contribution) → beats 87.3% threshold
+    - Profile shape within 0.85–1.0 (possibly better than static linear ramp)
+    - Velocity-aware gating within the protected zone
+
+  Initial gate profile: q1=127°: α_eff=0.036 ✓, q1=165°: α_eff=0.710 ✓, q1=180°: α_eff=0.731 ✓
+  Structural guarantee: pos_gate prevents expansion into swing-up zone regardless of trunk growth.
+
+  Waiting for initial eval (~25 min) then ep=10.
 
 V7 ep=80-110: DECLINING (82.2% at ep=110)
   Threshold drifted 0.850→0.707 over 110 epochs (too far below optimal).
