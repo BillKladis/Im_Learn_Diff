@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-05-01 session 11): RECORD 87.3% stands. Gate grid remaining in progress. v7 training. v9/v10 input bug FIXED and relaunched.**
+**Status (2026-05-01 session 12): RECORD 87.3% stands. v10f RUNNING (PID 9751). ep=10: 83.0%★, α@π=0.769↑ — trunk active, gradient flowing. Waiting for ep=20+ to see gate sharpening.**
 
 **RECORD**: thresh=0.850 natural diagonal → **87.3%** (f01), arr=242, post=99.3%
 **CONFIRMED BY**: threshold sweep, gate grid, AND scale=5.0 eval — all peak at 87.3%
@@ -233,10 +233,35 @@ V10E (PID 25881) — RUNNING: skip connection + structural vel suppressor
     Threshold IS sharpening (bias -5.0→-5.06 → 50% point 0.833→0.843) ✓
     But threshold sharpening without W growth = gate shrinks, f01 stays flat.
 
-  RESTART (top_frac=0.7, PID 3534): Net W gradient = +0.082 (positive!) → α@π grows.
-    With 70/30: d(logit@π)/dt = 0.7×0.202 - 0.3×0.247×0.8 ≈ +0.082 per epoch → growth
-    Threshold: roughly maintained (competing effects nearly balance).
-  Log: /tmp/v10e_07.log
+  RESTART (top_frac=0.7, PID 3534): confirmed W growing (α@π 0.731→0.736) BUT:
+    ep=10: 82.8%★ α@π=0.736 α@127°=0.457
+    ep=20: 82.8%  α@π=0.720 α@127°=0.439 (both declining again)
+    ep=30: 82.9%★ α@π=0.707 α@127°=0.425 (threshold 0.833→0.851 ✓ but α@π declining)
+  
+  SECOND ROOT CAUSE: DEAD TRUNK.
+    trunk weights zeroed → trunk output = 0 always.
+    d(loss)/d(alpha_head.W_trunk) = grad × h = grad × 0 = 0 → alpha_head.W_trunk never grows.
+    d(loss)/d(trunk_weights) = ... × alpha_head.W_trunk = 0 → trunk never gets gradients.
+    Only W_skip and bias learn → converge to W≈5.9, threshold≈0.851, α@π≈0.71 → 83%.
+    Sigmoid with W=5.9 is too gradual: fires 50% at threshold, only 71% at π.
+    For 87.3%, need W>>6 (near step function) or trunk to sharpen gate.
+  
+  V10F FIX: active trunk (kaiming default init, NOT zeroed).
+    With h≠0: alpha_head.W_trunk gets gradient from epoch 1 → grows → trunk learns.
+    Trunk can then learn to sharpen gate beyond what W_skip alone provides.
+    alpha_head.W_trunk still zero-init (initial alpha = skip only, same profile).
+    Log: /tmp/v10f.log  PID: 9751
+
+V10F RESULTS SO FAR:
+  Initial eval: 82.7%, arr=239, post=93.9% — same as v10e (correct, alpha_head.W_trunk=0 at init)
+  ep=10: 83.0%★  arr=328  post=99.2%  k=0.3001  α@π=0.7684↑  α@127°=0.4970↑  top/bot=9/1
+    KEY: α@π INCREASED (0.731→0.769) — unlike v10e where it DECREASED. TRUNK IS ACTIVE. ★
+    Concern: arr=328 (vs 239 baseline) — gate opening at α@127°=0.497 slows swing-up.
+             Trunk improved hold (post 93.9%→99.2%) but also opened at intermediate angles.
+    Net: +0.3% f01 despite higher arr. Training signal from 30% bottom-start should eventually
+         teach trunk to close gate at 127° (different phase signature than hold phase).
+  Waiting for ep=20+: critical question is whether arr decreases as trunk learns to
+    distinguish swing-up approach at 127° (high q1d, q2 swinging) from hold phase at 127°.
 
 V7 ep=80-110: DECLINING (82.2% at ep=110)
   Threshold drifted 0.850→0.707 over 110 epochs (too far below optimal).
