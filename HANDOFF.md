@@ -168,21 +168,39 @@ For meaningful improvement beyond 88%:
 | 2471 | exp_scalegate_v7.py | RUNNING — ep=30: 87.3% ★ | plateauing, watching ep=40 |
 | 6337 | exp_scalegate_v10b.py | RUNNING — CVXPY compiling | lr=0.001, top_frac=0.5, NO PRETRAIN |
 
-V7 TRAINING PROGRESS:
+V7 TRAINING PROGRESS (CONVERGED AT 87.3%):
   ep=10: 87.2% thresh=0.834 k=0.048
-  ep=20: 87.3% thresh=0.813 k=0.044  ← NEW RECORD TIE
-  ep=30: 87.3% thresh=0.795 k=0.042  ← holding, arr improved 242→241
-  Insight: thresh drifts down but k×q1d² compensates → at q1d=2: eff_thresh=0.795+0.042×4=0.963
-  Velocity-aware gate discovers: lower static threshold + velocity suppression ≡ smarter gating
+  ep=20: 87.3% thresh=0.813 k=0.044  ← RECORD TIE
+  ep=30: 87.3% thresh=0.795 k=0.042
+  ep=40: 87.3% thresh=0.782 k=0.039  ← arr improved 242→241
+  ep=50: 87.3% thresh=0.771 k=0.037  ← CONFIRMED PLATEAU
+  
+  v7 KEY INSIGHT: thresh drifts DOWN but k compensates.
+  At ep=50: q1d=2 effective thresh = 0.771+0.037×4=0.919 → gate barely fires during approach.
+  This IS a smarter gate: lower static threshold (earlier mild activation) + velocity suppression.
+  CONCLUSION: v7 has converged. 5 consecutive evals at 87.3%. Will let finish to ep=200 passively.
 
-V10B FIRST ATTEMPT (lr=0.01, top_frac=0.7) — KILLED ep=10: 0.0%
-  Same failure mode as v9 pretrained. Too aggressive LR (0.01), too top-heavy (70%).
-  With 9/10 top-starts, gradient pushed alpha up everywhere → gate fired during swing-up → 0%
+V10B — ALL ATTEMPTS FAILED (killed):
+  Attempt 1 (lr=0.01, top_frac=0.7): 0.0% at ep=10
+  Attempt 2 (lr=0.001, top_frac=0.5): 0.0% at ep=10
+  ROOT CAUSE: MLP without velocity inductive bias. Top-start gradient pushes alpha up for
+  ALL near-π states (including high-velocity approach during swing-up). MLP can't learn
+  the velocity-position interaction without structural help.
+  Secondary cause: NUM_STEPS=200 < arr=242 → bottom-start never reaches π → no velocity signal.
 
-V10B SECOND ATTEMPT (lr=0.001, top_frac=0.5, PID 6337) — RUNNING
-  50/50 top/bottom provides better curriculum balance.
-  Lower LR prevents catastrophic gate expansion.
-  Log: /tmp/v10b_lr1e3.log
+V10C (PID 11572) — RUNNING: MLP gate + structural velocity suppressor
+  alpha_eff = alpha_raw(MLP) × clamp(1 - k_eff × q1d², 0, 1)
+  k_eff = softplus(k_raw) ≥ 0, init ≈ 0.313 → gate off at q1d ≥ 1.79 rad/s
+  NUM_STEPS=300 (>arr=242) so bottom-start sees both swing-up AND hold phases
+  LR=0.001, top_frac=0.5, 400 epochs, NO pretraining
+  Log: /tmp/v10c.log
+
+  INITIAL EVAL: 5.1%, arr=328, post=6.2%
+    ← Expected: alpha=0 everywhere = no hold assist = pure unaugmented lin_net
+    ← arr=328 vs v7's arr=242: lin_net alone (no hold-Q boost) swings up slower
+    ← Training loop running (CVXPY compiled). Waiting for ep=10.
+    ← Structural velocity suppressor protects swing-up: even if MLP learns alpha_raw>0
+       at all near-π states, alpha_eff=0 when q1d≥1.79 rad/s (approach velocity)
 
 Gate grid remaining COMPLETE RESULTS (4/5 done):
   w=8.000 b=-6.400: 87.2%  arr=243  post=99.2%  [steeper at thresh=0.800 — no improvement]
