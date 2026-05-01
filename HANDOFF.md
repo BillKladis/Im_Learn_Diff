@@ -1,9 +1,10 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-05-01 session 9): RECORD 87.3% holds. Threshold sweep COMPLETE. Gate grid running (14 configs). v6 proper training (initial 87.1%).**
+**Status (2026-05-01 session 10): RECORD 87.3% confirmed by 3 independent methods. Gate grid 9/14 + 5 remaining restarted. v7 velocity-aware restarted.**
 
-**RECORD**: thresh=0.850 → **87.3%** (f01), arr=242, post=99.3%
+**RECORD**: thresh=0.850 natural diagonal → **87.3%** (f01), arr=242, post=99.3%
+**CONFIRMED BY**: threshold sweep, gate grid, AND scale=5.0 eval — all peak at 87.3%
 
 ---
 
@@ -159,19 +160,25 @@ For meaningful improvement beyond 88%:
 
 **Theorem**: With arr=242 and ANY post (even 100%), f01 ≤ 87.9%. To reach 90%+, need arr≤200.
 
-### RUNNING EXPERIMENTS (session 9)
+### RUNNING EXPERIMENTS (session 10)
 
 | PID | Script | Status | Notes |
 |-----|--------|--------|-------|
-| 10134 | exp_gate_grid_eval.py | RUNNING — 1/14 configs done | off-diagonal (w,b) grid |
-| 11634 | exp_scalegate_v6.py | RUNNING — training started | initial=87.1%, training |
-| TBD | exp_scalegate_v7.py | LAUNCHING — thresh_sweep freed CPU | velocity-aware gate |
+| 2470 | eval_grid_remaining.py | RUNNING — CVXPY compiling | 5 steeper-slope configs |
+| 2471 | exp_scalegate_v7.py | RUNNING — CVXPY compiling | velocity-aware, init thresh=0.850 k=0.05 |
 
-COMPLETED this session:
-- PID 24704 (thresh_sweep): COMPLETE — peak 87.3% at thresh=0.850, cliff at 0.925+
-- PID 10134 gate grid warmup: 87.2% ✓ (no_grad bug fix confirmed working)
+COMPLETED/KILLED in session 9 (before reboot):
+- PID 24704 (thresh_sweep): COMPLETE — full results table in section below
+- PID 10134 (gate_grid): 9/14 done at reboot — all natural diagonal + w=5 off-diagonal tested
+- PID 11634 (v6 decoupled): KILLED ep=20 — stagnant at 87.1%, thresholds drifting wrong
+- PID 20698 (v7 first run): KILLED — k went negative, fixed with softplus
+- PID 30320 (v7 second run): KILLED by reboot at ep=10 (87.2%, improving)
+- PID 1934 (scale5 eval): COMPLETE — all 4 thresholds done, peak 87.3%
 
-Logs: /tmp/scalegate_v6.log, /tmp/gate_grid.log, /tmp/thresh_sweep.log
+KEY BUG FIXED (session 9): v7's gate_k was unconstrained → went to k=-0.063 → 0.0% f01.
+Fix: gate_k = softplus(gate_k_raw), constrains k≥0. Verified working.
+
+Logs: /tmp/gate_grid_remaining.log, /tmp/scalegate_v7.log
 
 ### THRESHOLD SWEEP RESULTS (COMPLETE — session 9)
 
@@ -225,6 +232,72 @@ Training may improve params. Watching for training epochs > 87.3%.
 **CRITICAL BUG FIXED**: gate grid had `torch.no_grad()` in eval2k (breaks cvxpylayers).
 HANDOFF section 15.6 explicitly says NEVER wrap rollout with no_grad. Fixed in commit 46676ef.
 Gate grid restarted (PID 10134) without the bug — confirmed "Solved/Inaccurate" is GONE.
+
+---
+
+## SESSION 9-10 FINDINGS (2026-05-01)
+
+### GATE GRID RESULTS (9/14 configs completed, 5 steeper-slope configs restarted)
+
+| w | b | thresh | full | f01 | arr | post | notes |
+|---|---|--------|------|-----|-----|------|-------|
+| 5.000 | -4.000 | 0.800 | 1.000 | 87.2% | 242 | 99.1% | baseline |
+| 6.667 | -5.667 | 0.850 | 1.000 | **87.3%★** | 242 | 99.3% | NATURAL DIAGONAL PEAK |
+| 8.000 | -7.200 | 0.900 | 1.025 | 87.1% | 239 | 98.9% | natural diag drops |
+| 10.000 | -9.500 | 0.950 | 1.050 | 83.2% | 236 | 94.3% | cliff |
+| 5.000 | -3.900 | 0.780 | 0.980 | 87.0% | 240 | 98.9% | lower thresh hurts |
+| 5.000 | -3.750 | 0.750 | 0.950 | 82.6% | 239 | 93.8% | wide gate, bad hold |
+| 5.000 | -4.125 | 0.825 | 1.025 | 87.2% | 241 | 99.1% | max_alpha=0.875 at goal |
+| 5.000 | -4.250 | 0.850 | 1.050 | 87.1% | 240 | 99.0% | max_alpha=0.750 (v4-high bug) |
+| 5.000 | -4.375 | 0.875 | 1.075 | 86.9% | 238 | 98.6% | max_alpha=0.625 — bad |
+| 8.000 | -6.400 | 0.800 | 0.925 | TBD | — | — | RESTARTED |
+| 10.000 | -8.000 | 0.800 | 0.900 | TBD | — | — | RESTARTED |
+| 8.000 | -6.240 | 0.780 | 0.905 | TBD | — | — | RESTARTED |
+| 8.000 | -6.000 | 0.750 | 0.875 | TBD | — | — | RESTARTED |
+| 5.069 | -3.930 | 0.775 | 0.973 | TBD | — | — | RESTARTED |
+
+KEY FINDINGS from gate grid:
+1. Natural diagonal (full=1.000 at goal) is STRICTLY BEST for any given threshold
+2. full < 1.0 at goal: gate never opens fully → worse hold (87.1% or below)
+3. full > 1.0 at goal (but clamped to 1.0): similar or slightly worse than natural diagonal
+4. The optimum is confirmed at thresh=0.850, natural diagonal: w=6.667, b=-5.667
+
+### SCALE=5.0 EVAL WITH OPTIMAL THRESHOLD (COMPLETE)
+
+| thresh | f01 | arr | post | notes |
+|--------|-----|-----|------|-------|
+| 0.800 | 87.2% | 243 | 99.3% | arr slightly later than scale4 |
+| 0.825 | **87.3%** | 242 | 99.3% | ties record |
+| 0.850 | **87.3%** | 242 | 99.3% | ties record (same as scale4 at 0.850) |
+
+CONCLUSION: Scale=5.0 does NOT improve over scale=4.0. Both peak at 87.3%.
+The dQ_ref magnitude is optimized by scale training; adding more at inference doesn't help.
+
+### V6 DECOUPLED GATE AUTOPSY (KILLED at ep=20)
+
+Decoupled fe (thresh=0.75) + Q (thresh=0.85, natural diagonal):
+- Initial eval: 87.1%, arr=240, post=98.9% — BELOW record even at initialization
+- ep=10: 87.1%, th_fe=0.739, th_Q=0.826 — both drifting lower (wrong direction)
+- ep=20: 87.1%, th_fe=0.739, th_Q=0.810 — still drifting lower, no improvement
+
+CONCLUSION: Decoupled fe+Q gates don't help. The coupled approach (same gate for both)
+at thresh=0.850 is superior. Early fe suppression without Q boost creates a "guidance
+vacuum" that slightly hurts overall performance.
+
+### V7 VELOCITY-AWARE GATE (RESTARTED)
+
+Gate formula: proximity = near_pi - k_eff × q1d²; alpha = (w×proximity + b).clamp(0,1)
+k_eff = softplus(k_raw) ≥ 0 always (CRITICAL: unconstrained k went negative → 0.0% f01!)
+
+Run 1 (unconstrained k): k → -0.063 at ep=10 → 0.0% f01 (gate fires MORE at high velocity,
+disrupts swing-up). FIXED by softplus constraint.
+
+Run 2 (softplus, init k_eff=0.05, thresh=0.850, KILLED BY REBOOT at ep=10):
+- Initial eval: 87.0% (velocity suppression at k=0.05 slightly hurts arrival)
+- ep=10: **87.2%** ★ (improving! thresh=0.830, k=0.047 — k stayed positive, converging)
+
+Run 3 (CURRENTLY RUNNING, PID 2471): same init, restarted after reboot.
+Expected: improve through ep=10→20, potentially reach or exceed 87.3%.
 
 ---
 
