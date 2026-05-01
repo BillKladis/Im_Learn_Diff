@@ -164,9 +164,25 @@ For meaningful improvement beyond 88%:
 
 | PID | Script | Status | Notes |
 |-----|--------|--------|-------|
-| 2470 | eval_grid_remaining.py | RUNNING — 4/5 done | /tmp/gate_grid_remaining.log |
-| 2471 | exp_scalegate_v7.py | RUNNING — ep=10: 87.2% | velocity-aware 3 params |
-| 31515 | exp_scalegate_v10b.py | RUNNING — CVXPY compiling | NO PRETRAIN, alpha=0 start |
+| 2470 | eval_grid_remaining.py | **DONE** — all 5/5 complete | /tmp/gate_grid_remaining.log |
+| 2471 | exp_scalegate_v7.py | RUNNING — ep=30: 87.3% ★ | plateauing, watching ep=40 |
+| 6337 | exp_scalegate_v10b.py | RUNNING — CVXPY compiling | lr=0.001, top_frac=0.5, NO PRETRAIN |
+
+V7 TRAINING PROGRESS:
+  ep=10: 87.2% thresh=0.834 k=0.048
+  ep=20: 87.3% thresh=0.813 k=0.044  ← NEW RECORD TIE
+  ep=30: 87.3% thresh=0.795 k=0.042  ← holding, arr improved 242→241
+  Insight: thresh drifts down but k×q1d² compensates → at q1d=2: eff_thresh=0.795+0.042×4=0.963
+  Velocity-aware gate discovers: lower static threshold + velocity suppression ≡ smarter gating
+
+V10B FIRST ATTEMPT (lr=0.01, top_frac=0.7) — KILLED ep=10: 0.0%
+  Same failure mode as v9 pretrained. Too aggressive LR (0.01), too top-heavy (70%).
+  With 9/10 top-starts, gradient pushed alpha up everywhere → gate fired during swing-up → 0%
+
+V10B SECOND ATTEMPT (lr=0.001, top_frac=0.5, PID 6337) — RUNNING
+  50/50 top/bottom provides better curriculum balance.
+  Lower LR prevents catastrophic gate expansion.
+  Log: /tmp/v10b_lr1e3.log
 
 Gate grid remaining COMPLETE RESULTS (4/5 done):
   w=8.000 b=-6.400: 87.2%  arr=243  post=99.2%  [steeper at thresh=0.800 — no improvement]
@@ -297,17 +313,25 @@ Gate grid restarted (PID 10134) without the bug — confirmed "Solved/Inaccurate
 | 5.000 | -4.125 | 0.825 | 1.025 | 87.2% | 241 | 99.1% | max_alpha=0.875 at goal |
 | 5.000 | -4.250 | 0.850 | 1.050 | 87.1% | 240 | 99.0% | max_alpha=0.750 (v4-high bug) |
 | 5.000 | -4.375 | 0.875 | 1.075 | 86.9% | 238 | 98.6% | max_alpha=0.625 — bad |
-| 8.000 | -6.400 | 0.800 | 0.925 | TBD | — | — | RESTARTED |
-| 10.000 | -8.000 | 0.800 | 0.900 | TBD | — | — | RESTARTED |
-| 8.000 | -6.240 | 0.780 | 0.905 | TBD | — | — | RESTARTED |
-| 8.000 | -6.000 | 0.750 | 0.875 | TBD | — | — | RESTARTED |
-| 5.069 | -3.930 | 0.775 | 0.973 | TBD | — | — | RESTARTED |
+| 8.000 | -6.400 | 0.800 | 0.925 | 87.2% | 243 | 99.2% | steeper same thresh |
+| 10.000 | -8.000 | 0.800 | 0.900 | 87.1% | 243 | 99.1% | steepest same thresh |
+| 8.000 | -6.240 | 0.780 | 0.905 | 86.0% | 239 | 97.6% | wide+steep: post drops |
+| 8.000 | -6.000 | 0.750 | 0.875 | 82.8% | 328 | 99.0% | thresh=0.750: arr=328 catastrophic |
+| 5.069 | -3.930 | 0.775 | 0.973 | 87.0% | 240 | 98.8% | v4 ep=10 approx — gradient goes wrong way |
 
-KEY FINDINGS from gate grid:
-1. Natural diagonal (full=1.000 at goal) is STRICTLY BEST for any given threshold
-2. full < 1.0 at goal: gate never opens fully → worse hold (87.1% or below)
-3. full > 1.0 at goal (but clamped to 1.0): similar or slightly worse than natural diagonal
-4. The optimum is confirmed at thresh=0.850, natural diagonal: w=6.667, b=-5.667
+GATE GRID COMPLETE — ALL 14 CONFIGS TESTED. NONE BEAT 87.3%.
+
+KEY FINDINGS:
+1. Natural diagonal (full=1.000 at goal, thresh=0.850) is THE UNIQUE OPTIMUM
+2. Steeper slopes at same threshold: marginal degradation (87.1-87.2%)
+3. Lower threshold (thresh<0.850): either arr gets worse OR post drops
+4. thresh=0.750 catastrophic: arr=328 (86 steps late), same as dual-thresh wide gate
+5. v4 ep=10 direction (gradient pushed there): 87.0% — confirms training goes wrong way
+6. ALL off-diagonal (full≠1.0 at goal): ≤87.2%
+
+CONCLUSION: The static linear gate space is exhaustively searched. 87.3% is the ceiling
+for this parameterization family. Further improvement requires velocity-awareness (v7)
+or learned gates (v10b), or fundamentally different approach.
 
 ### SCALE=5.0 EVAL WITH OPTIMAL THRESHOLD (COMPLETE)
 
