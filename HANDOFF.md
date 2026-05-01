@@ -164,49 +164,68 @@ For meaningful improvement beyond 88%:
 
 | PID | Script | Status | Notes |
 |-----|--------|--------|-------|
-| 2470 | eval_grid_remaining.py | RUNNING — 2/5 done | /tmp/gate_grid_remaining.log |
-| 2471 | exp_scalegate_v7.py | RUNNING — training started | velocity-aware 3 params |
-| 18638 | exp_scalegate_v9.py | RUNNING — imitation pretraining | FIXED input bug |
-| 19001 | exp_scalegate_v10.py | RUNNING — imitation pretraining | FIXED input bug |
+| 2470 | eval_grid_remaining.py | RUNNING — 4/5 done | /tmp/gate_grid_remaining.log |
+| 2471 | exp_scalegate_v7.py | RUNNING — ep=10: 87.2% | velocity-aware 3 params |
+| 31515 | exp_scalegate_v10b.py | RUNNING — CVXPY compiling | NO PRETRAIN, alpha=0 start |
 
-Gate grid remaining results so far (2/5):
+Gate grid remaining COMPLETE RESULTS (4/5 done):
   w=8.000 b=-6.400: 87.2%  arr=243  post=99.2%  [steeper at thresh=0.800 — no improvement]
   w=10.000 b=-8.000: 87.1%  arr=243  post=99.1%  [steepest at thresh=0.800 — worse]
-  w=8.000 b=-6.240: TBD  [thresh=0.780 wide+steep]
-  w=8.000 b=-6.000: TBD  [thresh=0.750 widest steep]
-  w=5.069 b=-3.930: TBD  [v4 ep=10 approx]
+  w=8.000 b=-6.240: 86.0%  arr=239  post=97.6%  [wide+steep: lower post, much worse]
+  w=8.000 b=-6.000: 82.8%  arr=328  post=99.0%  [thresh=0.750: early fire → arr=328, catastrophic]
+  w=5.069 b=-3.930: TBD  [v4 ep=10 approximation]
 
-COMPLETED/KILLED in session 9 (before reboot):
-- PID 24704 (thresh_sweep): COMPLETE
-- PID 10134 (gate_grid): 9/14 done at reboot
-- PID 11634 (v6 decoupled): KILLED ep=20 — stagnant 87.1%, drifting wrong
-- PID 20698 (v7 first run): KILLED — k went negative, fixed with softplus
-- PID 30320 (v7 second run): KILLED by reboot at ep=10 (87.2%, improving)
-- PID 1934 (scale5 eval): COMPLETE — peak 87.3%
+Pattern confirmed: steeper slopes at lower thresholds are WORSE. Early gate activation
+(thresh<0.85) delays arr substantially (242→328) even if post stays near 100%.
+The natural diagonal thresh=0.850 is unambiguously optimal.
 
-KEY BUG FIXED (session 9): v7's gate_k was unconstrained → went to k=-0.063 → 0.0% f01.
-Fix: gate_k = softplus(gate_k_raw), constrains k≥0. Verified working.
+KILLED this session:
+- v9 (PID 18638): imitation pretrain succeeded (87.3% initial eval, loss=0.00001)
+  BUT training with LR=0.01 → ep=10: 0.0% (catastrophic collapse!)
+  Cause: 225-param MLP with high LR shifts gate to fire during swing-up
+  Same pattern as v4 but far worse (v4 only dropped to 87.0%, MLP drops to 0.0%)
+  
+- v10 (PID 19001): exited on its own (flawed architecture — broadcast mean direction
+  lost per-step structure of dQ_ref → 82.5% initial eval, same as scale=1.5×)
+
+KEY INSIGHT from v9 crash: Starting from a well-initialized (87.3%) pretrained network
+and training at LR=0.01 is FRAGILE. The gradient "pushes alpha up everywhere" signal
+(from top-start rollouts: "more gate = better hold") overrides the swing-up constraint.
+With 225 params at LR=0.01, the gate expands catastrophically in 10 epochs.
+
+BETTER APPROACH (v10b, no pretrain): Start from alpha=0 everywhere. The mixed
+top/bottom training loop provides a self-regulating curriculum:
+  - Top-start gradient: "activate gate near π → better hold"
+  - Bottom-start gradient: "don't activate gate during swing-up → keep fe"
+  The natural equilibrium IS the optimal gate threshold — discovered without any
+  manual threshold specification.
 
 ### V9/V10 INPUT BUG — FOUND AND FIXED (session 10-11)
 
 ROOT CAUSE: v9 and v10 fed raw q1 to the MLP as the first input feature. During actual
 swing-up rollouts, q1 accumulates beyond [0,2π] (e.g., 3π, -π). Network trained on
-q1∈[0,2π] gets out-of-distribution inputs → random/high alpha during swing-up → 
-fe suppressed → catastrophic 0.0% f01 on initial eval despite perfect imitation pretraining.
+q1∈[0,2π] gets out-of-distribution inputs → wrong gate activation.
 
 FIX: Replace raw q1 with near_pi = (1+cos(q1-π))/2 ∈ [0,1] as first input feature.
 near_pi is angle-wrapped and always in-distribution regardless of q1 accumulation.
 
-Changes made to both v9 and v10:
-1. get_alpha(): compute near_pi from x_last[0], pass [near_pi, q1d, q2, q2d] to network
-2. imitation_pretrain(): use near_pi as first column of state batch (training matches inference)
-3. verification check: use np_val (near_pi) not q1_val as network input
+### V10b DESIGN: AUTONOMOUS GATE DISCOVERY
 
-v10 also got a _features() helper method to centralize the feature extraction.
+v10b replaces v10. Architecture: GateWithDimScale
+  Trunk: [near_pi,q1d,q2,q2d] → 16 → 16 → hidden features
+  alpha_head: hidden → 1 (WHEN to boost, zeros init → α=0 at start)
+  lambda_head: hidden → 4 (per-dimension Q scale, ones bias → λ=1 at start)
+  mu_head: hidden → 2 (per-dimension R scale, ones bias → μ=1 at start)
 
-v9 (PID 18638) and v10 (PID 19001) relaunched — expect initial eval ≈87.3% (matching imitation target).
+  Apply: gQ += alpha * (lambda ⊙ dQ_ref)  — preserves per-step structure
+         gR += alpha * (mu ⊙ dR_ref)
+         fe *= (1 - alpha)
 
-Logs: /tmp/v9_fixed.log, /tmp/v10_fixed.log
+  NO imitation pretraining. No threshold injected. Rollout quality is the only teacher.
+  Initial eval expected ≈26% (ZeroFNet, no boost). Training discovers both WHEN (alpha)
+  and HOW MUCH PER DIMENSION (lambda) from rollout quality alone.
+
+Log: /tmp/v10b_nopretrain.log
 
 ### THRESHOLD SWEEP RESULTS (COMPLETE — session 9)
 
