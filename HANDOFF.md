@@ -165,8 +165,8 @@ For meaningful improvement beyond 88%:
 | PID | Script | Status | Notes |
 |-----|--------|--------|-------|
 | 2470 | eval_grid_remaining.py | **DONE** — all 5/5 complete | /tmp/gate_grid_remaining.log |
-| 2471 | exp_scalegate_v7.py | RUNNING — ep=60: 87.3% ★ | converged, passively finishing |
-| 20655 | exp_scalegate_v10d.py | RUNNING — CVXPY compiling | sigmoid fix, lr=0.01, NO PRETRAIN |
+| 2471 | exp_scalegate_v7.py | RUNNING — ep=80: 87.2% | converged, passively finishing |
+| 25881 | exp_scalegate_v10e.py | RUNNING — CVXPY compiling | skip+sigmoid fix, lr=0.01, NO PRETRAIN |
 
 V7 TRAINING PROGRESS (CONVERGED AT 87.3%):
   ep=10: 87.2% thresh=0.834 k=0.048
@@ -174,11 +174,14 @@ V7 TRAINING PROGRESS (CONVERGED AT 87.3%):
   ep=30: 87.3% thresh=0.795 k=0.042
   ep=40: 87.3% thresh=0.782 k=0.039  ← arr improved 242→241
   ep=50: 87.3% thresh=0.771 k=0.037  ← CONFIRMED PLATEAU
-  
+  ep=60: 87.3% thresh=0.761 k=0.036
+  ep=70: 87.3% thresh=0.753 k=0.035
+  ep=80: 87.2% thresh=0.744 k=0.034  ← very slight dip (thresh drifting below safe zone)
+
   v7 KEY INSIGHT: thresh drifts DOWN but k compensates.
-  At ep=50: q1d=2 effective thresh = 0.771+0.037×4=0.919 → gate barely fires during approach.
-  This IS a smarter gate: lower static threshold (earlier mild activation) + velocity suppression.
-  CONCLUSION: v7 has converged. 5 consecutive evals at 87.3%. Will let finish to ep=200 passively.
+  At ep=80: q1d=2 eff thresh = 0.744+0.034×4=0.880 → still near optimal at approach speed.
+  Slight dip at ep=80 likely transient (threshold approaching 0.750 regime, 82.3% static).
+  CONCLUSION: v7 converged at 87.3% (ep=20-70). Passively finishing to ep=200.
 
 V10B — ALL ATTEMPTS FAILED (killed):
   Attempt 1 (lr=0.01, top_frac=0.7): 0.0% at ep=10
@@ -196,13 +199,32 @@ V10C (PID 11572) — KILLED after ep=10: dead gradient bug confirmed
     No loss gradient flows to alpha_head → no learning → identical to initial eval.
     k_eff drifted ONLY because of AdamW weight decay, not loss signal.
 
-V10D (PID 20655) — RUNNING: dead gradient fix
-  CHANGE: sigmoid(alpha_head) instead of clamp(0,1)
-  CHANGE: alpha_head.bias init = -3.0 → sigmoid(-3)=0.047 (non-zero gradient ≈ 0.045)
-  CHANGE: LR = 0.01 (safe: velocity suppressor blocks high-velocity catastrophe)
-  Initial gate profile: alpha_raw=0.0474 uniformly (non-zero, gradients will flow)
-  Log: /tmp/v10d.log
-  Waiting for initial eval (~25 min CVXPY compile) then ep=10.
+V10D (PID 20655) — KILLED after ep=10: uniform small alpha still net harmful
+  INITIAL EVAL: 5.0%, arr=243, post=5.7%
+  ep=10: 5.0% (NO CHANGE), α@π=0.0464 (DECREASED from 0.0474!)
+  ROOT CAUSE: uniform alpha=0.047 is net harmful.
+    Q boost from 4.7% alpha is too small to meaningfully improve hold.
+    4.7% fe reduction at slow intermediate-angle states is measurable and harmful.
+    Both top-start AND bottom-start gradients push alpha toward 0.
+    DEEPER: with zero-init trunk AND zero alpha_head.weight, the only learnable
+    parameter is alpha_head.bias (global scalar). Reducing bias lowers alpha uniformly,
+    which is exactly wrong. The trunk never gets activated to differentiate states.
+
+V10E (PID 25881) — RUNNING: skip connection + structural vel suppressor
+  ROOT CAUSE FIX: direct near_pi skip connection to alpha_head
+    alpha_head = Linear(hidden+1, 1) — takes [trunk_output, near_pi_direct]
+    Init: W_near_pi=6, bias=-5 → sigmoid(6×near_pi-5) at init
+    → State-conditional alpha from epoch 0:
+      near_pi=0.0 (q1=0°):   α_raw=0.007 (gate off)
+      near_pi=0.5 (q1=90°):  α_raw=0.119
+      near_pi=0.8 (q1=127°): α_raw=0.452
+      near_pi=1.0 (q1=180°): α_raw=0.731
+    → Velocity suppressor: α_eff=0 at q1d≥1.79 (swing-up approach protected)
+  Training now has STATE-CONDITIONAL gradient: top-start pushes alpha UP at π,
+  bottom-start pushes alpha DOWN at intermediate angles.
+  Expected initial eval: 82-85% (alpha=0.73 at π ≈ scale=3.0× effective boost)
+  Log: /tmp/v10e.log
+  Waiting for initial eval (CVXPY compiling ~25 min from launch).
 
 Gate grid remaining COMPLETE RESULTS (4/5 done):
   w=8.000 b=-6.400: 87.2%  arr=243  post=99.2%  [steeper at thresh=0.800 — no improvement]
