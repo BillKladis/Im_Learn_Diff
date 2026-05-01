@@ -8,6 +8,96 @@
 
 ---
 
+## FILE LINEAGE — WHAT EACH FILE IS AND WHAT IT ACHIEVED
+
+### Foundation models (frozen inputs to all scalegate experiments)
+
+| Model path | What it is | f01 |
+|---|---|---|
+| `saved_models/stageD_posonly_ft_20260430_083618/` | Base **lin_net** — the swing-up model. Learns `f_extra` energy-pumping. Frozen in all scalegate experiments. Load with `LinearizationNetwork.load(POSONLY)`. | 26.2% (no gate) |
+| `saved_models/stageD_scale4.0x_dQ_20260430_192447/` | Source of **`dQ_ref`** and **`dR_ref`** — the Q/R correction direction the gate scales. Found by manual scale sweep; 4× was optimal. Load `ckpt['metadata']['training_params']['best_delta_Q']`. Shape (9,4) and (10,2). | 87.2% (static gate thresh=0.80) |
+| `saved_models/stageD_optinit_holdboost_dq0.99x0.99_20260430_165519/` | Best pre-scalegate model. HoldBoostWrapper with learned dQ from 20-epoch gradient training. | 82.9% |
+
+### Static gate sweeps (no learned parameters — eval only)
+
+| Script | What it sweeps | Key result |
+|---|---|---|
+| `exp_thresh_upper_sweep.py` | near_pi threshold from 0.750 to 0.950 | Peak at **thresh=0.850 → 87.3%**. 0.750 gives arr=239 but post=93.4% (terrible). 0.925+ cliff. |
+| `exp_gate_grid_eval.py` | 14 (w, b) pairs covering slope × threshold space | All ≤87.3%. Natural diagonal (full=1.0 at goal, thresh=0.85) is the unique optimum. |
+| `exp_dq_scale_sweep.py` | dQ_ref scale factor 0.0× to 10.0× | Two regimes: 83% (scale 0.65-2.0), 87% (scale 2.5-7.0). Peak 87.2% at scale=4-5. Scale=10: 0%. |
+
+### Scalegate learned-gate experiments
+
+| File | Key architectural idea | Init f01 | Peak f01 | Fate |
+|---|---|---|---|---|
+| `exp_scalegate.py` | 2 learnable params (w, b), linear ramp. Supervised pretrain. | 87.2% | 87.2% | Gradient always pushed threshold lower (wrong direction). |
+| `exp_scalegate_v2.py` | error_norm as direct input. Sharper pretrained profile. | 87.2% | 82.8% | Gate saturated → zero gradient → stuck. |
+| `exp_scalegate_v4.py` | Linear ramp init at thresh=0.80 (optimal static). | 87.2% | 87.0% | Threshold drifted to 0.775 (wrong dir). Confirmed training gradient ≠ f01 gradient. |
+| `exp_scalegate_v6.py` | Decoupled gates: separate thresh for fe (0.75) vs Q (0.85). | 87.1% | 87.1% | Decoupling created "guidance vacuum". No improvement over coupled. |
+| `exp_scalegate_v7.py` | Added velocity term: `proximity = near_pi - k×q1d²`. Velocity-aware. | 87.0% | **87.3%** | First 87.3% from a trained model. Threshold drifted lower over 200 ep but k compensated. Converged ep=20-70. |
+| `exp_scalegate_v9.py` | Full MLP (225 params), imitation pretrain from 87.2% static gate. | 87.3% | 87.3% | Collapsed to 0% in 10 training epochs at LR=0.01 — gate expanded into swing-up zone. |
+| `exp_scalegate_v10.py` | MLP with raw q1 as input (bug). | 82.5% | — | Killed: raw q1 goes out-of-distribution (accumulates beyond 2π during swing-up). |
+| `exp_scalegate_v10b.py` | MLP with near_pi input, zero-init alpha_head, lambda/mu heads. | ~26% | 0% | Lambda/mu from non-zero trunk → Q distortion → collapse. |
+| `exp_scalegate_v10c.py` | MLP, clamp(0,1) output, zero-init all weights. | 5.1% | 5.1% | **Dead gradient**: clamp at exactly 0 boundary kills PyTorch autograd. |
+| `exp_scalegate_v10d.py` | MLP, uniform small alpha (bias only, trunk zeroed). | 5.0% | 5.0% | Uniform alpha harmful; both top/bottom gradient pushed alpha → 0. Trunk never activates. |
+| `exp_scalegate_v10e.py` | **Near_pi skip connection** added (W=6, b=−5): state-conditional alpha from epoch 0. | 82.7% | 82.9% | **Dead trunk**: zero-init W_trunk → trunk output × 0 → trunk never gets gradient. Skip alone caps at 83%. |
+| `exp_scalegate_v10f.py` | Active trunk (kaiming init). W_trunk non-zero → trunk learns. | 82.7% | 83.2% | Gate expanded into swing-up zone by ep=30 → 0% f01. No positional protection. |
+| `exp_scalegate_v10g.py` | **Structural pos_gate** = sigmoid(50×(near_pi−0.85)) added. Kept lambda/mu heads. | 87.2% | **87.5%★** | Lambda/mu distorted Q direction by ep=30 → post=0% (arrived but didn't hold). Structural pos_gate itself worked. |
+| `exp_scalegate_v10h.py` | **Removed lambda/mu heads**. Only trunk + alpha_head + gate_k_raw (371 params). | 87.2% | **87.3%** | ✓ **THE WORKING SOLUTION.** Stable convergence. Gate fully learned. Ceiling confirmed. |
+| `exp_scalegate_v11.py` | Tried **soft f01 loss** directly on x_traj from rollout(). | 87.1% | N/A | Immediate failure: rollout() detaches all states; x_traj has no grad_fn. Killed. |
+| `exp_scalegate_v11b.py` | v10h + **larger perturbations** (q1d ±1.5) + **w_stable_phase=0.5**. 400 epochs. | 87.2% | **87.3%** | Confirmed ceiling. k_eff decayed 0.313→0.077. No training variation escapes 87.3%. |
+
+### Best checkpoints to load for future work
+
+| Path | What to use it for | f01 |
+|---|---|---|
+| `saved_models/stageD_posonly_ft_20260430_083618/` | Base lin_net for any future experiment | — |
+| `saved_models/stageD_scale4.0x_dQ_20260430_192447/` | Source of dQ_ref and dR_ref | — |
+| `saved_models/stageE_scalegate_v11b_h16_20260501_173905/` | Best learned gate (GateVelMLP, 371 params, 87.3%) | 87.3% |
+
+### How to load the v10h/v11b gate architecture
+
+```python
+import torch, sys, math
+sys.path.insert(0, "/home/user/Im_Learn_Diff")
+import lin_net as network_module
+
+POSONLY    = "saved_models/stageD_posonly_ft_20260430_083618/stageD_posonly_ft_20260430_083618.pth"
+SCALE4     = "saved_models/stageD_scale4.0x_dQ_20260430_192447/stageD_scale4.0x_dQ_20260430_192447.pth"
+GATE_CKPT  = "saved_models/stageE_scalegate_v11b_h16_20260501_173905/stageE_scalegate_v11b_h16_20260501_173905.pth"
+
+lin_net = network_module.LinearizationNetwork.load(POSONLY, device='cpu').double()
+scale4  = torch.load(SCALE4, map_location='cpu', weights_only=False)
+tp      = scale4['metadata']['training_params']
+dQ_ref  = torch.tensor(tp['best_delta_Q'], dtype=torch.float64)  # shape (9,4)
+dR_ref  = torch.tensor(tp['best_delta_R'], dtype=torch.float64)  # shape (10,2)
+
+# Then instantiate GateVelMLP from exp_scalegate_v11b.py and load state dict
+from exp_scalegate_v11b import GateVelMLP
+gate = GateVelMLP(lin_net, dQ_ref, dR_ref, hidden=16)
+gate_ckpt = torch.load(GATE_CKPT, map_location='cpu', weights_only=False)
+gate.load_state_dict(gate_ckpt['model_state_dict'])
+gate.eval()
+# gate(x_sequence) → gQ, gR, fe, qd, rd, gQf
+# Gives 87.3% f01 on 2000-step eval from [0,0,0,0]
+```
+
+### Key numbers to remember
+
+| Quantity | Value | Meaning |
+|---|---|---|
+| STRUCTURAL_THRESH | 0.85 | near_pi threshold for structural pos_gate. Hard-coded, non-learnable. |
+| STRUCTURAL_K | 50.0 | Steepness of pos_gate sigmoid. Makes transition sharp over ~5° of q1. |
+| NEAR_PI_SKIP_W | 6.0 | Skip connection weight from near_pi → alpha_head. Init state-conditional gate. |
+| NEAR_PI_SKIP_B | −5.0 | Skip connection bias. 50% point at near_pi=0.833 (≈146°) at init. |
+| GATE_K_INIT | −1.0 | softplus(−1.0) = 0.313 → vel gate turns off at q1d ≥ 1.79 rad/s at init. |
+| arr=241 | 241 steps | Minimum swing-up time with this lin_net (dt=0.05 → 12.05 seconds). |
+| post=99.3% | 99.3% | Maximum hold quality: 14 steps out of 1759 fail (wrap_dist > 0.10). |
+| f01 ceiling | 87.3% | = (2000−241)/2000 × 0.993. Unreachable above this with current lin_net+dQ_ref. |
+| hidden=16 | 16 | Trunk width. Total 371 trainable params (trunk 4→16→16, alpha_head (17,1), k_raw). |
+
+---
+
 ## SESSION 13 — FULL DETAILED ACCOUNT (2026-05-01)
 
 ### OVERVIEW
