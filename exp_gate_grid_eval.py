@@ -57,8 +57,7 @@ class LinearRampGate(torch.nn.Module):
 
 
 def eval2k(model, mpc, x0, x_goal, steps=2000):
-    with torch.no_grad():
-        x_t, _ = train_module.rollout(lin_net=model, mpc=mpc, x0=x0, x_goal=x_goal, num_steps=steps)
+    x_t, _ = train_module.rollout(lin_net=model, mpc=mpc, x0=x0, x_goal=x_goal, num_steps=steps)
     traj = x_t.cpu().numpy()
     wraps = np.array([math.sqrt(
         math.atan2(math.sin(s[0]-math.pi), math.cos(s[0]-math.pi))**2
