@@ -166,7 +166,7 @@ For meaningful improvement beyond 88%:
 |-----|--------|--------|-------|
 | 2470 | eval_grid_remaining.py | **DONE** — all 5/5 complete | /tmp/gate_grid_remaining.log |
 | 2471 | exp_scalegate_v7.py | RUNNING — ep=80: 87.2% | converged, passively finishing |
-| 25881 | exp_scalegate_v10e.py | RUNNING — CVXPY compiling | skip+sigmoid fix, lr=0.01, NO PRETRAIN |
+| 3534 | exp_scalegate_v10e.py | RUNNING — CVXPY compiling | top_frac=0.7, skip+sigmoid, lr=0.01 |
 
 V7 TRAINING PROGRESS (CONVERGED AT 87.3%):
   ep=10: 87.2% thresh=0.834 k=0.048
@@ -222,13 +222,26 @@ V10E (PID 25881) — RUNNING: skip connection + structural vel suppressor
     → Velocity suppressor: α_eff=0 at q1d≥1.79 (swing-up approach protected)
   Training now has STATE-CONDITIONAL gradient: top-start pushes alpha UP at π,
   bottom-start pushes alpha DOWN at intermediate angles.
-  INITIAL EVAL: 82.7%, arr=239, post=93.9%
+  INITIAL EVAL (top_frac=0.5 run): 82.7%, arr=239, post=93.9%
     ← Gate works! State-conditional alpha from skip connection.
-    ← post=93.9% = same as scale=1.0 level. Training must narrow threshold (0.5→0.85)
-       and push α@π from 0.731→1.0 to reach 99%+ post_arr.
-    ← arr=239 (3 steps earlier than thresh=0.85). Wide gate helps MPC attract to π.
-  Log: /tmp/v10e.log
-  Waiting for ep=10.
+    ← post=93.9% = same as scale=1.0 level.
+
+  ep=10 (top_frac=0.5): 82.7% FLAT — α@π=0.719↓, α@127°=0.438↓
+    ROOT CAUSE: with 50/50 training, gradient on W_near_pi nearly cancels:
+      top-start pushes W up (0.202×1.0), bottom-start pushes W down (0.247×0.8=0.198)
+      → W barely grows → α@π stuck at 0.73 (never reaches 1.0)
+    Threshold IS sharpening (bias -5.0→-5.06 → 50% point 0.833→0.843) ✓
+    But threshold sharpening without W growth = gate shrinks, f01 stays flat.
+
+  RESTART (top_frac=0.7, PID 3534): Net W gradient = +0.082 (positive!) → α@π grows.
+    With 70/30: d(logit@π)/dt = 0.7×0.202 - 0.3×0.247×0.8 ≈ +0.082 per epoch → growth
+    Threshold: roughly maintained (competing effects nearly balance).
+  Log: /tmp/v10e_07.log
+
+V7 ep=80-110: DECLINING (82.2% at ep=110)
+  Threshold drifted 0.850→0.707 over 110 epochs (too far below optimal).
+  Even with 70/30 top/bottom, threshold drifts lower due to top-start loss reward.
+  Process died (system event). Not restarting — peaked at 87.3% ep=20-70.
 
 Gate grid remaining COMPLETE RESULTS (4/5 done):
   w=8.000 b=-6.400: 87.2%  arr=243  post=99.2%  [steeper at thresh=0.800 — no improvement]
