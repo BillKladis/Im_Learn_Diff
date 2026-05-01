@@ -1,6 +1,6 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v8: swing-up + hold, fully learned.
+"""exp_mixed_curriculum.py — Mixed curriculum v9: swing-up + hold, fully learned.
 
-GRADIENT SEPARATION ARCHITECTURE (v8):
+GRADIENT SEPARATION ARCHITECTURE (v9):
   Bottom episode → f_head only (detach_gates_Q_for_qp=True, no w_q_profile)
   Top episode    → q_head only (detach_f_extra_for_qp=True) + direct f_extra
                    suppression via w_f_pos_only (teaches f_head to zero near-π)
@@ -10,16 +10,24 @@ v7 failure post-mortem:
   w_q_profile=100 fires with target=STABLE=[1.5,...] → massive Q gradient.
   Q gates jump from 0.015 → 0.077 in one step → Q-dominated MPC → chaotic L_bot.
 
-v8 root fix — remove ALL Q training from bottom episode:
-  detach_gates_Q_for_qp=True: q_head gets ZERO gradient from bottom episode.
-  No w_q_profile in bottom: no STABLE target triggered during swing-up.
-  → Q gates ONLY trained by top episode where near-π is the primary state.
+v8 root fix: detach_gates_Q_for_qp=True in bottom → Q cannot be trained by
+  track_loss (the explosive path). Q gates stayed stable through epoch 10+.
 
-v8 also adds direct f_extra suppression in top episode:
-  w_f_pos_only=0.5: penalises f_extra×near_pi → teaches f_head to zero f_extra
-  at near-π states. Uses original (not detached) f_extra → DIRECT gradient to
-  f_head. Combined with bottom episode driving f_extra up at near-zero states,
-  f_head learns: large f_extra at bottom, near-zero at top.
+v8b failure (epoch 20-30): no w_q_profile in bottom means Q@bot drifts up
+  as top-episode Q training bleeds through shared weights. Q@bot grew from
+  0.015→0.627 (epoch 27), then oscillated 0.627→0.463→0.298. Large Q@bot
+  competes with f_extra in bottom episode → L_bot degraded from 0.025→0.162.
+
+v9 fix: add w_q_profile back to BOTTOM episode WITH detach_gates_Q_for_qp=True.
+  This gives q_head a DIRECT gradient from the bottom episode (not through QP).
+  The direct penalty constrains Q@bot to PUMP at states visited in the bottom.
+  No explosion risk: the track_loss→q_head path is BLOCKED by detach_gates_Q.
+  Only w_q_profile's direct ∂(gate-target)²/∂q_head path reaches q_head.
+
+Result: q_head gets state-conditional training:
+  Bottom episode → PUMP target at q1=0 states (constrain Q@bot to 0.01)
+  Top episode   → STABLE target at q1=π states (push Q@top to 1.5)
+  Both via direct w_q_profile gradient, no track_loss contamination.
 
 PHILOSOPHY:
   No frozen modules. No hand-tuned gate formulas. No delta_Q corrections.
@@ -27,9 +35,9 @@ PHILOSOPHY:
   meta-epoch, all through train_linearization_network() with shared AdamW.
 
   BOTTOM episode (x0=[0,0,0,0]):
-    track_mode="energy" + detach_gates_Q_for_qp=True
-    → f_head learns resonant energy pumping via QP gradient
-    → q_head receives ZERO gradient (Q stays near init until top teaches it)
+    track_mode="energy" + detach_gates_Q_for_qp=True + w_q_profile=100
+    → f_head learns resonant energy pumping via QP gradient (detach blocks Q path)
+    → q_head: direct w_q_profile gradient (PUMP target at bottom) — stable Q@bot
 
   TOP episode (x0 near π, random perturbation):
     track_mode="cos_q1" + w_q_profile=100 + detach_f_extra_for_qp=True
@@ -188,13 +196,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v8{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v9{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.LinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v8",
+            "experiment": "mixed_curriculum_v9",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -225,15 +233,15 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v8 — clean gradient separation")
+    out("  EXP: MIXED CURRICULUM v9 — state-conditional Q via direct w_q_profile")
     out(f"  device: {device}")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"detach_Q=True, no w_q_profile")
+        f"detach_Q=True + w_q_profile={W_Q_PROFILE} (PUMP target @ bottom)")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
-        f"detach_f=True | w_f_pos_only={W_F_POS_ONLY_TOP}")
-    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (top episode only)")
-    out(f"  f_head trains from: bottom (QP path) + top (direct penalty w_f_pos_only)")
-    out(f"  q_head trains from: top only (Q-profile + w_stable_phase)")
+        f"detach_f=True | w_stable={W_STABLE_PHASE}")
+    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, BOTH episodes)")
+    out(f"  q_head: bottom→PUMP constraint, top→STABLE target (both via direct penalty)")
+    out(f"  f_head: bottom QP path only (track_loss→f_extra, detach blocks Q)")
     out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
     out("=" * 80)
 
@@ -274,10 +282,11 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # ONLY f_head trains here:
-        #   detach_gates_Q_for_qp=True → q_head gets ZERO gradient from bottom.
-        #   No w_q_profile → no STABLE target triggered when pendulum reaches π.
-        # This prevents Q explosion when swing-up first succeeds (v7 root cause).
+        # f_head trained by energy tracking (QP path: track_loss→f_extra→f_head).
+        # q_head trained by w_q_profile direct penalty ONLY (detach_gates_Q=True
+        # blocks the track_loss→QP→q_head path that caused v7's explosion).
+        # w_q_profile in bottom: PUMP target at q1=0 states → keeps Q@bot
+        # near 0.01 and prevents the drift seen in v8b (Q@bot 0.015→0.627).
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
             loss_b, _ = train_module.train_linearization_network(
@@ -286,6 +295,10 @@ def main():
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
+                w_q_profile=W_Q_PROFILE,
+                q_profile_pump=PUMP,
+                q_profile_stable=STABLE,
+                q_profile_state_phase=True,
                 external_optimizer=optimizer,
                 restore_best=False,
             )
