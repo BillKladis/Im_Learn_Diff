@@ -1,7 +1,7 @@
 # Double-Pendulum Swing-Up — HANDOFF
 
 **Branch:** `claude/continue-handoff-work-RhI5l`
-**Status (2026-05-01 session 12): RECORD 87.3% CONFIRMED (v10h converged to it). v10g briefly hit 87.5% (ep=20) but collapsed ep=30 due to lambda head distortion. v10h proved MLP can learn optimal gate but can't exceed 87.3% ceiling with current lin_net/dQ_ref. To beat: need faster swing-up OR better dQ_ref.**
+**Status (2026-05-01 session 13): v11b RUNNING (PID 8118). v11 (soft f01 loss) FAILED — rollout() uses torch.no_grad() so x_traj has no grad_fn. Reverted to QPC tracking loss. v11b = v10h + larger top-start perturbations (q1d ±1.5) + w_stable_phase=0.5 for bottom-start. Ceiling 87.3% confirmed by v10h convergence.**
 
 **RECORD**: thresh=0.850 natural diagonal → **87.3%** (f01), arr=242, post=99.3%
 **CONFIRMED BY**: threshold sweep, gate grid, AND scale=5.0 eval — all peak at 87.3%
@@ -325,6 +325,32 @@ V10H FINAL RESULTS (KILLED ep=70, converged):
   6. CEILING CONFIRMED: 87.3% is the practical max for this lin_net/dQ_ref combination
      → arr=241, post=99.2% (0.8% hold failures = ~14 steps where wrap drifts > 0.10)
      → To beat: need arr < 235 OR post > 99.5%, requires different controller/dQ
+
+V11 (FAILED — gradient structure incompatibility):
+  Design: Soft f01 loss — loss = -mean(sigmoid(β × (0.10 - wrap_dist(x_traj))))
+  Error: RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+  Root cause: rollout() at Simulate.py line 961 has `with torch.no_grad(): lin_net(...)`.
+    States are always detached between steps (current_state_detached = x0.detach().clone()).
+    So x_traj has NO grad_fn. Soft f01 needs gradient through x_traj → impossible without
+    a custom step-by-step loop that keeps states in the compute graph.
+  Lesson: QPC tracking loss works because it's computed from Q,R,fe (gate output per step),
+    not from x_traj states. train_linearization_network() maintains gradient through gate output
+    but NOT through state evolution.
+  Initial eval before failure: 87.1% (structural_thresh=0.80, lower than optimal 0.85).
+  Killed after discovering root cause.
+
+V11B (RUNNING PID 8118, /tmp/v11b.log):
+  Architecture: Identical to v10h (structural pos_gate + frozen lambda/mu).
+  Two changes from v10h:
+    1. Larger top-start perturbations: q1d up to ±1.5 rad/s (was ±0.6)
+       → exposes gate to high-velocity near-top states during training
+       → may help gate learn velocity-dependent hold behavior
+    2. w_stable_phase=0.5 for bottom-start: extra position loss in last 50 steps
+       → encourages fe suppression to NOT affect arrival quality
+  structural_thresh=0.85 (optimal, same as v10h)
+  371 trainable params, NO pretraining, LR=0.01, top_frac=70%, epochs=400
+  Initial gate profile: q1=127°: α_eff=0.036 ✓, q1=180°: α_eff=0.731 ✓ (same as v10h)
+  Expected: converge to 87.3% (ceiling). Watching for any departure above ceiling.
 
 V10 EXPERIMENT SERIES — COMPLETE SUMMARY:
   v10c: clamp→gradient=0 (dead gate)
