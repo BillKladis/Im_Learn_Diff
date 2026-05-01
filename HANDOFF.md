@@ -222,9 +222,13 @@ V10E (PID 25881) — RUNNING: skip connection + structural vel suppressor
     → Velocity suppressor: α_eff=0 at q1d≥1.79 (swing-up approach protected)
   Training now has STATE-CONDITIONAL gradient: top-start pushes alpha UP at π,
   bottom-start pushes alpha DOWN at intermediate angles.
-  Expected initial eval: 82-85% (alpha=0.73 at π ≈ scale=3.0× effective boost)
+  INITIAL EVAL: 82.7%, arr=239, post=93.9%
+    ← Gate works! State-conditional alpha from skip connection.
+    ← post=93.9% = same as scale=1.0 level. Training must narrow threshold (0.5→0.85)
+       and push α@π from 0.731→1.0 to reach 99%+ post_arr.
+    ← arr=239 (3 steps earlier than thresh=0.85). Wide gate helps MPC attract to π.
   Log: /tmp/v10e.log
-  Waiting for initial eval (CVXPY compiling ~25 min from launch).
+  Waiting for ep=10.
 
 Gate grid remaining COMPLETE RESULTS (4/5 done):
   w=8.000 b=-6.400: 87.2%  arr=243  post=99.2%  [steeper at thresh=0.800 — no improvement]
