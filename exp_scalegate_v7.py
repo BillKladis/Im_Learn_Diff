@@ -51,13 +51,19 @@ BOTTOM_X0_LIST = [[0,0,0,0],[0.2,0,0,0],[-0.2,0,0,0],[0.5,0,0,0],[-0.5,0,0,0]]
 class VelocityAwareGate(nn.Module):
     """3-param gate: proximity = near_pi - k*q1d², alpha=(w*proximity+b).clamp(0,1).
 
-    k>0: gate suppressed when passing through top at high angular velocity.
-    This prevents over-constraining during high-speed transitions and allows
-    more natural hold-stabilization.
+    k is constrained ≥ 0 via softplus: k_eff = softplus(k_raw).
+    k_eff > 0: gate suppressed when passing through top at high angular velocity.
+    This prevents the gate from firing during fast swing-throughs (where the
+    pendulum passes near π with high q1d but is NOT in a holding state).
 
-    Init: w=5, b=-4, k=0 → exact HoldBoostWrapper (no velocity term).
+    k_eff = 0: reduces to pure angle-based gate (same as v4/threshold sweep).
+    k_eff > 0: gate requires pendulum to be BOTH near π AND slow.
+
+    Init: k_raw s.t. softplus(k_raw) ≈ init_k_eff.
+    For init_k_eff=0.05: k_raw = log(exp(0.05)-1) ≈ -2.94
+    For init_k_eff=0.0: not exactly representable; use small k_raw → k_eff≈small
     """
-    def __init__(self, lin_net, dQ_ref, dR_ref, init_w=5.0, init_b=-4.0, init_k=0.0):
+    def __init__(self, lin_net, dQ_ref, dR_ref, init_w=5.0, init_b=-4.0, init_k_eff=0.05):
         super().__init__()
         self.lin_net = lin_net
         self.register_buffer('dQ_ref', dQ_ref.clone())  # (9,4)
@@ -69,7 +75,14 @@ class VelocityAwareGate(nn.Module):
 
         self.gate_w = nn.Parameter(torch.tensor(init_w, dtype=torch.float64))
         self.gate_b = nn.Parameter(torch.tensor(init_b, dtype=torch.float64))
-        self.gate_k = nn.Parameter(torch.tensor(init_k, dtype=torch.float64))
+        # k_eff = softplus(gate_k_raw) ≥ 0 always
+        import math as _math
+        k_raw_init = _math.log(_math.exp(max(init_k_eff, 1e-6)) - 1.0)
+        self.gate_k_raw = nn.Parameter(torch.tensor(k_raw_init, dtype=torch.float64))
+
+    @property
+    def gate_k(self):
+        return torch.nn.functional.softplus(self.gate_k_raw)
 
     def get_proximity(self, x_sequence):
         x_last = x_sequence[-1]
@@ -167,7 +180,7 @@ def main():
 
     model = VelocityAwareGate(lin_net, dQ_ref, dR_ref,
                                init_w=args.init_w, init_b=args.init_b,
-                               init_k=args.init_k).to(device)
+                               init_k_eff=args.init_k).to(device)
 
     init_thresh = -args.init_b / args.init_w if abs(args.init_w) > 1e-6 else 0.80
 
@@ -175,7 +188,7 @@ def main():
     print("  EXP SCALEGATE v7: Velocity-aware gate (3 params: w, b, k)")
     print(f"  proximity = (1+cos(q1-π))/2 - k × q1d²")
     print(f"  alpha = (w × proximity + b).clamp(0,1)")
-    print(f"  Init: w={args.init_w}, b={args.init_b}, k={args.init_k}")
+    print(f"  Init: w={args.init_w}, b={args.init_b}, k_eff={args.init_k} (softplus constrained k≥0)")
     print(f"  Init threshold (k=0): near_pi={init_thresh:.3f}"
           f" → {math.degrees(math.acos(2*init_thresh-1)):.1f}° from top")
     print(f"  LR={args.lr}  top_frac={args.top_frac:.0%}  epochs={args.epochs}")
@@ -191,9 +204,9 @@ def main():
     best_f01 = f01
     best_w = model.gate_w.item()
     best_b = model.gate_b.item()
-    best_k = model.gate_k.item()
+    best_k_raw = model.gate_k_raw.item()
 
-    gate_params = [model.gate_w, model.gate_b, model.gate_k]
+    gate_params = [model.gate_w, model.gate_b, model.gate_k_raw]
     optimizer = torch.optim.AdamW(gate_params, lr=args.lr, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
@@ -234,13 +247,14 @@ def main():
             f01, arr, post = eval2k(model, mpc, x0_eval, x_goal)
             w_now = model.gate_w.item()
             b_now = model.gate_b.item()
-            k_now = model.gate_k.item()
+            k_now = model.gate_k.item()        # effective k (softplus output, always ≥0)
+            k_raw_now = model.gate_k_raw.item()
             thresh_now = -b_now / w_now if abs(w_now) > 1e-6 else float('nan')
             mark = ""
             if f01 > best_f01:
                 mark = " ★"
                 best_f01 = f01
-                best_w, best_b, best_k = w_now, b_now, k_now
+                best_w, best_b, best_k_raw = w_now, b_now, k_raw_now
             lr_now = optimizer.param_groups[0]['lr']
             print(f"  [ep={epoch:3d}]  {f01:.1%}  arr={arr}  post={f'{post:.1%}' if post else 'N/A'}"
                   f"  thresh={thresh_now:.4f}  k={k_now:.4f}"
@@ -253,7 +267,7 @@ def main():
 
     model.gate_w.data.fill_(best_w)
     model.gate_b.data.fill_(best_b)
-    model.gate_k.data.fill_(best_k)
+    model.gate_k_raw.data.fill_(best_k_raw)
 
     probe_gate(model, device, "Final gate profile:")
 
@@ -267,10 +281,11 @@ def main():
             "best_f01": best_f01,
             "gate_w": best_w,
             "gate_b": best_b,
-            "gate_k": best_k,
+            "gate_k_eff": torch.nn.functional.softplus(torch.tensor(best_k_raw)).item(),
+            "gate_k_raw": best_k_raw,
             "gate_thresh": -best_b / best_w if abs(best_w) > 1e-6 else 0.80,
             "dQ_ref_mean": dQ_ref.mean(0).tolist(),
-            "init_k": args.init_k,
+            "init_k_eff": args.init_k,
         },
         session_name=session_name,
     )
