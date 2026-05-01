@@ -233,10 +233,10 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v9 — state-conditional Q via direct w_q_profile")
+    out("  EXP: MIXED CURRICULUM v9b — PUMP-only target in bottom episode")
     out(f"  device: {device}")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"detach_Q=True + w_q_profile={W_Q_PROFILE} (PUMP target @ bottom)")
+        f"detach_Q=True + w_q_profile={W_Q_PROFILE} (PUMP target ALWAYS, no STABLE)")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
         f"detach_f=True | w_stable={W_STABLE_PHASE}")
     out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, BOTH episodes)")
@@ -297,8 +297,11 @@ def main():
                 detach_gates_Q_for_qp=True,
                 w_q_profile=W_Q_PROFILE,
                 q_profile_pump=PUMP,
-                q_profile_stable=STABLE,
-                q_profile_state_phase=True,
+                q_profile_stable=PUMP,   # PUMP for BOTH branches: always target PUMP
+                # No q_profile_state_phase — default False → time-based split,
+                # but both pump AND stable target PUMP so Q is always PUMP here.
+                # This prevents the v7/v9 explosion: near-π transient states in
+                # the bottom episode no longer trigger STABLE target for Q.
                 external_optimizer=optimizer,
                 restore_best=False,
             )
