@@ -1,6 +1,6 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v14: pure f_net/q_net decoupling.
+"""exp_mixed_curriculum.py — Mixed curriculum v14b: separate optimizers.
 
-v14 = v13 + remove q_profile from bottom episode.
+v14b = v14 + separate AdamW optimizers for f_net (bottom) and q_net (top).
 
 v13 result (ep1-12):
   Positive: Q@mid self-corrected (0.090 peak ep8 → 0.018 ep12). Swing-up working
@@ -103,7 +103,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14b.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -183,13 +183,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14b{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14",
+            "experiment": "mixed_curriculum_v14b",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -220,7 +220,7 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14 — pure f_net/q_net decoupling")
+    out("  EXP: MIXED CURRICULUM v14b — separate optimizers for f_net / q_net")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
@@ -250,7 +250,11 @@ def main():
     model = network_module.SeparatedLinearizationNetwork(**model_kwargs).to(device).double()
     apply_q1_bias(model, Q_BIAS_Q1)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # Separate optimizers: f_net trains in bottom, q_net trains in top.
+    # Shared AdamW decimated q_net's effective LR: 3 zero-grad bottom updates
+    # diluted q_net's Adam moments by ~4×, causing Q@top to grow at only 0.006/epoch.
+    optimizer_f = torch.optim.AdamW(model.f_net.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer_q = torch.optim.AdamW(model.q_net.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     # Initial probe
     p = probe_network(model, mpc, device)
@@ -287,7 +291,7 @@ def main():
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
-                external_optimizer=optimizer,
+                external_optimizer=optimizer_f,
                 restore_best=False,
             )
             L_bot_last = loss_b[0] if loss_b else float("nan")
@@ -312,7 +316,7 @@ def main():
             w_f_pos_only=W_F_POS_ONLY_TOP,
             f_gate_thresh=F_GATE_THRESH_TOP,
             detach_f_extra_for_qp=DETACH_F_EXTRA_TOP,
-            external_optimizer=optimizer,
+            external_optimizer=optimizer_q,
             restore_best=False,
         )
         L_top = loss_t[0] if loss_t else float("nan")
