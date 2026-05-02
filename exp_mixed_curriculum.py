@@ -1,24 +1,18 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v14g: no gate in energy tracking.
+"""exp_mixed_curriculum.py — Mixed curriculum v14h: gentle fe suppression.
 
-v14g = v14g − f_gate_thresh in episode A (energy tracking).
+v14h = v14g with W_F_POS_ONLY_FE = 0.1 (was 2.0).
 
-v14g failure (ep1-20, killed):
-  f_gate_thresh in episode A blocked 90% of energy tracking gradient (all near-π
-  steps of 170-step rollout were zeroed). L_bot stayed constant at 2.082 for 20
-  epochs (vs v14d's 1.778→0.038 by ep10). f_net never learned to swing to π.
-  Eval: arr=None at ep20 despite Q@mid=0.010, Q@top=1.032.
+v14g failure (ep1-11, killed):
+  W_F_POS_ONLY_FE=2.0 suppressed fe@top to ~0.046 by ep2 — too fast, too early.
+  Energy tracking needs fe@top ~1-3 in early training for final push to π. With
+  fe@top≈0, L_bot stayed at 2.082 (same as v14f). The suppression episode won the
+  tug-of-war against energy tracking before f_net had time to learn the swing.
 
-v14g fix — remove f_gate_thresh from energy tracking (episode A):
-  Energy tracking now trains f_extra at ALL states (pushes fe@top UP via trunk_f).
-  Episode B (fe suppression, near-top start, w_f_pos_only=2.0, detach QP) pushes
-  fe@top DOWN in a SEPARATE Adam step. No same-backward-pass conflict (v14d's bug).
-  Adam momentum accumulates opposing gradients for near-π parameters → stable
-  equilibrium at low fe@top instead of chaotic oscillation.
-
-  Why separate calls work but same call didn't (v14d): in a single backward pass,
-  conflicting gradients on the same parameter cancel or create instability. In
-  separate sequential calls, Adam processes each gradient individually and their
-  momentum vectors reach a natural balance point.
+v14h fix — reduce W_F_POS_ONLY_FE from 2.0 → 0.1:
+  Gentle suppression allows fe@top to stabilize at ~2-3 while L_bot decreases.
+  As Q@top grows (via top q_profile), Q itself provides hold near π → fe@top can
+  decrease gradually. The suppression signal strengthens RELATIVE to energy tracking
+  as training progresses (energy loss decreases → tracking gradient shrinks).
 
 v14d reference: ep30 achieved 81.7% f01, arr=214, post=91.5%.
 """
@@ -88,14 +82,14 @@ STABLE_PHASE_STEPS = N_TOP
 # State-conditional f_extra will emerge naturally via trunk learning.
 W_F_POS_ONLY_TOP = 0.0
 
-# Bottom-specific: two-episode f_net training (v14g).
+# Bottom-specific: two-episode f_net training (v14h).
 # Episode A — energy tracking with gate: blocks gradient at near-π (no upward push on fe@top).
 F_GATE_THRESH_BOT = 0.8   # same threshold as top; zeroes f_extra when near_pi > 0.8
 # Episode B — fe suppression: near-top start, w_f_pos_only, NO gate, detach_f_extra_for_qp.
 # Directly pushes fe@top → 0. QP is detached so no competing gradient. Acts ONLY at
 # near-π states (separate from episode A's non-π states). No gradient competition.
 N_FE_STEPS         = 5      # short near-top rollout; Q@top hold keeps states near π
-W_F_POS_ONLY_FE    = 2.0    # direct penalty on f_extra at near-π: near_goal × f_extra²
+W_F_POS_ONLY_FE    = 0.1    # gentle: allows fe@top ~2-3 in early training; was 2.0 (v14g)
 # Bottom q_profile: weak PUMP target everywhere. Prevents Q@mid tracking Q@top.
 # Equilibrium: 3×10×(Q-0.01) = 100×(Q-1.5) → Q@top≈1.156; Q@mid≈0.081.
 W_Q_PROFILE_BOT   = 10.0
@@ -115,7 +109,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum_v14g.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14h.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -195,13 +189,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14g{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14h{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14g",
+            "experiment": "mixed_curriculum_v14h",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -237,7 +231,7 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14g — f_gate_thresh in bottom (stable fe)")
+    out("  EXP: MIXED CURRICULUM v14h — gentle fe suppression (W_F_POS_ONLY_FE=0.1)")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
@@ -296,7 +290,7 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # v14g triple bottom loop — state-conditional f_extra:
+        # v14h triple bottom loop — state-conditional f_extra:
         #   A. Energy tracking (NO gate): f_net trains at ALL states, pushes fe@top up.
         #   B. Fe suppression (w_f_pos_only, detach_f, near-top start, separate Adam
         #      step): pushes fe@top down. Alternating A→B is stable equilibrium.
