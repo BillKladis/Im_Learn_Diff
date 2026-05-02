@@ -1,18 +1,21 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v14h: gentle fe suppression.
+"""exp_mixed_curriculum.py — Mixed curriculum v14i: w_f_pos_only in episode A.
 
-v14h = v14g with W_F_POS_ONLY_FE = 0.1 (was 2.0).
+v14i = remove separate episode B + add w_f_pos_only=0.2 to episode A.
 
-v14g failure (ep1-11, killed):
-  W_F_POS_ONLY_FE=2.0 suppressed fe@top to ~0.046 by ep2 — too fast, too early.
-  Energy tracking needs fe@top ~1-3 in early training for final push to π. With
-  fe@top≈0, L_bot stayed at 2.082 (same as v14f). The suppression episode won the
-  tug-of-war against energy tracking before f_net had time to learn the swing.
+v14g/v14h failure analysis:
+  Separate episode B fires unconditionally every epoch regardless of whether energy
+  tracking is working. W=2.0 (v14g) and W=0.1 (v14h) both suppressed fe@top to
+  ~0.046-0.103 before L_bot could decrease. Episode B has no self-regulating signal.
 
-v14h fix — reduce W_F_POS_ONLY_FE from 2.0 → 0.1:
-  Gentle suppression allows fe@top to stabilize at ~2-3 while L_bot decreases.
-  As Q@top grows (via top q_profile), Q itself provides hold near π → fe@top can
-  decrease gradually. The suppression signal strengthens RELATIVE to energy tracking
-  as training progresses (energy loss decreases → tracking gradient shrinks).
+v14i fix — put w_f_pos_only in episode A (same call as energy tracking):
+  Suppression only fires at near-π states ENCOUNTERED DURING THE SWING-UP ROLLOUT.
+  When the pendulum can't reach π (early training), near_pi≈0 everywhere → no
+  suppression → fe grows freely → energy tracking gets traction.
+  When the pendulum succeeds (late training), near_pi→1 for many steps → suppression
+  fires → fe@top decays. Self-regulating, exactly like v14d.
+
+  W=0.2 (vs v14d's W=0.5): feedback gain ≈ 0.2/0.5 × 1.1 = 0.44 < 1 → stable.
+  v14d oscillated at ep40+ (gain≈1.1). W=0.2 prevents this.
 
 v14d reference: ep30 achieved 81.7% f01, arr=214, post=91.5%.
 """
@@ -82,14 +85,10 @@ STABLE_PHASE_STEPS = N_TOP
 # State-conditional f_extra will emerge naturally via trunk learning.
 W_F_POS_ONLY_TOP = 0.0
 
-# Bottom-specific: two-episode f_net training (v14h).
-# Episode A — energy tracking with gate: blocks gradient at near-π (no upward push on fe@top).
-F_GATE_THRESH_BOT = 0.8   # same threshold as top; zeroes f_extra when near_pi > 0.8
-# Episode B — fe suppression: near-top start, w_f_pos_only, NO gate, detach_f_extra_for_qp.
-# Directly pushes fe@top → 0. QP is detached so no competing gradient. Acts ONLY at
-# near-π states (separate from episode A's non-π states). No gradient competition.
-N_FE_STEPS         = 5      # short near-top rollout; Q@top hold keeps states near π
-W_F_POS_ONLY_FE    = 0.1    # gentle: allows fe@top ~2-3 in early training; was 2.0 (v14g)
+# Bottom-specific: w_f_pos_only in episode A (v14i).
+# Self-regulating: only fires at near-π states encountered during the swing-up rollout.
+# W=0.2 < v14d's 0.5 → feedback gain ≈ 0.44 < 1 → no ep40+ oscillation.
+W_F_POS_ONLY_BOT   = 0.2    # in-episode-A penalty; was 0.5 in v14d (oscillated ep40+)
 # Bottom q_profile: weak PUMP target everywhere. Prevents Q@mid tracking Q@top.
 # Equilibrium: 3×10×(Q-0.01) = 100×(Q-1.5) → Q@top≈1.156; Q@mid≈0.081.
 W_Q_PROFILE_BOT   = 10.0
@@ -109,7 +108,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum_v14h.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14i.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -189,20 +188,18 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14h{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14i{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14h",
+            "experiment": "mixed_curriculum_v14i",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
             "w_q_profile_bot": W_Q_PROFILE_BOT,
-            "f_gate_thresh_bot": F_GATE_THRESH_BOT,
-            "w_f_pos_only_fe": W_F_POS_ONLY_FE,
-            "n_fe_steps": N_FE_STEPS,
+            "w_f_pos_only_bot": W_F_POS_ONLY_BOT,
             "n_q_profile_steps": N_Q_PROFILE_STEPS,
             "pump":  PUMP,
             "stable": STABLE,
@@ -231,15 +228,13 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14h — gentle fe suppression (W_F_POS_ONLY_FE=0.1)")
+    out("  EXP: MIXED CURRICULUM v14i — w_f_pos_only=0.2 in episode A (self-regulating)")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
     out(f"  Bottom A: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"NO gate → full trajectory gradient on f_net")
-    out(f"  Bottom B: {N_FE_STEPS} steps × {N_BOTTOM_PER_TOP}/meta | near-top start | "
-        f"w_f_pos_only={W_F_POS_ONLY_FE} | detach_f_extra | NO gate → fe@top suppressed")
-    out(f"  Bottom C: {N_Q_PROFILE_STEPS} steps × {N_BOTTOM_PER_TOP}/meta | "
+        f"w_f_pos_only={W_F_POS_ONLY_BOT} | self-regulating: only fires when near π")
+    out(f"  Bottom B: {N_Q_PROFILE_STEPS} steps × {N_BOTTOM_PER_TOP}/meta | "
         f"optimizer_q | PUMP everywhere | w_q_profile_bot={W_Q_PROFILE_BOT}")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
         f"near_pi_power={Q_NEAR_PI_POWER} | detach_f=True | w_stable={W_STABLE_PHASE}")
@@ -290,41 +285,26 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # v14h triple bottom loop — state-conditional f_extra:
-        #   A. Energy tracking (NO gate): f_net trains at ALL states, pushes fe@top up.
-        #   B. Fe suppression (w_f_pos_only, detach_f, near-top start, separate Adam
-        #      step): pushes fe@top down. Alternating A→B is stable equilibrium.
-        #      No same-backward-pass conflict (unlike v14d where both were one call).
-        #   C. Short q_profile (optimizer_q, PUMP): Q@mid control.
+        # v14i bottom loop — w_f_pos_only in episode A (self-regulating, like v14d):
+        #   A. Energy tracking + w_f_pos_only: suppression only fires when pendulum
+        #      reaches π in the rollout. Self-regulating: no fe suppression when stuck.
+        #   B. Short q_profile (optimizer_q, PUMP): Q@mid control.
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
-            # A. Energy tracking — full trajectory, all states (no gate)
+            # A. Energy tracking + in-call fe suppression (self-regulating)
             loss_b, _ = train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
+                w_f_pos_only=W_F_POS_ONLY_BOT,
                 external_optimizer=optimizer_f,
                 restore_best=False,
             )
             L_bot_last = loss_b[0] if loss_b else float("nan")
 
-            # B. Fe suppression — f_net trains at near-π; w_f_pos_only, NO gate
-            x0_fe = sample_top(device)
-            train_module.train_linearization_network(
-                lin_net=model, mpc=mpc,
-                x0=x0_fe, x_goal=x_goal, demo=demo_top,
-                num_steps=N_FE_STEPS, num_epochs=1, lr=LR,
-                track_mode="cos_q1",
-                detach_gates_Q_for_qp=True,
-                detach_f_extra_for_qp=True,
-                w_f_pos_only=W_F_POS_ONLY_FE,
-                external_optimizer=optimizer_f,
-                restore_best=False,
-            )
-
-            # C. Short q_profile — trains q_net with PUMP target at all states
+            # B. Short q_profile — trains q_net with PUMP target at all states
             train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
