@@ -1,50 +1,35 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v9: swing-up + hold, fully learned.
+"""exp_mixed_curriculum.py — Mixed curriculum v11: swing-up + hold, fully learned.
 
-GRADIENT SEPARATION ARCHITECTURE (v9):
-  Bottom episode → f_head only (detach_gates_Q_for_qp=True, no w_q_profile)
-  Top episode    → q_head only (detach_f_extra_for_qp=True) + direct f_extra
-                   suppression via w_f_pos_only (teaches f_head to zero near-π)
+v11 = v9b (explicit PUMP constraint in bottom) + F_EXTRA_BOUND=2.0 (QP stability fix).
 
-v7 failure post-mortem:
-  Epoch 6: pendulum first swings up to near-π in bottom episode.
-  w_q_profile=100 fires with target=STABLE=[1.5,...] → massive Q gradient.
-  Q gates jump from 0.015 → 0.077 in one step → Q-dominated MPC → chaotic L_bot.
+Failure history:
+  v7:  w_q_profile in bottom with STABLE target → Q explosion at epoch 7.
+  v8:  detach_gates_Q_for_qp=True, no w_q_profile → Q@bot drifts from trunk bleed.
+  v8b: same as v8 — L_bot=0.021 @ep10 but QP instability (fe@top=13.3) @ep26.
+  v9:  w_q_profile=100 STABLE in bottom (state_phase) → Q explosion epoch 7 (direct path).
+  v9b: w_q_profile=100 PUMP in bottom → Q grew to 1.087 then CRASHED @ep26:
+       fe@top=13.3 with F_EXTRA_BOUND=3.0 → "Solved/Inaccurate" → Q collapse.
+  v10: w_q_profile=100 NEUTRAL in bottom → trunk interference froze fe@bot @3.7.
+  v10b: no w_q_profile in bottom (v8b-style) + F_EXTRA_BOUND=2.0 → f01=4.5% @ep10,
+        but Q@bot grew 0.015→1.307 from trunk bleed-through → L_bot exploded @ep28.
 
-v8 root fix: detach_gates_Q_for_qp=True in bottom → Q cannot be trained by
-  track_loss (the explosive path). Q gates stayed stable through epoch 10+.
+v11 root fix: add explicit PUMP constraint back to bottom (prevents trunk drift),
+  AND cap F_EXTRA_BOUND=2.0 (prevents QP instability that killed v9b).
+  PUMP target (0.01) in bottom has near-zero gradient at start (gate≈0.015→0.01),
+  causing minimal trunk interference (gradient ~1/step vs 200/step for NEUTRAL).
+  This was confirmed in v9b where fe@bot grew healthily to 7.25 @ep8 with PUMP.
 
-v8b failure (epoch 20-30): no w_q_profile in bottom means Q@bot drifts up
-  as top-episode Q training bleeds through shared weights. Q@bot grew from
-  0.015→0.627 (epoch 27), then oscillated 0.627→0.463→0.298. Large Q@bot
-  competes with f_extra in bottom episode → L_bot degraded from 0.025→0.162.
+GRADIENT SEPARATION ARCHITECTURE (v11):
+  Bottom episode → f_head (energy tracking QP) + q_head direct (PUMP target)
+    detach_gates_Q_for_qp=True: blocks track_loss→QP→q_head explosive path
+    w_q_profile=100, PUMP target: constrains Q@bot to 0.01 via direct penalty
+  Top episode → q_head (cos_q1 QP + STABLE target) + q_head direct (STABLE)
+    detach_f_extra_for_qp=True: blocks QP→f_head gradient in top episode
 
-v9 fix: add w_q_profile back to BOTTOM episode WITH detach_gates_Q_for_qp=True.
-  This gives q_head a DIRECT gradient from the bottom episode (not through QP).
-  The direct penalty constrains Q@bot to PUMP at states visited in the bottom.
-  No explosion risk: the track_loss→q_head path is BLOCKED by detach_gates_Q.
-  Only w_q_profile's direct ∂(gate-target)²/∂q_head path reaches q_head.
-
-Result: q_head gets state-conditional training:
-  Bottom episode → PUMP target at q1=0 states (constrain Q@bot to 0.01)
-  Top episode   → STABLE target at q1=π states (push Q@top to 1.5)
-  Both via direct w_q_profile gradient, no track_loss contamination.
-
-PHILOSOPHY:
-  No frozen modules. No hand-tuned gate formulas. No delta_Q corrections.
-  Mixed curriculum: N_BOTTOM_PER_TOP bottom episodes + 1 top episode per
-  meta-epoch, all through train_linearization_network() with shared AdamW.
-
-  BOTTOM episode (x0=[0,0,0,0]):
-    track_mode="energy" + detach_gates_Q_for_qp=True + w_q_profile=100
-    → f_head learns resonant energy pumping via QP gradient (detach blocks Q path)
-    → q_head: direct w_q_profile gradient (PUMP target at bottom) — stable Q@bot
-
-  TOP episode (x0 near π, random perturbation):
-    track_mode="cos_q1" + w_q_profile=100 + detach_f_extra_for_qp=True
-    + w_f_pos_only=0.5 + f_gate_thresh=0.8 + w_stable_phase=3.0
-    → Q-head trained exclusively from top (hold via Q, stable profile)
-    → f_head: zero gradient from QP (detached), small gradient from w_f_pos_only
-    → f_gate_thresh: hard-zeros f_extra for QP near π (clean feedforward)
+State-conditional Q learning:
+  Bottom states (q1≈0) → PUMP target → Q@bot stays near 0.01
+  Top states   (q1≈π) → STABLE target → Q@top grows toward 1.5
+  Trunk learns to distinguish hanging vs near-π states.
 """
 
 import math
@@ -76,7 +61,7 @@ CONTROL_DIM = 2
 HIDDEN_DIM      = 128
 GATE_RANGE_Q    = 0.99
 GATE_RANGE_R    = 0.20
-F_EXTRA_BOUND   = 2.0   # reduced 3→2: prevents fe saturation and QP instability
+F_EXTRA_BOUND   = 2.0   # v9b used 3.0 → QP instability @ep26; 2.0 caps fe safely
 F_KICKSTART_AMP = 1.0
 Q_BIAS_Q1       = -3.0
 
@@ -91,12 +76,8 @@ WEIGHT_DECAY     = 1e-4
 W_Q_PROFILE = 100.0
 PUMP    = [0.01, 0.01, 1.0, 1.0]  # at bottom states: small Q → f_extra pumps
 STABLE  = [1.5,  1.5,  1.0, 1.0]  # at top states (top episode): strong Q → hold
-NEUTRAL = [1.0,  1.0,  1.0, 1.0]  # at top states (bottom episode): neutral Q
-# Bottom episode uses PUMP→NEUTRAL (state_phase=True): targets PUMP at bottom,
-# NEUTRAL at transient near-π. This prevents the collapse seen in v9b where
-# PUMP target at near-π in bottom fought top's STABLE target 3:1 (N_BOTTOM_PER_TOP=3).
-# Gradient equilibrium with NEUTRAL: Q* ≈ 1.23 (vs 0.69 with PUMP at top).
-# Top episode uses PUMP→STABLE (state_phase=True): trains Q@top toward STABLE.
+# Bottom uses PUMP at ALL states (q_stable=PUMP, so state_phase doesn't matter).
+# Top uses PUMP→STABLE (state_phase=True): PUMP at non-π states, STABLE at π.
 
 # Top-specific: hold loss applied on ALL steps of top episode
 W_STABLE_PHASE     = 3.0
@@ -202,13 +183,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v10b{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v11{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.LinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v10",
+            "experiment": "mixed_curriculum_v11",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -239,15 +220,15 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v10b — v8b-style bottom + F_EXTRA_BOUND=2.0")
+    out("  EXP: MIXED CURRICULUM v11 — v9b + F_EXTRA_BOUND=2.0")
     out(f"  device: {device}")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"detach_Q=True, no w_q_profile (F_EXTRA_BOUND={F_EXTRA_BOUND})")
+        f"detach_Q=True, w_q={W_Q_PROFILE} PUMP constraint (F_EXTRA_BOUND={F_EXTRA_BOUND})")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
         f"detach_f=True | w_stable={W_STABLE_PHASE}")
-    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, BOTH episodes)")
-    out(f"  q_head: bottom→PUMP constraint, top→STABLE target (both via direct penalty)")
-    out(f"  f_head: bottom QP path only (track_loss→f_extra, detach blocks Q)")
+    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional)")
+    out(f"  q_head: bottom→PUMP direct, top→STABLE direct; detach_Q blocks QP→q_head")
+    out(f"  f_head: bottom QP path only (detach_Q); top QP path blocked (detach_f)")
     out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
     out("=" * 80)
 
@@ -288,15 +269,13 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # Pure energy tracking — no w_q_profile in bottom (v8b-style).
-        # The w_q_profile in bottom was tried in v9/v9b/v10 but each version
-        # either caused Q explosion (v9: STABLE fired at near-pi transient states)
-        # or Q collapse (v9b: PUMP target fought top's STABLE 3:1 via N_BOTTOM_PER_TOP)
-        # or trunk interference from NEUTRAL target that froze fe@bot (v10).
-        # Conclusion: bottom episode is best kept clean — energy tracking only.
-        # Q@bot drift (v8b: 0.015→0.627) is tolerable since drift is slow and
-        # swing-up still works (arr≈179-245 at epoch 10 before drift causes issues).
-        # F_EXTRA_BOUND=2.0 prevents fe saturation and QP instability (the v9b killer).
+        # Energy tracking + explicit PUMP constraint on q_head (v11 = v9b approach).
+        # detach_gates_Q_for_qp=True blocks the explosive track_loss→QP→q_head path.
+        # w_q_profile (PUMP target) provides a direct gradient: q_head → PUMP=0.01.
+        # PUMP target: gradient = 2×100×(0.01-0.01)≈0 initially → minimal trunk
+        # interference. This was verified in v9b where fe@bot grew healthily to 7.25.
+        # Without this constraint (v10b), Q@bot drifts 0.015→1.307 via trunk bleed
+        # from top episode, causing L_bot explosion at epoch 28.
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
             loss_b, _ = train_module.train_linearization_network(
@@ -305,6 +284,10 @@ def main():
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
+                w_q_profile=W_Q_PROFILE,
+                q_profile_pump=PUMP,
+                q_profile_stable=PUMP,       # always PUMP — no state-phase escalation
+                q_profile_state_phase=True,
                 external_optimizer=optimizer,
                 restore_best=False,
             )
