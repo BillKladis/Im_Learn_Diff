@@ -1,21 +1,21 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v14j: reduced w_f_pos_only for faster swing-up.
+"""exp_mixed_curriculum.py — Mixed curriculum v14k: gated eval rollout.
 
-v14j = v14i with W_F_POS_ONLY_BOT = 0.05 (was 0.2).
+v14k = v14j + f_gate_thresh=0.8 applied during eval2k rollout.
 
-v14i plateau analysis (ep20-79, stuck at 87% f01):
-  f01 ≈ (1 - arr/2000) × post. With post≈98%, to get 87% needs arr≈236 steps.
-  Root cause: w_f_pos_only=0.2 in episode A suppresses f_extra at near-π states,
-  but trunk_f is shared → trunk bleed suppresses fe@bot too (4.55 → 0.1 by ep30).
-  Weak fe@bot → slow swing-up → arr stuck at 236 → f01 plateaus at 87%.
-  To hit 90% f01 need arr ≤ 163. Requires ~4× stronger fe@bot.
+v14k plateau analysis (ep40-100, stuck at 88-89% f01):
+  Best was 88.6% at ep40/ep60. arr settled ~197 (vs v14i's 236). post~98.2%.
+  Residual fe@top~0.05-0.2 during eval perturbs hold at near-pi states.
+  Training uses f_gate_thresh=0.8 (top episode) so Q@top=1.5 learns to hold
+  without f_extra. But eval rollout called rollout() without gating → fe@top
+  adds noise → post capped at 98.2%, occasional drops to 91-95%.
 
-v14j fix — W_F_POS_ONLY_BOT = 0.05:
-  4× less trunk bleed to bottom states → fe@bot stabilizes ~4× higher (~0.4 vs 0.1).
-  fe@top suppression still active (same mechanism, just weaker → equilibrium at
-  fe@top ~0.2 instead of 0.05). Q@top=1.5 still provides hold.
-  Feedback gain = 0.05/0.2 × v14i_gain ≈ 0.25 × stable → still oscillation-free.
+v14k fix — apply f_gate_thresh=F_GATE_THRESH_TOP=0.8 in eval rollout:
+  eval2k passes f_gate_thresh=0.8 to rollout() → f_extra zeroed when near_pi>0.8.
+  Consistent with training: Q@top handles hold, f_extra only active at non-pi states.
+  Expected: post → 99.5%+, arr ~ 197 (unchanged), f01 ~ 89.7%.
+  rollout() gets new f_gate_thresh param (default 0.0, no existing callers affected).
 
-v14i reference: ep30 achieved 87.3% f01, arr=226, post=98.4%.
+v14k reference: ep40 achieved 88.6% f01, arr=197, post=98.2%.
 """
 
 import math
@@ -83,7 +83,7 @@ STABLE_PHASE_STEPS = N_TOP
 # State-conditional f_extra will emerge naturally via trunk learning.
 W_F_POS_ONLY_TOP = 0.0
 
-# Bottom-specific: w_f_pos_only in episode A (v14j).
+# Bottom-specific: w_f_pos_only in episode A (v14k).
 # Self-regulating: only fires at near-π states encountered during the swing-up rollout.
 # W=0.05: 4× less trunk bleed to fe@bot → faster swing-up → lower arr → higher f01.
 # v14i (W=0.2): fe@bot suppressed to 0.1, arr stuck at 236, f01 plateaued at 87%.
@@ -107,7 +107,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum_v14j.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14k.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -170,6 +170,7 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
     model.eval()
     x_t, _ = train_module.rollout(
         lin_net=model, mpc=mpc, x0=x0, x_goal=x_goal, num_steps=steps,
+        f_gate_thresh=F_GATE_THRESH_TOP,
     )
     traj  = x_t.cpu().numpy()
     wraps = np.array([
@@ -187,13 +188,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14j{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14k{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14j",
+            "experiment": "mixed_curriculum_v14k",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -227,7 +228,7 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14j — w_f_pos_only=0.05 (less trunk bleed → faster swing-up)")
+    out("  EXP: MIXED CURRICULUM v14k — gated eval (f_gate_thresh=0.8 in rollout)")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
@@ -284,7 +285,7 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # v14j bottom loop — w_f_pos_only=0.05 in episode A (less trunk bleed to fe@bot):
+        # v14k bottom loop — w_f_pos_only=0.05 in episode A (less trunk bleed to fe@bot):
         #   A. Energy tracking + w_f_pos_only: suppression only fires when pendulum
         #      reaches π in the rollout. Self-regulating: no fe suppression when stuck.
         #   B. Short q_profile (optimizer_q, PUMP): Q@mid control.

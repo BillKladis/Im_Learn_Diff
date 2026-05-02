@@ -939,6 +939,7 @@ def rollout(
     x0:        torch.Tensor,
     x_goal:    torch.Tensor,
     num_steps: int,
+    f_gate_thresh: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     n_x = x0.shape[0]
@@ -987,6 +988,11 @@ def rollout(
             min=mpc.MPC_dynamics.u_min.unsqueeze(0),
             max=mpc.MPC_dynamics.u_max.unsqueeze(0),
         )
+
+        if f_gate_thresh > 0.0 and f_extra is not None:
+            _near_pi = (1.0 + torch.cos(x[0] - x_goal[0])) / 2.0
+            _zf = ((_near_pi - f_gate_thresh) / max(1e-8, 1.0 - f_gate_thresh)).clamp(0.0, 1.0)
+            f_extra = f_extra * (1.0 - _zf)
 
         extra_ctrl = f_extra.reshape(-1) if f_extra is not None else None
 
