@@ -1,33 +1,29 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v12: sharper Q-profile + sin/cos input.
+"""exp_mixed_curriculum.py — Mixed curriculum v13: separated f_net / q_net.
 
-v12 = v11 + two fixes for the Q@mid limit-cycle failure:
+v13 = v12 + architectural fix for Q@mid limit-cycle failure:
 
-v11 failure (ep23-36 oscillation):
-  Q@top grew to 1.508 (ep23) but Q@mid also grew to 0.855 via trunk bleed-through.
-  Q@mid=0.855 × Q_base[0]=12 = 10.3 → MPC resists leaving hanging → L_bot=1.794.
-  Swing-up breaks → Q@mid/Q@top collapse → recover → repeat (limit cycle ~15 ep).
+v12 post-mortem (aborted at ep 9):
+  Q@mid=0.077 by epoch 9 (vs v11's 0.023 at same epoch).
+  sin/cos input made Q@top learn faster (0.165 at ep9 vs 0.023 in v11), but the
+  SHARED trunk still bled Q@top gradients to Q@mid — sin/cos just accelerated bleed.
+  power=4 weakened top's q_profile gradient at π/2 (0.103 vs 0.755) but Q@top's
+  faster growth meant the bleed was stronger despite the weaker target.
 
-  Root cause 1: top episode visits π/2 states when pendulum fails to hold.
-    State-conditional target at π/2: near_pi=0.5 → target=0.5×1.5+0.5×0.01=0.755.
-    When Q@mid≈0.01, top gradient = 2×100×(0.01-0.755)=-149 (strong push up).
-    Bottom's PUMP gradient at π/2 = 2×100×(0.01-0.01)≈0 (at its own target, silent).
-    → Top wins unopposed, Q@mid grows unchecked.
+v11/v12 root cause (architectural):
+  Single LinearizationNetwork trunk shared by f_head, r_head, q_head.
+  Energy-tracking loss → trunk → q_head: Q@mid grows whenever pendulum visits π/2.
+  No target-side fix can fully prevent this; the gradient path goes through trunk.
 
-  Root cause 2: shared trunk can't separate π/2 features from π features.
-    cos(q1) similarity: cos(π/2)=0, cos(π)=-1 — numerically close enough to confuse
-    trunk representations, bleeding STABLE training into Q@mid behavior.
-
-Fix 1 — Sharper near_pi (q_profile_near_pi_power=4 in top):
-  near_pi = ((1+cos(q1-π))/2)^4
-  At π/2: 0.5^4 = 0.0625 → target = 0.0625×1.5 + 0.9375×0.01 ≈ 0.103 (was 0.755)
-  Top's Q@mid gradient: 2×100×(0.01-0.103) = -18.6 (vs -149 before) — 8× weaker.
-  Bottom's PUMP gradient now dominates at π/2 → Q@mid stays near PUMP.
-
-Fix 2 — Goal-centred sin/cos input (use_sincos=True):
-  Replace [q1,dq1,q2,dq2] → [sin(q1-π), cos(q1-π), dq1/8, sin(q2), cos(q2), dq2/8].
-  cos(q1-π) = +1 at goal (π), -1 at hanging (0), 0 at π/2.
-  The trunk now sees an EXPLICIT near-goal signal — no need to learn it from raw angle.
-  This sharpens the trunk's state-conditional representations for q_head.
+Fix — SeparatedLinearizationNetwork (v13):
+  f_net (trunk_f → f_head + r_head): only energy-tracking gradients reach trunk_f.
+  q_net (trunk_q → q_head only):     only q_profile gradients reach trunk_q.
+  ZERO trunk bleed between f_head and q_head by construction.
+  Q@mid is trained only by q_profile:
+    - Bottom: target=PUMP=0.01 at all states (3× per top).
+    - Top:    target=0.103 at π/2 (power=4, still kept for safety).
+  Bottom runs 3× per top; at π/2 bottom's gradient is ≈0 (already at target).
+  Top's weak gradient (−18.6) is unopposed but Q@mid stays low because q_net
+  trunk learns a sharp state space from sin/cos — π/2 and π are clearly distinct.
 """
 
 import math
@@ -62,11 +58,11 @@ GATE_RANGE_R    = 0.20
 F_EXTRA_BOUND   = 2.0   # v9b used 3.0 → QP instability @ep26; 2.0 caps fe safely
 F_KICKSTART_AMP = 1.0
 Q_BIAS_Q1       = -3.0
-USE_SINCOS      = True  # goal-centred representation: cos(q1-π)+1 near goal
+# SeparatedLinearizationNetwork always uses sin/cos input — no USE_SINCOS flag needed.
 
 # Top-episode near_pi sharpness: target = near_pi^power × STABLE + (1-near_pi^power) × PUMP
-# power=1: near_pi=0.5 at π/2 → target=0.755 (kills Q@mid in v11)
-# power=4: near_pi=0.06 at π/2 → target=0.103 (8× weaker, bottom PUMP wins)
+# power=4: near_pi^4=0.0625 at π/2 → target=0.103 (8× weaker than power=1's 0.755).
+# Kept even with separated networks: top's q_profile still directly trains q_net.
 Q_NEAR_PI_POWER = 4
 
 META_EPOCHS      = 200
@@ -187,13 +183,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v12{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
-    m = network_module.LinearizationNetwork(**model_class_kwargs).double()
+    name = f"stageF_mixed_v13{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v12",
+            "experiment": "mixed_curriculum_v13",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -224,15 +220,16 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v12 — sharper Q-profile + sin/cos input")
+    out("  EXP: MIXED CURRICULUM v13 — SeparatedLinearizationNetwork (f_net || q_net)")
     out(f"  device: {device}")
-    out(f"  Input: use_sincos={USE_SINCOS}  (cos(q1-π)+1 explicit near-goal signal)")
+    out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
+    out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
         f"detach_Q=True, w_q={W_Q_PROFILE} PUMP constraint (F_EXTRA_BOUND={F_EXTRA_BOUND})")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
         f"near_pi_power={Q_NEAR_PI_POWER} | detach_f=True | w_stable={W_STABLE_PHASE}")
-    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, sharp)")
-    out(f"  Near_pi@π/2: {0.5**Q_NEAR_PI_POWER:.4f} → target≈{0.5**Q_NEAR_PI_POWER*STABLE[0]+(1-0.5**Q_NEAR_PI_POWER)*PUMP[0]:.3f} (was 0.755 with power=1)")
+    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, power={Q_NEAR_PI_POWER})")
+    out(f"  Near_pi@π/2: {0.5**Q_NEAR_PI_POWER:.4f} → target≈{0.5**Q_NEAR_PI_POWER*STABLE[0]+(1-0.5**Q_NEAR_PI_POWER)*PUMP[0]:.3f}")
     out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
     out("=" * 80)
 
@@ -248,9 +245,8 @@ def main():
         horizon=HORIZON, hidden_dim=HIDDEN_DIM,
         gate_range_q=GATE_RANGE_Q, gate_range_r=GATE_RANGE_R,
         f_extra_bound=F_EXTRA_BOUND, f_kickstart_amp=F_KICKSTART_AMP,
-        use_sincos=USE_SINCOS,
     )
-    model = network_module.LinearizationNetwork(**model_kwargs).to(device).double()
+    model = network_module.SeparatedLinearizationNetwork(**model_kwargs).to(device).double()
     apply_q1_bias(model, Q_BIAS_Q1)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)

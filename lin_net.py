@@ -473,6 +473,105 @@ class LinearizationNetworkSC(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Separated network: f_net and q_net have independent trunks.
+# Eliminates trunk bleed-through: top-episode Q training never affects f_head.
+# ──────────────────────────────────────────────────────────────────────────
+class SeparatedLinearizationNetwork(nn.Module):
+    """Two independent sub-networks sharing only the forward() interface.
+
+    f_net  (state_encoder_f → trunk_f → f_head + r_head):
+      Trained by energy tracking gradient in bottom episode.
+      Gets zero gradient from top episode (detach_f_extra_for_qp=True).
+
+    q_net  (state_encoder_q → trunk_q → q_head):
+      Trained only by w_q_profile gradients (PUMP in bottom, STABLE in top).
+      Gets zero gradient from QP in bottom (detach_gates_Q_for_qp=True).
+
+    Result: no trunk bleed-through.  Q@mid stays near PUMP regardless of
+    how high Q@top grows, because q_net's trunk_q learns purely from the
+    q_profile signal and the two feature spaces never interfere.
+    """
+
+    def __init__(
+        self,
+        state_dim:        int,
+        control_dim:      int,
+        horizon:          int,
+        hidden_dim:       int   = 128,
+        gate_range_q:     float = 0.99,
+        gate_range_r:     float = 0.20,
+        f_extra_bound:    float = 2.0,
+        f_kickstart_amp:  float = 1.0,
+        gate_range_qf:    float = 0.0,
+    ):
+        super().__init__()
+        self.state_dim    = state_dim
+        self.control_dim  = control_dim
+        self.horizon      = horizon
+        self.gate_range_q = gate_range_q
+        self.gate_range_r = gate_range_r
+        self.f_extra_bound = f_extra_bound  # accessed by Simulate.py
+
+        # Both sub-nets use goal-centred sin/cos input representation.
+        self.f_net = LinearizationNetwork(
+            state_dim=state_dim, control_dim=control_dim, horizon=horizon,
+            hidden_dim=hidden_dim, gate_range_q=gate_range_q,
+            gate_range_r=gate_range_r, f_extra_bound=f_extra_bound,
+            f_kickstart_amp=f_kickstart_amp, gate_range_qf=gate_range_qf,
+            use_sincos=True,
+        )
+        self.q_net = LinearizationNetwork(
+            state_dim=state_dim, control_dim=control_dim, horizon=horizon,
+            hidden_dim=hidden_dim, gate_range_q=gate_range_q,
+            gate_range_r=gate_range_r, f_extra_bound=f_extra_bound,
+            f_kickstart_amp=0.0,   # q_net produces Q gates, not f_extra
+            gate_range_qf=gate_range_qf,
+            use_sincos=True,
+        )
+
+        # Expose q_head at top level for apply_q1_bias() compatibility.
+        self.q_head = self.q_net.q_head
+
+        self.metadata = {
+            "state_dim":       state_dim,
+            "control_dim":     control_dim,
+            "hidden_dim":      hidden_dim,
+            "horizon":         horizon,
+            "gate_range_q":    gate_range_q,
+            "gate_range_r":    gate_range_r,
+            "gate_range_qf":   gate_range_qf,
+            "f_extra_bound":   f_extra_bound,
+            "f_kickstart_amp": f_kickstart_amp,
+            "use_sincos":      True,
+            "architecture":    "separated_fnet_qnet",
+            "created_date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def forward(
+        self,
+        x_sequence:  torch.Tensor,
+        q_base_diag: Optional[torch.Tensor] = None,
+        r_base_diag: Optional[torch.Tensor] = None,
+    ):
+        # gates_Q from q_net (only q_profile gradients ever reach q_net.trunk_q)
+        gates_Q, _, _, q_diags, _, gates_Qf = self.q_net(x_sequence, q_base_diag, r_base_diag)
+        # f_extra and gates_R from f_net (only energy-tracking gradients reach f_net.trunk_f)
+        _, gates_R, f_extra, _, r_diags, _ = self.f_net(x_sequence, q_base_diag, r_base_diag)
+        return gates_Q, gates_R, f_extra, q_diags, r_diags, gates_Qf
+
+    def save(self, filepath: str, metadata: Optional[Dict] = None):
+        parent = os.path.dirname(filepath)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if metadata:
+            self.metadata.update(metadata)
+        torch.save(
+            {"model_state_dict": self.state_dict(), "metadata": self.metadata},
+            filepath,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Recorder & ModelManager (unchanged from previous Stage D version)
 # ──────────────────────────────────────────────────────────────────────────
 class NetworkOutputRecorder:
