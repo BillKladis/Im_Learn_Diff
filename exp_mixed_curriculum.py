@@ -1,29 +1,25 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v14d: bottom q_profile + fe suppression.
+"""exp_mixed_curriculum.py — Mixed curriculum v14e: f_gate_thresh in bottom (stable fe).
 
-v14d = v14c + two fixes for the v14c limit cycle:
+v14e = v14d − w_f_pos_only_bot + f_gate_thresh_bot
 
-FIX 1 — Q@mid tracks Q@top (intra-q_net trunk bleed):
-  v14c gave q_net ZERO gradient from bottom, so trunk_q learned only from top.
-  Top's STABLE training at near-π propagates to ALL states (including π/2) via
-  the shared trunk_q, causing Q@mid to track Q@top → same limit cycle as v11.
-  Fix: add a short q_profile call in bottom loop (optimizer_q, N_Q_PROFILE_STEPS=5,
-  target=PUMP everywhere). Equilibrium at π:
-    3×W_Q_BOT×(Q-PUMP) = W_Q_TOP×(Q-STABLE) →  Q@top ≈ 1.156 (vs 1.5 in v14c)
-    At π/2 (near_pi^4=0.0625): Q@mid ≈ 0.081   (Q@top is 14× larger → swing-up safe)
-  Also: optimizer_q now gets 4 real gradient steps/meta-epoch (vs 1 in v14c),
-  eliminating the zero-grad Adam dilution.
+v14d result (ep1-49, killed):
+  ep30: f01=81.7%, arr=214, post=91.5% ← BEST RESULT EVER. Q@mid=0.010, Q@top=1.206.
+  ep40+: f01=0.0%. Self-correction worked but f_extra became chaotic.
 
-FIX 2 — fe@top growing toward clip ceiling:
-  v14c: fe@top reached 9-11 (clip ceiling = 11.18), causing QP instability.
-  f_net was never told to suppress f_extra at near-π states in the bottom loop.
-  Fix: add w_f_pos_only=W_F_POS_ONLY_BOT=0.5 to bottom energy-tracking call
-  (optimizer_f, NO f_gate_thresh — must penalise raw f_extra, not gated zero).
-  This directly penalises near_goal × f_extra², teaching f_net to output small
-  f_extra at top states. Expected fe@top << fe@bot after convergence.
+v14d failure mode — chaotic fe oscillation:
+  w_f_pos_only in bottom competes with energy tracking near π. When the swing-up
+  succeeds and the pendulum reaches π, energy tracking wants large f_extra at π
+  (to stay inverted). w_f_pos_only wants zero. The competition is transmitted
+  through trunk_f to ALL states including bottom, making fe@bot oscillate wildly
+  (0.033 to 0.418). At ep45: fe@bot=0.033, fe@top=0.104 — inverted! Swing-up fails.
 
-v14c result (ep1-31, killed at limit cycle):
-  ep10: f01=4.5%, arr=216. ep20: f01=0.0%, arr=169. ep30: f01=0.0%, arr=None.
-  Q@mid tracked Q@top throughout: Q@mid=1.235, Q@top=1.258 at ep27. Same as v11.
+Fix (v14e) — f_gate_thresh in bottom instead of w_f_pos_only:
+  f_gate_thresh ZEROES f_extra at near-π states without providing any gradient to
+  f_net at those states. Energy tracking gradient at near-π is blocked (f_extra=0 →
+  no QP contribution → no gradient path to f_net near π). The hold at near-π in
+  the bottom rollout is maintained by detached Q@top=1.4 (QP still uses Q gates even
+  when detached). Weight decay naturally shrinks fe@top; f_net only gets energy-
+  tracking gradient at far-from-π states (q1=0 to ~2.5 rad). Stable fe@bot guaranteed.
 """
 
 import math
@@ -91,11 +87,13 @@ STABLE_PHASE_STEPS = N_TOP
 # State-conditional f_extra will emerge naturally via trunk learning.
 W_F_POS_ONLY_TOP = 0.0
 
-# Bottom-specific: fe suppression + q_profile in bottom loop (v14d).
-# w_f_pos_only=0.5 in bottom energy-tracking call: penalises near_goal × f_extra²,
-# teaches f_net to output small f_extra at near-π states. NO f_gate_thresh here —
-# Simulate.py applies w_f_pos_only to gated f_extra; if gated to 0 the penalty vanishes.
-W_F_POS_ONLY_BOT  = 0.5
+# Bottom-specific: fe suppression via gating (v14e).
+# f_gate_thresh in bottom energy-tracking call ZEROES f_extra at near-π states
+# without ANY gradient signal to f_net near π. No chaotic energy-tracking vs
+# w_f_pos_only competition. Hold at near-π in bottom is maintained by detached
+# Q@top in the QP (Q gates still used even when detached from gradient).
+# Weight decay naturally shrinks fe@top; fe@bot is stable (energy tracking at q1≈0).
+F_GATE_THRESH_BOT = 0.8   # same threshold as top; zeroes f_extra when near_pi > 0.8
 # Bottom q_profile: weak PUMP target everywhere. Prevents Q@mid tracking Q@top.
 # Equilibrium: 3×10×(Q-0.01) = 100×(Q-1.5) → Q@top≈1.156; Q@mid≈0.081.
 W_Q_PROFILE_BOT   = 10.0
@@ -115,7 +113,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum_v14d.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14e.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -195,18 +193,18 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14d{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14e{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14d",
+            "experiment": "mixed_curriculum_v14e",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
             "w_q_profile_bot": W_Q_PROFILE_BOT,
-            "w_f_pos_only_bot": W_F_POS_ONLY_BOT,
+            "f_gate_thresh_bot": F_GATE_THRESH_BOT,
             "n_q_profile_steps": N_Q_PROFILE_STEPS,
             "pump":  PUMP,
             "stable": STABLE,
@@ -235,12 +233,12 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14d — bottom q_profile + fe@top suppression")
+    out("  EXP: MIXED CURRICULUM v14e — f_gate_thresh in bottom (stable fe)")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"detach_Q=True | w_f_pos_only={W_F_POS_ONLY_BOT} (no f_gate_thresh)")
+        f"detach_Q=True | f_gate_thresh_bot={F_GATE_THRESH_BOT} (no gradient on f_net near π)")
     out(f"  Bottom q_profile: {N_Q_PROFILE_STEPS} steps × {N_BOTTOM_PER_TOP}/meta | "
         f"optimizer_q | PUMP everywhere | w_q_profile_bot={W_Q_PROFILE_BOT}")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
@@ -292,25 +290,27 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # v14d dual bottom loop per iteration:
-        #   1. Energy tracking (optimizer_f): trains f_net with fe@top suppression.
-        #      w_f_pos_only penalises near_goal×f_extra² → f_net learns small fe at π.
-        #      NO f_gate_thresh — Simulate.py applies w_f_pos_only to gated f_extra,
-        #      which is zero at top states → penalty vanishes. Must use raw f_extra.
+        # v14e dual bottom loop per iteration:
+        #   1. Energy tracking (optimizer_f): trains f_net with f_gate_thresh.
+        #      f_gate_thresh ZEROES f_extra at near-π states — no gradient on f_net
+        #      near π, eliminating the energy-tracking vs w_f_pos_only chaotic
+        #      competition that destabilised fe in v14d. Hold at near-π in bottom
+        #      is maintained by the detached Q@top in the QP (Q still used even
+        #      when detached from grad). Weight decay shrinks fe@top naturally.
         #   2. Short q_profile (optimizer_q): 5-step PUMP target at all states.
         #      Prevents Q@mid from tracking Q@top via trunk_q bleed.
         #      Equilibrium: Q@top≈1.156, Q@mid≈0.081 (vs equal in v14c).
-        #      Also fixes Adam dilution: optimizer_q gets 4 real steps/meta-epoch.
+        #      optimizer_q gets 4 real steps/meta-epoch.
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
-            # 1. Energy tracking — trains f_net only; suppresses fe@top
+            # 1. Energy tracking — trains f_net only; gate zeroes fe near π (no grad)
             loss_b, _ = train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
-                w_f_pos_only=W_F_POS_ONLY_BOT,
+                f_gate_thresh=F_GATE_THRESH_BOT,
                 external_optimizer=optimizer_f,
                 restore_best=False,
             )
@@ -333,8 +333,7 @@ def main():
 
         # ── Top episode: hold from near-top random start ───────────────
         # ONLY q_head trains via QP gradient (detach_f_extra_for_qp=True).
-        # f_head gets a SMALL direct gradient from w_f_pos_only to suppress
-        # f_extra near π — teaches state-conditional f_extra without QP coupling.
+        # f_head gets ZERO gradient from top (detach + gate). q_net trains freely.
         x0_top = sample_top(device)
         loss_t, _ = train_module.train_linearization_network(
             lin_net=model, mpc=mpc,
