@@ -244,6 +244,7 @@ def train_linearization_network(
     q_profile_pump:     Optional[List[float]] = None,    # default [0.01,1,1,1]
     q_profile_stable:   Optional[List[float]] = None,    # default [1,1,1,1]
     q_profile_state_phase: bool = False,   # blend pump↔stable from cos(q1)
+    q_profile_near_pi_power: float = 1.0, # raise near_pi to this power for sharper cutoff
     # Same idea for the network's Qf-head (terminal cost gates). Pump-phase
     # target should be small (don't penalise terminal state away from upright
     # while still pumping), stable-phase target should be ~1 (full Qf cost
@@ -539,6 +540,8 @@ def train_linearization_network(
                 if q_profile_state_phase:
                     near_goal = (1.0 + torch.cos(current_state_detached[0] - x_goal[0])) / 2.0
                     near_goal = torch.clamp(near_goal, 0.0, 1.0)
+                    if q_profile_near_pi_power != 1.0:
+                        near_goal = near_goal ** q_profile_near_pi_power
                     target = (1.0 - near_goal) * q_profile_pump_t + near_goal * q_profile_stable_t
                 else:
                     target = q_profile_pump_t if step < phase_split_step else q_profile_stable_t

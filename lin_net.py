@@ -50,11 +50,18 @@ class LinearizationNetwork(nn.Module):
         # raw of 0 → gate of 1.0 (network can still default to "no
         # change"). Same pattern as gates_Q.
         gate_range_qf:    float = 0.0,
+        # Goal-centred sin/cos input representation.
+        # Replaces [q1,dq1,q2,dq2] → [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8].
+        # cos(q1-π)≈+1 at the goal (inverted), ≈-1 at hanging — makes the
+        # near-goal region explicit to the trunk without any learned mapping.
+        # Only valid for the double-pendulum (state_dim=4, 2 angle dims).
+        use_sincos:       bool  = False,
     ):
         super().__init__()
         self.state_dim   = state_dim
         self.control_dim = control_dim
         self.hidden_dim  = hidden_dim
+        self.use_sincos  = use_sincos
         self.horizon     = horizon
 
         for name, value in (
@@ -77,12 +84,21 @@ class LinearizationNetwork(nn.Module):
         self.f_kickstart_amp = f_kickstart_amp
 
         # ── Input branch ────────────────────────────────────────────────────
-        state_input_dim = 5 * state_dim
+        # With use_sincos the 4-D state expands to 6-D per frame:
+        #   [q1,dq1,q2,dq2] → [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]
+        # The sin/cos values are already in [-1,1]; velocities are pre-divided by 8.
+        obs_dim         = 6 if use_sincos else state_dim
+        state_input_dim = 5 * obs_dim
         enc_dim         = hidden_dim
 
-        state_scale = torch.tensor(
-            [math.pi, 8.0, math.pi, 8.0], dtype=torch.float64
-        ).repeat(5)
+        if use_sincos:
+            # sin/cos outputs are in [-1,1]; no further scaling needed.
+            # Store a ones buffer so code paths that reference state_scale still work.
+            state_scale = torch.ones(state_input_dim, dtype=torch.float64)
+        else:
+            state_scale = torch.tensor(
+                [math.pi, 8.0, math.pi, 8.0], dtype=torch.float64
+            ).repeat(5)
         self.register_buffer("state_scale", state_scale)
 
         self.state_encoder = nn.Sequential(
@@ -137,6 +153,7 @@ class LinearizationNetwork(nn.Module):
             "gate_range_qf":   gate_range_qf,
             "f_extra_bound":   f_extra_bound,
             "f_kickstart_amp": f_kickstart_amp,
+            "use_sincos":      use_sincos,
             "architecture":    "stage_d_three_head_qrf_kickstart",
             "created_date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -189,8 +206,25 @@ class LinearizationNetwork(nn.Module):
         q_base_diag: Optional[torch.Tensor] = None,
         r_base_diag: Optional[torch.Tensor] = None,
     ):
-        x_flat   = x_sequence.reshape(-1)
-        x_normed = x_flat / self.state_scale
+        if self.use_sincos:
+            # x_sequence: [5, 4] = [q1, dq1, q2, dq2]
+            q1  = x_sequence[:, 0:1]
+            dq1 = x_sequence[:, 1:2]
+            q2  = x_sequence[:, 2:3]
+            dq2 = x_sequence[:, 3:4]
+            x_obs = torch.cat([
+                torch.sin(q1 - math.pi),   # 0 at goal and hanging; ±1 at ±π/2
+                torch.cos(q1 - math.pi),   # +1 at goal (q1=π); -1 at hanging (q1=0)
+                dq1 / 8.0,
+                torch.sin(q2),
+                torch.cos(q2),
+                dq2 / 8.0,
+            ], dim=-1)  # [5, 6]
+            x_flat   = x_obs.reshape(-1)   # [30], already in [-1,1] range
+            x_normed = x_flat              # state_scale is ones when use_sincos=True
+        else:
+            x_flat   = x_sequence.reshape(-1)
+            x_normed = x_flat / self.state_scale
         state_emb = self.state_encoder(x_normed)
         features  = self.trunk(state_emb)
 
@@ -239,9 +273,10 @@ class LinearizationNetwork(nn.Module):
             horizon         = metadata.get("horizon",         10),
             gate_range_q    = metadata.get("gate_range_q",    0.95),
             gate_range_r    = metadata.get("gate_range_r",    0.20),
-            gate_range_qf   = metadata.get("gate_range_qf",   0.0),  # 0 for back-compat
+            gate_range_qf   = metadata.get("gate_range_qf",   0.0),   # 0 for back-compat
             f_extra_bound   = metadata.get("f_extra_bound",   3.0),
-            f_kickstart_amp = metadata.get("f_kickstart_amp", 0.0),  # 0 for back-compat
+            f_kickstart_amp = metadata.get("f_kickstart_amp", 0.0),   # 0 for back-compat
+            use_sincos      = metadata.get("use_sincos",      False),  # False for back-compat
         )
         # strict=False so old checkpoints without qf_head weights load cleanly;
         # the qf_head will keep its random init (output ~ 0 → gates_Qf ~ 1).

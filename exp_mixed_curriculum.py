@@ -1,35 +1,33 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v11: swing-up + hold, fully learned.
+"""exp_mixed_curriculum.py — Mixed curriculum v12: sharper Q-profile + sin/cos input.
 
-v11 = v9b (explicit PUMP constraint in bottom) + F_EXTRA_BOUND=2.0 (QP stability fix).
+v12 = v11 + two fixes for the Q@mid limit-cycle failure:
 
-Failure history:
-  v7:  w_q_profile in bottom with STABLE target → Q explosion at epoch 7.
-  v8:  detach_gates_Q_for_qp=True, no w_q_profile → Q@bot drifts from trunk bleed.
-  v8b: same as v8 — L_bot=0.021 @ep10 but QP instability (fe@top=13.3) @ep26.
-  v9:  w_q_profile=100 STABLE in bottom (state_phase) → Q explosion epoch 7 (direct path).
-  v9b: w_q_profile=100 PUMP in bottom → Q grew to 1.087 then CRASHED @ep26:
-       fe@top=13.3 with F_EXTRA_BOUND=3.0 → "Solved/Inaccurate" → Q collapse.
-  v10: w_q_profile=100 NEUTRAL in bottom → trunk interference froze fe@bot @3.7.
-  v10b: no w_q_profile in bottom (v8b-style) + F_EXTRA_BOUND=2.0 → f01=4.5% @ep10,
-        but Q@bot grew 0.015→1.307 from trunk bleed-through → L_bot exploded @ep28.
+v11 failure (ep23-36 oscillation):
+  Q@top grew to 1.508 (ep23) but Q@mid also grew to 0.855 via trunk bleed-through.
+  Q@mid=0.855 × Q_base[0]=12 = 10.3 → MPC resists leaving hanging → L_bot=1.794.
+  Swing-up breaks → Q@mid/Q@top collapse → recover → repeat (limit cycle ~15 ep).
 
-v11 root fix: add explicit PUMP constraint back to bottom (prevents trunk drift),
-  AND cap F_EXTRA_BOUND=2.0 (prevents QP instability that killed v9b).
-  PUMP target (0.01) in bottom has near-zero gradient at start (gate≈0.015→0.01),
-  causing minimal trunk interference (gradient ~1/step vs 200/step for NEUTRAL).
-  This was confirmed in v9b where fe@bot grew healthily to 7.25 @ep8 with PUMP.
+  Root cause 1: top episode visits π/2 states when pendulum fails to hold.
+    State-conditional target at π/2: near_pi=0.5 → target=0.5×1.5+0.5×0.01=0.755.
+    When Q@mid≈0.01, top gradient = 2×100×(0.01-0.755)=-149 (strong push up).
+    Bottom's PUMP gradient at π/2 = 2×100×(0.01-0.01)≈0 (at its own target, silent).
+    → Top wins unopposed, Q@mid grows unchecked.
 
-GRADIENT SEPARATION ARCHITECTURE (v11):
-  Bottom episode → f_head (energy tracking QP) + q_head direct (PUMP target)
-    detach_gates_Q_for_qp=True: blocks track_loss→QP→q_head explosive path
-    w_q_profile=100, PUMP target: constrains Q@bot to 0.01 via direct penalty
-  Top episode → q_head (cos_q1 QP + STABLE target) + q_head direct (STABLE)
-    detach_f_extra_for_qp=True: blocks QP→f_head gradient in top episode
+  Root cause 2: shared trunk can't separate π/2 features from π features.
+    cos(q1) similarity: cos(π/2)=0, cos(π)=-1 — numerically close enough to confuse
+    trunk representations, bleeding STABLE training into Q@mid behavior.
 
-State-conditional Q learning:
-  Bottom states (q1≈0) → PUMP target → Q@bot stays near 0.01
-  Top states   (q1≈π) → STABLE target → Q@top grows toward 1.5
-  Trunk learns to distinguish hanging vs near-π states.
+Fix 1 — Sharper near_pi (q_profile_near_pi_power=4 in top):
+  near_pi = ((1+cos(q1-π))/2)^4
+  At π/2: 0.5^4 = 0.0625 → target = 0.0625×1.5 + 0.9375×0.01 ≈ 0.103 (was 0.755)
+  Top's Q@mid gradient: 2×100×(0.01-0.103) = -18.6 (vs -149 before) — 8× weaker.
+  Bottom's PUMP gradient now dominates at π/2 → Q@mid stays near PUMP.
+
+Fix 2 — Goal-centred sin/cos input (use_sincos=True):
+  Replace [q1,dq1,q2,dq2] → [sin(q1-π), cos(q1-π), dq1/8, sin(q2), cos(q2), dq2/8].
+  cos(q1-π) = +1 at goal (π), -1 at hanging (0), 0 at π/2.
+  The trunk now sees an EXPLICIT near-goal signal — no need to learn it from raw angle.
+  This sharpens the trunk's state-conditional representations for q_head.
 """
 
 import math
@@ -64,6 +62,12 @@ GATE_RANGE_R    = 0.20
 F_EXTRA_BOUND   = 2.0   # v9b used 3.0 → QP instability @ep26; 2.0 caps fe safely
 F_KICKSTART_AMP = 1.0
 Q_BIAS_Q1       = -3.0
+USE_SINCOS      = True  # goal-centred representation: cos(q1-π)+1 near goal
+
+# Top-episode near_pi sharpness: target = near_pi^power × STABLE + (1-near_pi^power) × PUMP
+# power=1: near_pi=0.5 at π/2 → target=0.755 (kills Q@mid in v11)
+# power=4: near_pi=0.06 at π/2 → target=0.103 (8× weaker, bottom PUMP wins)
+Q_NEAR_PI_POWER = 4
 
 META_EPOCHS      = 200
 N_BOTTOM_PER_TOP = 3      # bottom gradient steps per top step
@@ -183,13 +187,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v11{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v12{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.LinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v11",
+            "experiment": "mixed_curriculum_v12",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -220,15 +224,15 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v11 — v9b + F_EXTRA_BOUND=2.0")
+    out("  EXP: MIXED CURRICULUM v12 — sharper Q-profile + sin/cos input")
     out(f"  device: {device}")
+    out(f"  Input: use_sincos={USE_SINCOS}  (cos(q1-π)+1 explicit near-goal signal)")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
         f"detach_Q=True, w_q={W_Q_PROFILE} PUMP constraint (F_EXTRA_BOUND={F_EXTRA_BOUND})")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
-        f"detach_f=True | w_stable={W_STABLE_PHASE}")
-    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional)")
-    out(f"  q_head: bottom→PUMP direct, top→STABLE direct; detach_Q blocks QP→q_head")
-    out(f"  f_head: bottom QP path only (detach_Q); top QP path blocked (detach_f)")
+        f"near_pi_power={Q_NEAR_PI_POWER} | detach_f=True | w_stable={W_STABLE_PHASE}")
+    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, sharp)")
+    out(f"  Near_pi@π/2: {0.5**Q_NEAR_PI_POWER:.4f} → target≈{0.5**Q_NEAR_PI_POWER*STABLE[0]+(1-0.5**Q_NEAR_PI_POWER)*PUMP[0]:.3f} (was 0.755 with power=1)")
     out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
     out("=" * 80)
 
@@ -244,6 +248,7 @@ def main():
         horizon=HORIZON, hidden_dim=HIDDEN_DIM,
         gate_range_q=GATE_RANGE_Q, gate_range_r=GATE_RANGE_R,
         f_extra_bound=F_EXTRA_BOUND, f_kickstart_amp=F_KICKSTART_AMP,
+        use_sincos=USE_SINCOS,
     )
     model = network_module.LinearizationNetwork(**model_kwargs).to(device).double()
     apply_q1_bias(model, Q_BIAS_Q1)
@@ -307,6 +312,7 @@ def main():
             q_profile_pump=PUMP,
             q_profile_stable=STABLE,
             q_profile_state_phase=True,
+            q_profile_near_pi_power=Q_NEAR_PI_POWER,
             w_stable_phase=W_STABLE_PHASE,
             stable_phase_steps=STABLE_PHASE_STEPS,
             w_f_pos_only=W_F_POS_ONLY_TOP,
