@@ -1,26 +1,24 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v14f: state-conditional f_extra.
+"""exp_mixed_curriculum.py — Mixed curriculum v14g: no gate in energy tracking.
 
-v14f = v14f + dedicated fe suppression episode at near-top start.
+v14g = v14g − f_gate_thresh in episode A (energy tracking).
 
-v14f failure (ep1-10, killed):
-  f_gate_thresh blocks energy tracking gradient at near-π, but trunk_f still
-  generalises from energy tracking at non-π states → fe@top grew to 9.165 at ep10
-  (82% of clip ceiling 11.18). Same QP instability as v14c. No competing signal
-  to push fe@top down, only weight decay (too weak).
+v14g failure (ep1-20, killed):
+  f_gate_thresh in episode A blocked 90% of energy tracking gradient (all near-π
+  steps of 170-step rollout were zeroed). L_bot stayed constant at 2.082 for 20
+  epochs (vs v14d's 1.778→0.038 by ep10). f_net never learned to swing to π.
+  Eval: arr=None at ep20 despite Q@mid=0.010, Q@top=1.032.
 
-v14f fix — state-conditional f_extra via two SEPARATE f_net episodes per iteration:
-  1. Energy tracking (f_gate_thresh=0.8): trains f_net at NON-π states.
-     Gate blocks gradient at near-π → no upward push on fe@top from this call.
-  2. Fe suppression (w_f_pos_only, NO gate, near-top start, detach_f_extra_for_qp):
-     trains f_net at NEAR-π states ONLY. Only gradient source is w_f_pos_only
-     (directly penalises near_goal × f_extra²). QP is detached so no competing
-     energy-tracking-style gradient from the QP. Pushes fe@top → 0.
+v14g fix — remove f_gate_thresh from energy tracking (episode A):
+  Energy tracking now trains f_extra at ALL states (pushes fe@top UP via trunk_f).
+  Episode B (fe suppression, near-top start, w_f_pos_only=2.0, detach QP) pushes
+  fe@top DOWN in a SEPARATE Adam step. No same-backward-pass conflict (v14d's bug).
+  Adam momentum accumulates opposing gradients for near-π parameters → stable
+  equilibrium at low fe@top instead of chaotic oscillation.
 
-The two calls visit DIFFERENT state regions → no gradient competition at any state.
-trunk_f differentiates [sin(0-π),cos(0-π),...] from [sin(π-π),cos(π-π),...]:
-  - At bottom input: large f_extra (from energy tracking)
-  - At top input: small f_extra (from fe suppression)
-State-conditional f_extra emerges naturally without chaos.
+  Why separate calls work but same call didn't (v14d): in a single backward pass,
+  conflicting gradients on the same parameter cancel or create instability. In
+  separate sequential calls, Adam processes each gradient individually and their
+  momentum vectors reach a natural balance point.
 
 v14d reference: ep30 achieved 81.7% f01, arr=214, post=91.5%.
 """
@@ -90,7 +88,7 @@ STABLE_PHASE_STEPS = N_TOP
 # State-conditional f_extra will emerge naturally via trunk learning.
 W_F_POS_ONLY_TOP = 0.0
 
-# Bottom-specific: two-episode f_net training (v14f).
+# Bottom-specific: two-episode f_net training (v14g).
 # Episode A — energy tracking with gate: blocks gradient at near-π (no upward push on fe@top).
 F_GATE_THRESH_BOT = 0.8   # same threshold as top; zeroes f_extra when near_pi > 0.8
 # Episode B — fe suppression: near-top start, w_f_pos_only, NO gate, detach_f_extra_for_qp.
@@ -117,7 +115,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum_v14f.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14g.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -197,13 +195,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14f{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14g{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14f",
+            "experiment": "mixed_curriculum_v14g",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -239,12 +237,12 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14f — f_gate_thresh in bottom (stable fe)")
+    out("  EXP: MIXED CURRICULUM v14g — f_gate_thresh in bottom (stable fe)")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
     out(f"  Bottom A: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"f_gate_thresh={F_GATE_THRESH_BOT} → no gradient on f_net near π")
+        f"NO gate → full trajectory gradient on f_net")
     out(f"  Bottom B: {N_FE_STEPS} steps × {N_BOTTOM_PER_TOP}/meta | near-top start | "
         f"w_f_pos_only={W_F_POS_ONLY_FE} | detach_f_extra | NO gate → fe@top suppressed")
     out(f"  Bottom C: {N_Q_PROFILE_STEPS} steps × {N_BOTTOM_PER_TOP}/meta | "
@@ -298,21 +296,21 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # v14f triple bottom loop — state-conditional f_extra:
-        #   A. Energy tracking (f_gate_thresh): large fe at non-π states.
-        #   B. Fe suppression (w_f_pos_only, detach_f, near-top start): small fe at π.
-        #      Two separate calls visit DIFFERENT state regions → no competition.
+        # v14g triple bottom loop — state-conditional f_extra:
+        #   A. Energy tracking (NO gate): f_net trains at ALL states, pushes fe@top up.
+        #   B. Fe suppression (w_f_pos_only, detach_f, near-top start, separate Adam
+        #      step): pushes fe@top down. Alternating A→B is stable equilibrium.
+        #      No same-backward-pass conflict (unlike v14d where both were one call).
         #   C. Short q_profile (optimizer_q, PUMP): Q@mid control.
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
-            # A. Energy tracking — f_net trains at non-π; gate blocks near-π gradient
+            # A. Energy tracking — full trajectory, all states (no gate)
             loss_b, _ = train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
-                f_gate_thresh=F_GATE_THRESH_BOT,
                 external_optimizer=optimizer_f,
                 restore_best=False,
             )
