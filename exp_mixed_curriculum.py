@@ -202,7 +202,7 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v10{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v10b{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.LinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
@@ -239,10 +239,10 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v10 — NEUTRAL target at near-pi in bottom episode")
+    out("  EXP: MIXED CURRICULUM v10b — v8b-style bottom + F_EXTRA_BOUND=2.0")
     out(f"  device: {device}")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"detach_Q=True + w_q_profile PUMP→NEUTRAL (F_EXTRA_BOUND={F_EXTRA_BOUND})")
+        f"detach_Q=True, no w_q_profile (F_EXTRA_BOUND={F_EXTRA_BOUND})")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
         f"detach_f=True | w_stable={W_STABLE_PHASE}")
     out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, BOTH episodes)")
@@ -288,11 +288,15 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # f_head trained by energy tracking (QP path: track_loss→f_extra→f_head).
-        # q_head trained by w_q_profile direct penalty ONLY (detach_gates_Q=True
-        # blocks the track_loss→QP→q_head path that caused v7's explosion).
-        # w_q_profile in bottom: PUMP target at q1=0 states → keeps Q@bot
-        # near 0.01 and prevents the drift seen in v8b (Q@bot 0.015→0.627).
+        # Pure energy tracking — no w_q_profile in bottom (v8b-style).
+        # The w_q_profile in bottom was tried in v9/v9b/v10 but each version
+        # either caused Q explosion (v9: STABLE fired at near-pi transient states)
+        # or Q collapse (v9b: PUMP target fought top's STABLE 3:1 via N_BOTTOM_PER_TOP)
+        # or trunk interference from NEUTRAL target that froze fe@bot (v10).
+        # Conclusion: bottom episode is best kept clean — energy tracking only.
+        # Q@bot drift (v8b: 0.015→0.627) is tolerable since drift is slow and
+        # swing-up still works (arr≈179-245 at epoch 10 before drift causes issues).
+        # F_EXTRA_BOUND=2.0 prevents fe saturation and QP instability (the v9b killer).
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
             loss_b, _ = train_module.train_linearization_network(
@@ -301,14 +305,6 @@ def main():
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
-                w_q_profile=W_Q_PROFILE,
-                q_profile_pump=PUMP,
-                q_profile_stable=NEUTRAL,  # neutral at near-π, not PUMP or STABLE
-                q_profile_state_phase=True,
-                # PUMP at bottom → keeps Q@bot near 0.01 (prevents v8b drift).
-                # NEUTRAL at near-π → gradient is ≈0 when Q≈1.0, doesn't fight
-                # top episode's STABLE target → equilibrium Q* ≈ 1.23 instead
-                # of collapsing to PUMP (v9b failure at Q>0.69).
                 external_optimizer=optimizer,
                 restore_best=False,
             )
