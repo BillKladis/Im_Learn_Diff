@@ -76,7 +76,7 @@ CONTROL_DIM = 2
 HIDDEN_DIM      = 128
 GATE_RANGE_Q    = 0.99
 GATE_RANGE_R    = 0.20
-F_EXTRA_BOUND   = 3.0
+F_EXTRA_BOUND   = 2.0   # reduced 3→2: prevents fe saturation and QP instability
 F_KICKSTART_AMP = 1.0
 Q_BIAS_Q1       = -3.0
 
@@ -87,10 +87,16 @@ N_TOP            = 100    # hold episode length
 LR               = 1e-3
 WEIGHT_DECAY     = 1e-4
 
-# Q-profile: ONLY used in top episode (no Q learning in bottom)
+# Q-profile: state-conditional target for w_q_profile in both episodes.
 W_Q_PROFILE = 100.0
-PUMP   = [0.01, 0.01, 1.0, 1.0]   # low Q[q1/q1d] at bottom → f_extra pumps
-STABLE = [1.5,  1.5,  1.0, 1.0]   # high Q[q1/q1d] at top   → QP stabilises
+PUMP    = [0.01, 0.01, 1.0, 1.0]  # at bottom states: small Q → f_extra pumps
+STABLE  = [1.5,  1.5,  1.0, 1.0]  # at top states (top episode): strong Q → hold
+NEUTRAL = [1.0,  1.0,  1.0, 1.0]  # at top states (bottom episode): neutral Q
+# Bottom episode uses PUMP→NEUTRAL (state_phase=True): targets PUMP at bottom,
+# NEUTRAL at transient near-π. This prevents the collapse seen in v9b where
+# PUMP target at near-π in bottom fought top's STABLE target 3:1 (N_BOTTOM_PER_TOP=3).
+# Gradient equilibrium with NEUTRAL: Q* ≈ 1.23 (vs 0.69 with PUMP at top).
+# Top episode uses PUMP→STABLE (state_phase=True): trains Q@top toward STABLE.
 
 # Top-specific: hold loss applied on ALL steps of top episode
 W_STABLE_PHASE     = 3.0
@@ -196,13 +202,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v9{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v10{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.LinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v9",
+            "experiment": "mixed_curriculum_v10",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -233,10 +239,10 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v9b — PUMP-only target in bottom episode")
+    out("  EXP: MIXED CURRICULUM v10 — NEUTRAL target at near-pi in bottom episode")
     out(f"  device: {device}")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"detach_Q=True + w_q_profile={W_Q_PROFILE} (PUMP target ALWAYS, no STABLE)")
+        f"detach_Q=True + w_q_profile PUMP→NEUTRAL (F_EXTRA_BOUND={F_EXTRA_BOUND})")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
         f"detach_f=True | w_stable={W_STABLE_PHASE}")
     out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, BOTH episodes)")
@@ -297,11 +303,12 @@ def main():
                 detach_gates_Q_for_qp=True,
                 w_q_profile=W_Q_PROFILE,
                 q_profile_pump=PUMP,
-                q_profile_stable=PUMP,   # PUMP for BOTH branches: always target PUMP
-                # No q_profile_state_phase — default False → time-based split,
-                # but both pump AND stable target PUMP so Q is always PUMP here.
-                # This prevents the v7/v9 explosion: near-π transient states in
-                # the bottom episode no longer trigger STABLE target for Q.
+                q_profile_stable=NEUTRAL,  # neutral at near-π, not PUMP or STABLE
+                q_profile_state_phase=True,
+                # PUMP at bottom → keeps Q@bot near 0.01 (prevents v8b drift).
+                # NEUTRAL at near-π → gradient is ≈0 when Q≈1.0, doesn't fight
+                # top episode's STABLE target → equilibrium Q* ≈ 1.23 instead
+                # of collapsing to PUMP (v9b failure at Q>0.69).
                 external_optimizer=optimizer,
                 restore_best=False,
             )
