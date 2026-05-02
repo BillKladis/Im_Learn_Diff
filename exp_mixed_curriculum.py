@@ -1,23 +1,21 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v14i: w_f_pos_only in episode A.
+"""exp_mixed_curriculum.py — Mixed curriculum v14j: reduced w_f_pos_only for faster swing-up.
 
-v14i = remove separate episode B + add w_f_pos_only=0.2 to episode A.
+v14j = v14i with W_F_POS_ONLY_BOT = 0.05 (was 0.2).
 
-v14g/v14h failure analysis:
-  Separate episode B fires unconditionally every epoch regardless of whether energy
-  tracking is working. W=2.0 (v14g) and W=0.1 (v14h) both suppressed fe@top to
-  ~0.046-0.103 before L_bot could decrease. Episode B has no self-regulating signal.
+v14i plateau analysis (ep20-79, stuck at 87% f01):
+  f01 ≈ (1 - arr/2000) × post. With post≈98%, to get 87% needs arr≈236 steps.
+  Root cause: w_f_pos_only=0.2 in episode A suppresses f_extra at near-π states,
+  but trunk_f is shared → trunk bleed suppresses fe@bot too (4.55 → 0.1 by ep30).
+  Weak fe@bot → slow swing-up → arr stuck at 236 → f01 plateaus at 87%.
+  To hit 90% f01 need arr ≤ 163. Requires ~4× stronger fe@bot.
 
-v14i fix — put w_f_pos_only in episode A (same call as energy tracking):
-  Suppression only fires at near-π states ENCOUNTERED DURING THE SWING-UP ROLLOUT.
-  When the pendulum can't reach π (early training), near_pi≈0 everywhere → no
-  suppression → fe grows freely → energy tracking gets traction.
-  When the pendulum succeeds (late training), near_pi→1 for many steps → suppression
-  fires → fe@top decays. Self-regulating, exactly like v14d.
+v14j fix — W_F_POS_ONLY_BOT = 0.05:
+  4× less trunk bleed to bottom states → fe@bot stabilizes ~4× higher (~0.4 vs 0.1).
+  fe@top suppression still active (same mechanism, just weaker → equilibrium at
+  fe@top ~0.2 instead of 0.05). Q@top=1.5 still provides hold.
+  Feedback gain = 0.05/0.2 × v14i_gain ≈ 0.25 × stable → still oscillation-free.
 
-  W=0.2 (vs v14d's W=0.5): feedback gain ≈ 0.2/0.5 × 1.1 = 0.44 < 1 → stable.
-  v14d oscillated at ep40+ (gain≈1.1). W=0.2 prevents this.
-
-v14d reference: ep30 achieved 81.7% f01, arr=214, post=91.5%.
+v14i reference: ep30 achieved 87.3% f01, arr=226, post=98.4%.
 """
 
 import math
@@ -85,10 +83,11 @@ STABLE_PHASE_STEPS = N_TOP
 # State-conditional f_extra will emerge naturally via trunk learning.
 W_F_POS_ONLY_TOP = 0.0
 
-# Bottom-specific: w_f_pos_only in episode A (v14i).
+# Bottom-specific: w_f_pos_only in episode A (v14j).
 # Self-regulating: only fires at near-π states encountered during the swing-up rollout.
-# W=0.2 < v14d's 0.5 → feedback gain ≈ 0.44 < 1 → no ep40+ oscillation.
-W_F_POS_ONLY_BOT   = 0.2    # in-episode-A penalty; was 0.5 in v14d (oscillated ep40+)
+# W=0.05: 4× less trunk bleed to fe@bot → faster swing-up → lower arr → higher f01.
+# v14i (W=0.2): fe@bot suppressed to 0.1, arr stuck at 236, f01 plateaued at 87%.
+W_F_POS_ONLY_BOT   = 0.05   # was 0.2 (v14i) → too much trunk bleed to bottom states
 # Bottom q_profile: weak PUMP target everywhere. Prevents Q@mid tracking Q@top.
 # Equilibrium: 3×10×(Q-0.01) = 100×(Q-1.5) → Q@top≈1.156; Q@mid≈0.081.
 W_Q_PROFILE_BOT   = 10.0
@@ -108,7 +107,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum_v14i.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14j.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -188,13 +187,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14i{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14j{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14i",
+            "experiment": "mixed_curriculum_v14j",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -228,7 +227,7 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14i — w_f_pos_only=0.2 in episode A (self-regulating)")
+    out("  EXP: MIXED CURRICULUM v14j — w_f_pos_only=0.05 (less trunk bleed → faster swing-up)")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
@@ -285,7 +284,7 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # v14i bottom loop — w_f_pos_only in episode A (self-regulating, like v14d):
+        # v14j bottom loop — w_f_pos_only=0.05 in episode A (less trunk bleed to fe@bot):
         #   A. Energy tracking + w_f_pos_only: suppression only fires when pendulum
         #      reaches π in the rollout. Self-regulating: no fe suppression when stuck.
         #   B. Short q_profile (optimizer_q, PUMP): Q@mid control.
