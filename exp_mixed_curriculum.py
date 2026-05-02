@@ -55,7 +55,9 @@ CONTROL_DIM = 2
 HIDDEN_DIM      = 128
 GATE_RANGE_Q    = 0.99
 GATE_RANGE_R    = 0.20
-F_EXTRA_BOUND   = 2.0   # v9b used 3.0 → QP instability @ep26; 2.0 caps fe safely
+F_EXTRA_BOUND   = 2.5   # v14b hit ceiling (8.944) at ep9 → frozen L_bot=2.089 for ep9-13.
+                        # 2.5 → clip=11.18. fe@top stays small (detach_f=True in top).
+                        # v9b QP instability was fe@top=13.3 (no detach); safe here.
 F_KICKSTART_AMP = 1.0
 Q_BIAS_Q1       = -3.0
 # SeparatedLinearizationNetwork always uses sin/cos input — no USE_SINCOS flag needed.
@@ -103,7 +105,7 @@ TOP_PERT_Q2D = 0.50
 EVAL_EVERY = 10
 SAVE_EVERY = 50
 SAVE_DIR   = "saved_models"
-LOG_FILE   = "/tmp/mixed_curriculum_v14b.log"
+LOG_FILE   = "/tmp/mixed_curriculum_v14c.log"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -183,13 +185,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v14b{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14c{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v14b",
+            "experiment": "mixed_curriculum_v14c",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -220,7 +222,7 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v14b — separate optimizers for f_net / q_net")
+    out("  EXP: MIXED CURRICULUM v14c — F_EXTRA_BOUND=2.5 (fix clip ceiling)")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
