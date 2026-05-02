@@ -1,29 +1,29 @@
-"""exp_mixed_curriculum.py — Mixed curriculum v13: separated f_net / q_net.
+"""exp_mixed_curriculum.py — Mixed curriculum v14: pure f_net/q_net decoupling.
 
-v13 = v12 + architectural fix for Q@mid limit-cycle failure:
+v14 = v13 + remove q_profile from bottom episode.
 
-v12 post-mortem (aborted at ep 9):
-  Q@mid=0.077 by epoch 9 (vs v11's 0.023 at same epoch).
-  sin/cos input made Q@top learn faster (0.165 at ep9 vs 0.023 in v11), but the
-  SHARED trunk still bled Q@top gradients to Q@mid — sin/cos just accelerated bleed.
-  power=4 weakened top's q_profile gradient at π/2 (0.103 vs 0.755) but Q@top's
-  faster growth meant the bleed was stronger despite the weaker target.
+v13 result (ep1-12):
+  Positive: Q@mid self-corrected (0.090 peak ep8 → 0.018 ep12). Swing-up working
+  (arr=159 at ep10). SeparatedLinearizationNetwork eliminates f_net→q_net bleed.
+  Negative: Q@top PLATEAUED at ~0.104. Hold fails (post=0.0% at ep10).
 
-v11/v12 root cause (architectural):
-  Single LinearizationNetwork trunk shared by f_head, r_head, q_head.
-  Energy-tracking loss → trunk → q_head: Q@mid grows whenever pendulum visits π/2.
-  No target-side fix can fully prevent this; the gradient path goes through trunk.
+v13 Q@top plateau cause:
+  Bottom's q_profile (target=PUMP=0.01 at ALL states, including near-π) competes
+  directly with top's STABLE training at π. Equilibrium:
+    3×(Q@top - 0.01) = 1×(Q@top - 1.5)  →  Q@top ≈ 0.38  (max, never reaches 1.5)
+  With 3:1 bottom:top ratio and bottom's PUMP target at π, Q@top can only reach ~0.1.
 
-Fix — SeparatedLinearizationNetwork (v13):
-  f_net (trunk_f → f_head + r_head): only energy-tracking gradients reach trunk_f.
-  q_net (trunk_q → q_head only):     only q_profile gradients reach trunk_q.
-  ZERO trunk bleed between f_head and q_head by construction.
-  Q@mid is trained only by q_profile:
-    - Bottom: target=PUMP=0.01 at all states (3× per top).
-    - Top:    target=0.103 at π/2 (power=4, still kept for safety).
-  Bottom runs 3× per top; at π/2 bottom's gradient is ≈0 (already at target).
-  Top's weak gradient (−18.6) is unopposed but Q@mid stays low because q_net
-  trunk learns a sharp state space from sin/cos — π/2 and π are clearly distinct.
+Fix (v14) — pure decoupling:
+  BOTTOM: remove w_q_profile entirely. q_net gets ZERO gradient from bottom.
+    (detach_gates_Q_for_qp=True already blocks QP→q_net; removing q_profile
+     means absolutely no gradient reaches q_net in bottom.)
+  TOP:    q_profile PUMP→STABLE (power=4) + QP tracking gradient both train q_net.
+    Q@top → 1.5 freely (no competing bottom PUMP at π).
+    Q@mid → 0.103 (top's power=4 target at π/2, weak but stable).
+    Q@bot → 0.01-0.05 (interpolated, low enough for swing-up).
+
+  f_net gets ZERO gradient from top (detach_f_extra_for_qp=True).
+  Perfect role separation: f_net = swing-up, q_net = state-conditional hold.
 """
 
 import math
@@ -183,13 +183,13 @@ def eval2k(model, mpc, x0, x_goal, steps=2000):
 
 
 def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
-    name = f"stageF_mixed_v13{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
+    name = f"stageF_mixed_v14{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
     m.load_state_dict(best_state)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
-            "experiment": "mixed_curriculum_v13",
+            "experiment": "mixed_curriculum_v14",
             "meta_epoch": meta,
             "best_f01":   best_f01,
             "w_q_profile": W_Q_PROFILE,
@@ -220,16 +220,17 @@ def main():
     x_goal = torch.tensor(X_GOAL, dtype=torch.float64, device=device)
 
     out("=" * 80)
-    out("  EXP: MIXED CURRICULUM v13 — SeparatedLinearizationNetwork (f_net || q_net)")
+    out("  EXP: MIXED CURRICULUM v14 — pure f_net/q_net decoupling")
     out(f"  device: {device}")
     out(f"  Architecture: SEPARATED f_net (f+r heads) | q_net (q head only)")
     out(f"  Input: sin/cos goal-centred [sin(q1-π),cos(q1-π),dq1/8,sin(q2),cos(q2),dq2/8]")
     out(f"  Bottom: {N_BOTTOM} steps × {N_BOTTOM_PER_TOP}/meta | energy | "
-        f"detach_Q=True, w_q={W_Q_PROFILE} PUMP constraint (F_EXTRA_BOUND={F_EXTRA_BOUND})")
+        f"detach_Q=True, NO q_profile (q_net gets ZERO gradient from bottom)")
     out(f"  Top:    {N_TOP} steps × 1/meta | cos_q1 | w_q_profile={W_Q_PROFILE} | "
         f"near_pi_power={Q_NEAR_PI_POWER} | detach_f=True | w_stable={W_STABLE_PHASE}")
-    out(f"  Q-profile: PUMP={PUMP} → STABLE={STABLE}  (state-conditional, power={Q_NEAR_PI_POWER})")
+    out(f"  Q-profile (top only): PUMP={PUMP} → STABLE={STABLE}  (power={Q_NEAR_PI_POWER})")
     out(f"  Near_pi@π/2: {0.5**Q_NEAR_PI_POWER:.4f} → target≈{0.5**Q_NEAR_PI_POWER*STABLE[0]+(1-0.5**Q_NEAR_PI_POWER)*PUMP[0]:.3f}")
+    out(f"  Expected: Q@top→1.5, Q@mid→0.103, Q@bot→0.01-0.05 (interpolated)")
     out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
     out("=" * 80)
 
@@ -270,13 +271,14 @@ def main():
 
     for meta in range(META_EPOCHS):
         # ── Bottom episodes: swing-up from x0=[0,0,0,0] ───────────────
-        # Energy tracking + explicit PUMP constraint on q_head (v11 = v9b approach).
-        # detach_gates_Q_for_qp=True blocks the explosive track_loss→QP→q_head path.
-        # w_q_profile (PUMP target) provides a direct gradient: q_head → PUMP=0.01.
-        # PUMP target: gradient = 2×100×(0.01-0.01)≈0 initially → minimal trunk
-        # interference. This was verified in v9b where fe@bot grew healthily to 7.25.
-        # Without this constraint (v10b), Q@bot drifts 0.015→1.307 via trunk bleed
-        # from top episode, causing L_bot explosion at epoch 28.
+        # v14: f_net only. detach_gates_Q_for_qp=True + no q_profile = q_net gets
+        # ZERO gradient from bottom. f_net trains purely via energy-tracking QP.
+        # detach_gates_Q_for_qp=True already blocks QP→q_net.
+        # Removing q_profile means absolutely no loss reaches q_net in bottom.
+        # f_net trains freely via energy-tracking QP gradient.
+        # (v10b lesson: with shared trunk, removing q_profile caused Q@bot drift.
+        #  With SeparatedLinearizationNetwork, f_net and q_net are fully independent;
+        #  Q@bot is set entirely by top's q_profile; no drift risk.)
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
             loss_b, _ = train_module.train_linearization_network(
@@ -285,10 +287,6 @@ def main():
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
-                w_q_profile=W_Q_PROFILE,
-                q_profile_pump=PUMP,
-                q_profile_stable=PUMP,       # always PUMP — no state-phase escalation
-                q_profile_state_phase=True,
                 external_optimizer=optimizer,
                 restore_best=False,
             )
