@@ -102,8 +102,8 @@ SAVE_EVERY      = 50
 SAVE_DIR        = "saved_models"
 LOG_FILE        = "/tmp/generalize_v15.log"
 
-# Checkpoint to fine-tune from — best v14j result
-LOAD_CHECKPOINT = "saved_models/stageF_mixed_v14j_20260502_230715_ep50/stageF_mixed_v14j_20260502_230715_ep50.pth"
+# Checkpoint to fine-tune from — best v14m result (89.9% f01, arr=168)
+LOAD_CHECKPOINT = "saved_models/stageF_mixed_v14m_20260503_102608_ep50/stageF_mixed_v14m_20260503_102608_ep50.pth"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
