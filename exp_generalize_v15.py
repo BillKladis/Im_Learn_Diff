@@ -71,8 +71,8 @@ STABLE_PHASE_STEPS = N_TOP
 
 W_F_POS_ONLY_TOP = 0.0
 
-W_F_POS_ONLY_FE = 1.0    # stronger than v14m=0.2 — must counter perturbed bottom gradient
-N_FE_STEPS      = 20     # more steps — 20×3=60 B-fe steps/meta to maintain fe@top suppression
+W_F_POS_ONLY_FE = 0.2    # mild — episode A detached so dynamics-only gradient to f_head is weak
+N_FE_STEPS      = 5      # 5×3=15 B-fe steps/meta; sufficient with detach in episode A
 SUPPRESS_START  = 0      # start from ep1 — checkpoint already has fe@top suppressed, must maintain
 
 W_Q_PROFILE_BOT   = 10.0
