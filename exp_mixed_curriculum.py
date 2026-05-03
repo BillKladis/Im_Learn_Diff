@@ -299,8 +299,7 @@ def main():
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
-                w_stable_phase=W_F_STABLE_BOT,
-                stable_phase_steps=N_BOTTOM,
+                w_f_stable=W_F_STABLE_BOT,
                 external_optimizer=optimizer_f,
                 restore_best=False,
             )
