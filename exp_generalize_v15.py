@@ -198,16 +198,17 @@ def eval_multi(model, mpc, x0_fixed, x_goal, device, n_perturbed=N_EVAL_STARTS, 
     return mean_f01, min_f01, fixed_f01, fixed_arr, fixed_post
 
 
-def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
+def save_checkpoint(model_class_kwargs, state_dict, meta, f01_label, save_dir, tag=""):
+    """Save a given state_dict (best or current) to disk."""
     name = f"stageF_gen_v15{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{meta}"
     m = network_module.SeparatedLinearizationNetwork(**model_class_kwargs).double()
-    m.load_state_dict(best_state)
+    m.load_state_dict(state_dict)
     network_module.ModelManager(base_dir=save_dir).save_training_session(
         model=m, loss_history=[],
         training_params={
             "experiment": "generalize_v15",
             "meta_epoch": meta,
-            "best_f01":   best_f01,
+            "f01_label":  f01_label,
             "load_checkpoint": LOAD_CHECKPOINT,
             "max_bot_pert_q1": MAX_BOT_PERT_Q1,
             "max_bot_pert_q2": MAX_BOT_PERT_Q2,
@@ -219,6 +220,10 @@ def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
         session_name=name,
     )
     return name
+
+
+def save_best(model_class_kwargs, best_state, meta, best_f01, save_dir, tag=""):
+    return save_checkpoint(model_class_kwargs, best_state, meta, f"{best_f01:.1%}", save_dir, tag)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -291,8 +296,10 @@ def main():
     out(hdr)
     out("  " + "-" * len(hdr.rstrip()))
 
-    best_f01   = f01_init
-    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+    best_f01        = f01_init    # best fixed-start f01 (for compatibility)
+    best_state      = {k: v.clone() for k, v in model.state_dict().items()}
+    best_mean_f01   = 0.0         # best mean f01 at full perturbation range
+    best_mean_state = None
     t0 = time.time()
 
     for meta in range(META_EPOCHS):
@@ -388,6 +395,10 @@ def main():
                 best_f01   = fixed_f01
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
                 mark = " ★"
+            # Track best MEAN f01 once at full perturbation range
+            if pert_scale >= 1.0 and mean_f01 > best_mean_f01:
+                best_mean_f01   = mean_f01
+                best_mean_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         line = (f"  [{meta+1:>3}]  {L_bot_last:>8.3f}  {L_top:>8.3f}  "
                 f"  {p['bot']['Q_q1']:.3f}  {p['mid']['Q_q1']:.3f}  {p['top']['Q_q1']:.3f}  "
@@ -396,14 +407,27 @@ def main():
                 f"  {f01_mn_str}  {f01_fx_str}  {arr_str}  {post_str}{mark}")
         out(line)
 
-        if (meta + 1) % SAVE_EVERY == 0 and best_state is not None:
-            name = save_best(model_kwargs, best_state, meta + 1, best_f01, SAVE_DIR)
-            out(f"  → Saved: {name}")
+        if (meta + 1) % SAVE_EVERY == 0:
+            # Save current state (not best_state) — generalization training improves over time
+            curr_state = {k: v.clone() for k, v in model.state_dict().items()}
+            name = save_checkpoint(model_kwargs, curr_state, meta + 1,
+                                   f"curr_mean={mean_f01:.1%}_fix={fixed_f01:.1%}", SAVE_DIR)
+            out(f"  → Saved (current): {name}")
+            if best_mean_state is not None:
+                name_m = save_checkpoint(model_kwargs, best_mean_state, meta + 1,
+                                         f"best_mean={best_mean_f01:.1%}", SAVE_DIR, tag="_BESTMEAN")
+                out(f"  → Saved (best_mean): {name_m}")
 
     elapsed = time.time() - t0
-    if best_state is not None:
-        name = save_best(model_kwargs, best_state, META_EPOCHS, best_f01, SAVE_DIR, tag="_FINAL")
-        out(f"\n  FINAL best f01={best_f01:.1%}  saved: {name}")
+    # Save final current state AND best-mean state
+    curr_state = {k: v.clone() for k, v in model.state_dict().items()}
+    name = save_checkpoint(model_kwargs, curr_state, META_EPOCHS,
+                           f"final_curr", SAVE_DIR, tag="_FINAL")
+    out(f"\n  FINAL curr state saved: {name}")
+    if best_mean_state is not None:
+        name_m = save_checkpoint(model_kwargs, best_mean_state, META_EPOCHS,
+                                 f"best_mean={best_mean_f01:.1%}", SAVE_DIR, tag="_BESTMEAN")
+        out(f"  FINAL best_mean={best_mean_f01:.1%}  saved: {name_m}")
     out(f"  Total time: {elapsed/60:.1f} min")
     log.close()
 
