@@ -318,6 +318,7 @@ def main():
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
+                detach_f_extra_for_qp=True,   # prevent episode A from driving fe@top up
                 external_optimizer=optimizer_f,
                 restore_best=False,
             )
