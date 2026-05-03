@@ -71,9 +71,9 @@ STABLE_PHASE_STEPS = N_TOP
 
 W_F_POS_ONLY_TOP = 0.0
 
-W_F_POS_ONLY_FE = 0.2
-N_FE_STEPS      = 5
-SUPPRESS_START  = 5    # lower than v14m=10 since checkpoint already trained
+W_F_POS_ONLY_FE = 1.0    # stronger than v14m=0.2 — must counter perturbed bottom gradient
+N_FE_STEPS      = 20     # more steps — 20×3=60 B-fe steps/meta to maintain fe@top suppression
+SUPPRESS_START  = 0      # start from ep1 — checkpoint already has fe@top suppressed, must maintain
 
 W_Q_PROFILE_BOT   = 10.0
 N_Q_PROFILE_STEPS = 5
