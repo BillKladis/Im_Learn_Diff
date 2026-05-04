@@ -43,15 +43,16 @@ class MPC_controller:
         self.N      = N
         self.dt     = torch.tensor(0.05, device=device, dtype=torch.float64)
 
-        # Baseline cost diagonals — physically motivated.
+        # Baseline cost diagonals — tuned for real hardware (m~0.1kg, l=0.05m, u_max=0.15Nm).
+        # State order: [q1, q1_dot, q2, q2_dot].  Hardware order: [q1, q2, q1_dot, q2_dot].
         self.q_base_diag = torch.tensor(
-            [12.0, 5.0, 50.0, 40.0], device=device, dtype=torch.float64
+            [100.0, 10.0, 100.0, 10.0], device=device, dtype=torch.float64
         )
         self.r_base_diag = torch.tensor(
             [1.0, 1.0], device=device, dtype=torch.float64
         )
         self.Qf = torch.diag(torch.tensor(
-            [20.0, 20.0, 40.0, 30.0], device=device, dtype=torch.float64
+            [200.0, 20.0, 200.0, 20.0], device=device, dtype=torch.float64
         ))
 
         self.true_dynamics = true_dynamics.DoublePendulumDynamics(device=device)
@@ -126,24 +127,30 @@ class MPC_controller:
     # Energy helper
     # ──────────────────────────────────────────────────────────────────────
     def compute_energy_single(self, x: torch.Tensor) -> torch.Tensor:
-        """Total mechanical energy (T + V) for the full point-mass system."""
-        m1, m2 = 1.0, 1.0
-        l1, l2 = 0.5, 0.5
-        g      = 9.81
+        """Total mechanical energy (T + V) for the real rigid-body hardware."""
+        dyn = self.true_dynamics
+        m1, m2 = dyn.m1, dyn.m2
+        l1, r1, r2 = dyn.l1, dyn.r1, dyn.r2
+        I1, I2 = dyn.I1, dyn.I2
+        g = dyn.g
 
         q1, q1_dot, q2, q2_dot = x[0], x[1], x[2], x[3]
 
-        y1 = -l1 * torch.cos(q1)
-        y2 = -l1 * torch.cos(q1) - l2 * torch.cos(q1 + q2)
-        V  = m1 * g * y1 + m2 * g * y2
+        # Potential energy (reference: both links fully down)
+        V = -m1*g*r1*torch.cos(q1) - m2*g*(l1*torch.cos(q1) + r2*torch.cos(q1 + q2))
 
-        v1_sq = (l1 * q1_dot) ** 2
-        vx2 = l1 * q1_dot * torch.cos(q1) + l2 * (q1_dot + q2_dot) * torch.cos(q1 + q2)
-        vy2 = l1 * q1_dot * torch.sin(q1) + l2 * (q1_dot + q2_dot) * torch.sin(q1 + q2)
-        v2_sq = vx2 ** 2 + vy2 ** 2
+        # Kinetic energy: rotational + translational CoM
+        # CoM1 velocity magnitude squared: (r1*q1_dot)^2
+        v1_sq = (r1 * q1_dot) ** 2
+        KE1 = 0.5*m1*v1_sq + 0.5*I1*q1_dot**2
 
-        T = 0.5 * m1 * v1_sq + 0.5 * m2 * v2_sq
-        return T + V
+        # CoM2 velocity
+        vx2 = l1*torch.cos(q1)*q1_dot + r2*torch.cos(q1+q2)*(q1_dot+q2_dot)
+        vy2 = l1*torch.sin(q1)*q1_dot + r2*torch.sin(q1+q2)*(q1_dot+q2_dot)
+        v2_sq = vx2**2 + vy2**2
+        KE2 = 0.5*m2*v2_sq + 0.5*I2*(q1_dot+q2_dot)**2
+
+        return KE1 + KE2 + V
 
     # ──────────────────────────────────────────────────────────────────────
     # Discretisation
