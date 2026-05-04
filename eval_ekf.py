@@ -99,6 +99,10 @@ def rollout_ekf(
 
     state_history = [x.clone() for _ in range(5)]
 
+    # Track the control actually applied at previous step (post-cancellation, pre-disturbance).
+    # EKF uses this so the residual bias it estimates converges to the true bias.
+    u_prev_applied = torch.zeros(n_u, dtype=torch.float64)
+
     for step in range(num_steps):
         # ── True state + measurement noise ──────────────────────────────
         if obs_sigma > 0.0:
@@ -108,10 +112,9 @@ def rollout_ekf(
 
         # ── EKF filtering ───────────────────────────────────────────────
         if ekf is not None and step > 0:
-            u_prev = u_seq_guess[0]  # approximate prev commanded u
-            x_est, bias_est = ekf.step(y, u_prev)
+            x_est, bias_est = ekf.step(y, u_prev_applied)
         else:
-            x_est = y
+            x_est = y.clone()
             bias_est = torch.zeros(n_u, dtype=torch.float64)
             if ekf is not None:
                 ekf.reset(x_est)
@@ -143,13 +146,26 @@ def rollout_ekf(
             diag_corrections_Qf=gates_Qf,
         )
 
-        u_apply = u_opt.detach().clone()
+        u_cmd = u_opt.detach().clone()
 
-        # ── Bias cancellation ────────────────────────────────────────────
-        if cancel_bias and isinstance(ekf, EKF6) and step > 10:
-            u_apply = u_apply - bias_est.detach()
+        # ── Bias cancellation (warm-up: wait 20 steps for EKF to converge) ──
+        # Apply cancellation and clamp; save this as u_prev_applied so the EKF
+        # receives the command we actually sent — residual bias converges to true bias.
+        if cancel_bias and isinstance(ekf, EKF6) and step >= 20:
+            u_after_cancel = torch.clamp(
+                u_cmd - bias_est.detach(),
+                min=mpc.MPC_dynamics.u_min,
+                max=mpc.MPC_dynamics.u_max,
+            )
+        else:
+            u_after_cancel = u_cmd
 
-        # ── Apply disturbances to actual torque ──────────────────────────
+        # Record what the EKF should think we commanded (post-cancel, pre-disturbance)
+        u_prev_applied = u_after_cancel.detach().clone()
+
+        # ── Apply unknown disturbances to actual physical torque ─────────
+        u_apply = u_after_cancel.clone()
+
         if ctrl_sigma > 0.0:
             with torch.no_grad():
                 u_apply = u_apply + torch.randn(n_u, generator=rng,
