@@ -323,6 +323,11 @@ def train_linearization_network(
     # at deployment time.  Pass a list/tensor of 4 σ values (one per
     # state dim).  Default: zeros = no noise.
     train_noise_sigma:    Optional[List[float]] = None,
+    # Control noise during training: add Gaussian noise to u_mpc before dynamics.
+    # Teaches robustness to actuator noise / torque uncertainty. Gradient still
+    # flows through u_mpc (noise is a detached additive constant per step).
+    # Pass a list of 2 σ values (one per control dim). Default: None = no noise.
+    train_ctrl_sigma:     Optional[List[float]] = None,
     # Late-phase track penalty: in the last `track_late_phase_steps` steps,
     # add w_track_late_phase * track_step ON TOP of the normal track loss.
     # Heavily emphasises tracking near goal arrival — encourages the network
@@ -459,6 +464,13 @@ def train_linearization_network(
         )
     else:
         train_noise_tensor = None
+
+    if train_ctrl_sigma is not None and any(s > 0 for s in train_ctrl_sigma):
+        train_ctrl_noise_tensor = torch.tensor(
+            train_ctrl_sigma, device=mpc.device, dtype=torch.float64,
+        )
+    else:
+        train_ctrl_noise_tensor = None
 
     def add_train_noise(state):
         if train_noise_tensor is None:
@@ -646,7 +658,19 @@ def train_linearization_network(
                 diag_corrections_Qf=gates_Qf,
             )
 
-            next_state = mpc.true_RK4_disc(current_state_detached, u_mpc, mpc.dt)
+            # Control noise: additive Gaussian on u_mpc before dynamics.
+            # Gradient still flows through u_mpc (noise is a sampled constant).
+            u_dyn = u_mpc
+            if train_ctrl_noise_tensor is not None:
+                with torch.no_grad():
+                    ctrl_noise = torch.randn(n_u, device=mpc.device, dtype=torch.float64) \
+                                 * train_ctrl_noise_tensor
+                u_dyn = u_mpc + ctrl_noise
+                u_dyn = torch.clamp(u_dyn,
+                                    min=mpc.MPC_dynamics.u_min,
+                                    max=mpc.MPC_dynamics.u_max)
+
+            next_state = mpc.true_RK4_disc(current_state_detached, u_dyn, mpc.dt)
 
             # ── Hold-reward (soft time-in-zone) ─────────────────────────
             # Differentiable indicator: exp(-||x_wrapped||² / σ²) where
