@@ -43,16 +43,20 @@ class MPC_controller:
         self.N      = N
         self.dt     = torch.tensor(0.05, device=device, dtype=torch.float64)
 
-        # Baseline cost diagonals — tuned for real hardware (m~0.1kg, l=0.05m, u_max=0.15Nm).
+        # Baseline cost diagonals — scaled for real hardware (m~0.1kg, l=0.05m, u_max=0.15Nm).
+        # B_vel ≈ 55-90 per step (small inertia → large acceleration response).
+        # Q_vel must stay ≤ 0.0001 to keep H well-conditioned at all linearisation points.
+        # Q_pos = 0.1 gives strong position drive (cost ratio Q*π²/R ≈ 1 >> R*u_max²=0.02).
+        # Top conditioning: cond ≈ 2.3e6 (acceptable for SCS with eps=1e-6).
         # State order: [q1, q1_dot, q2, q2_dot].  Hardware order: [q1, q2, q1_dot, q2_dot].
         self.q_base_diag = torch.tensor(
-            [100.0, 10.0, 100.0, 10.0], device=device, dtype=torch.float64
+            [0.1, 0.0001, 0.1, 0.0001], device=device, dtype=torch.float64
         )
         self.r_base_diag = torch.tensor(
             [1.0, 1.0], device=device, dtype=torch.float64
         )
         self.Qf = torch.diag(torch.tensor(
-            [200.0, 20.0, 200.0, 20.0], device=device, dtype=torch.float64
+            [0.2, 0.0002, 0.2, 0.0002], device=device, dtype=torch.float64
         ))
 
         self.true_dynamics = true_dynamics.DoublePendulumDynamics(device=device)
@@ -155,15 +159,20 @@ class MPC_controller:
     # ──────────────────────────────────────────────────────────────────────
     # Discretisation
     # ──────────────────────────────────────────────────────────────────────
-    def true_RK4_disc(self, x: torch.Tensor, u: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-        t0 = dt.new_zeros(())
-        tH = 0.5 * dt
-        t1 = dt
-        f1 = self.true_dynamics.deriv(t0, x, u)
-        f2 = self.true_dynamics.deriv(tH, x + 0.5 * dt * f1, u)
-        f3 = self.true_dynamics.deriv(tH, x + 0.5 * dt * f2, u)
-        f4 = self.true_dynamics.deriv(t1, x + dt * f3, u)
-        return x + (dt / 6.0) * (f1 + 2 * f2 + 2 * f3 + f4)
+    def true_RK4_disc(self, x: torch.Tensor, u: torch.Tensor, dt: torch.Tensor,
+                      n_sub: int = 5) -> torch.Tensor:
+        # 5 sub-steps of h=dt/5=0.01s prevent Coriolis overflow (M22^{-1}≈2944).
+        h = dt / n_sub
+        for _ in range(n_sub):
+            t0 = h.new_zeros(())
+            tH = 0.5 * h
+            t1 = h
+            f1 = self.true_dynamics.deriv(t0, x, u)
+            f2 = self.true_dynamics.deriv(tH, x + 0.5 * h * f1, u)
+            f3 = self.true_dynamics.deriv(tH, x + 0.5 * h * f2, u)
+            f4 = self.true_dynamics.deriv(t1, x + h * f3, u)
+            x = x + (h / 6.0) * (f1 + 2 * f2 + 2 * f3 + f4)
+        return x
 
     def MPC_RK4_disc(self, x: torch.Tensor, u: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         t0 = dt.new_zeros(())

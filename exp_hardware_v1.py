@@ -40,41 +40,41 @@ CONTROL_DIM = 2
 HIDDEN_DIM      = 128
 GATE_RANGE_Q    = 0.99
 GATE_RANGE_R    = 0.20
-F_EXTRA_BOUND   = 2.5
-F_KICKSTART_AMP = 1.0
-Q_BIAS_Q1       = -3.0
+F_EXTRA_BOUND   = 2.5    # with H_bottom≈32 gives DU*≈0.078Nm per element (52% of u_max)
+F_KICKSTART_AMP = 0.01   # very small init so network starts near-zero
+Q_BIAS_Q1       = 0.5    # gates≈1.46 → Q_eff=0.146; enough to beat gravity at top (0.146*0.3>0.027Nm)
 
 Q_NEAR_PI_POWER = 4
 
 META_EPOCHS      = 200
-N_BOTTOM_PER_TOP = 3
-N_BOTTOM         = 170
+N_BOTTOM_PER_TOP = 6     # more short episodes to compensate for short N_BOTTOM
+N_BOTTOM         = 6     # 0.3s rollout: stays below q1=π, prevents Coriolis overflow
 N_TOP            = 100
 LR               = 1e-3
 WEIGHT_DECAY     = 1e-4
 
 W_Q_PROFILE = 100.0
-PUMP    = [0.01, 0.01, 1.0, 1.0]
-STABLE  = [1.5,  1.5,  1.0, 1.0]
+PUMP    = [0.2, 1.0, 0.2, 1.0]   # bottom: reduce Q_pos to 20% (allow free swing), keep Q_vel
+STABLE  = [2.0, 1.0, 2.0, 1.0]   # top: double Q_pos for strong hold
 
 W_STABLE_PHASE     = 3.0
 STABLE_PHASE_STEPS = N_TOP
 
-W_F_POS_ONLY_TOP = 0.0
+W_F_POS_ONLY_TOP = 0.3    # suppress f_extra near top (was 0.0, needed with large F_EXTRA_BOUND)
 F_GATE_THRESH_TOP  = 0.8
 DETACH_F_EXTRA_TOP = True
 
-W_F_POS_ONLY_FE = 0.2
+W_F_POS_ONLY_FE = 0.5    # stronger suppression (was 0.2, needed with large F_EXTRA_BOUND)
 N_FE_STEPS      = 5
-SUPPRESS_START  = 10
+SUPPRESS_START  = 0      # start suppression from epoch 0 (was 10, too late with fast fe growth)
 
 W_Q_PROFILE_BOT   = 10.0
 N_Q_PROFILE_STEPS = 5
 
 TOP_PERT_Q1  = 0.30
-TOP_PERT_Q1D = 0.60
+TOP_PERT_Q1D = 0.30
 TOP_PERT_Q2  = 0.20
-TOP_PERT_Q2D = 0.50
+TOP_PERT_Q2D = 0.30
 
 EVAL_EVERY = 10
 SAVE_EVERY = 50
@@ -184,14 +184,14 @@ def main():
     out(f"  Physics: m1=0.10548 m2=0.07620 l1=l2=0.05m r1=0.05 r2=0.03670")
     out(f"           I1=4.617e-4 I2=2.370e-4  u_max=±0.15 Nm")
     out(f"  State:   [q1, q1_dot, q2, q2_dot]  (hw: [q1,q2,q1d,q2d])")
-    out(f"  Q_base:  [100, 10, 100, 10]  R_base: [1, 1]")
+    out(f"  Q_base:  [0.1, 0.0001, 0.1, 0.0001]  R_base: [1, 1]  (Q_pos large for drive, Q_vel tiny for cond)")
     out(f"  META_EPOCHS={META_EPOCHS}  LR={LR}  hidden={HIDDEN_DIM}")
     out("=" * 80)
 
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON, device=device)
     mpc.dt = torch.tensor(DT, dtype=torch.float64, device=device)
 
-    demo_bottom = make_energy_demo(N_BOTTOM, device)
+    demo_bottom = make_hold_demo(N_BOTTOM, device)   # target = upright; cos_q1 loss
     demo_top    = make_hold_demo(N_TOP, device)
 
     model_kwargs = dict(
@@ -224,15 +224,16 @@ def main():
     for meta in range(META_EPOCHS):
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
-            # A. Clean energy tracking
+            # A. Short cos_q1 tracking toward upright (6 steps, no Coriolis overflow)
             loss_b, _ = train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
-                track_mode="energy",
+                track_mode="cos_q1",
                 detach_gates_Q_for_qp=True,
                 external_optimizer=optimizer_f,
                 restore_best=False,
+                grad_debug=True,
             )
             L_bot_last = loss_b[0] if loss_b else float("nan")
 
@@ -249,14 +250,15 @@ def main():
                     w_f_pos_only=W_F_POS_ONLY_FE,
                     external_optimizer=optimizer_f,
                     restore_best=False,
+                    grad_debug=True,
                 )
 
-            # B-q. Short q_profile with PUMP target
+            # B-q. Short q_profile with PUMP target (cos_q1 loss, hold demo)
             train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_Q_PROFILE_STEPS, num_epochs=1, lr=LR,
-                track_mode="energy",
+                track_mode="cos_q1",
                 detach_gates_Q_for_qp=True,
                 w_q_profile=W_Q_PROFILE_BOT,
                 q_profile_pump=PUMP,
@@ -264,6 +266,7 @@ def main():
                 q_profile_state_phase=True,
                 external_optimizer=optimizer_q,
                 restore_best=False,
+                grad_debug=True,
             )
 
         # Top episode
@@ -285,6 +288,7 @@ def main():
             detach_f_extra_for_qp=DETACH_F_EXTRA_TOP,
             external_optimizer=optimizer_q,
             restore_best=False,
+            grad_debug=True,
         )
         L_top = loss_t[0] if loss_t else float("nan")
 

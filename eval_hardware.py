@@ -41,7 +41,7 @@ SEED = 42
 
 MODEL_KWARGS = dict(
     state_dim=4, control_dim=2, horizon=10, hidden_dim=128,
-    gate_range_q=0.99, gate_range_r=0.20, f_extra_bound=2.5, f_kickstart_amp=1.0,
+    gate_range_q=0.99, gate_range_r=0.20, f_extra_bound=2.5, f_kickstart_amp=0.01,
 )
 
 # ── Hardware-realistic noise levels ───────────────────────────────────────
