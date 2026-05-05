@@ -356,6 +356,12 @@ def main():
             name = save_checkpoint(model_kwargs, cur_state, meta + 1,
                                    f"diag_ep{meta+1}", SAVE_DIR, tag="_diag")
             out(f"  → Diag snapshot: {name}")
+            # Also persist best_state so regression doesn't lose it between SAVE_EVERY intervals
+            if best_state is not None:
+                bname = save_checkpoint(model_kwargs, best_state, meta + 1,
+                                        f"best_f01={best_f01:.1%}_diag{meta+1}",
+                                        SAVE_DIR, tag="_best")
+                out(f"  → Best state: {bname}  (f01={best_f01:.1%})")
 
     elapsed = time.time() - t0
     if best_state is not None:
