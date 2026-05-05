@@ -47,8 +47,8 @@ Q_BIAS_Q1       = 0.5    # gates≈1.46 → Q_eff=0.146; enough to beat gravity 
 Q_NEAR_PI_POWER = 4
 
 META_EPOCHS      = 200
-N_BOTTOM_PER_TOP = 6     # more short episodes to compensate for short N_BOTTOM
-N_BOTTOM         = 6     # 0.3s rollout: stays below q1=π, prevents Coriolis overflow
+N_BOTTOM_PER_TOP = 3     # fewer per-top since each is longer
+N_BOTTOM         = 25    # 1.25s; covers full swing-up + catch phase (was 15, too short for catch)
 N_TOP            = 100
 LR               = 1e-3
 WEIGHT_DECAY     = 1e-4
@@ -191,7 +191,7 @@ def main():
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON, device=device)
     mpc.dt = torch.tensor(DT, dtype=torch.float64, device=device)
 
-    demo_bottom = make_hold_demo(N_BOTTOM, device)   # target = upright; cos_q1 loss
+    demo_bottom = make_energy_demo(N_BOTTOM, device)  # energy curve 0→π; energy track loss
     demo_top    = make_hold_demo(N_TOP, device)
 
     model_kwargs = dict(
@@ -224,12 +224,12 @@ def main():
     for meta in range(META_EPOCHS):
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
-            # A. Short cos_q1 tracking toward upright (6 steps, no Coriolis overflow)
+            # A. Energy tracking (0.75s); limits velocity at top, clean gradient
             loss_b, _ = train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
-                track_mode="cos_q1",
+                track_mode="energy",
                 detach_gates_Q_for_qp=True,
                 external_optimizer=optimizer_f,
                 restore_best=False,
@@ -253,12 +253,12 @@ def main():
                     grad_debug=True,
                 )
 
-            # B-q. Short q_profile with PUMP target (cos_q1 loss, hold demo)
+            # B-q. Short q_profile with PUMP target (energy loss, energy demo)
             train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_Q_PROFILE_STEPS, num_epochs=1, lr=LR,
-                track_mode="cos_q1",
+                track_mode="energy",
                 detach_gates_Q_for_qp=True,
                 w_q_profile=W_Q_PROFILE_BOT,
                 q_profile_pump=PUMP,

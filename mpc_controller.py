@@ -160,8 +160,8 @@ class MPC_controller:
     # Discretisation
     # ──────────────────────────────────────────────────────────────────────
     def true_RK4_disc(self, x: torch.Tensor, u: torch.Tensor, dt: torch.Tensor,
-                      n_sub: int = 5) -> torch.Tensor:
-        # 5 sub-steps of h=dt/5=0.01s prevent Coriolis overflow (M22^{-1}≈2944).
+                      n_sub: int = 10) -> torch.Tensor:
+        # 10 sub-steps of h=dt/10=0.005s prevent Coriolis overflow (M22^{-1}≈2944).
         h = dt / n_sub
         for _ in range(n_sub):
             t0 = h.new_zeros(())
