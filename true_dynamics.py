@@ -37,7 +37,7 @@ class DoublePendulumDynamics:
     Control:  tau = [u1, u2]  (joint torques, Nm)
     """
 
-    def __init__(self, device=None, dtype=torch.float64):
+    def __init__(self, device=None, dtype=torch.float64, u_lim=_U_LIM):
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device(device)
@@ -53,8 +53,8 @@ class DoublePendulumDynamics:
         self.I2 = torch.tensor(_I2, device=self.device, dtype=self.dtype)
         self.g  = torch.tensor(_G,  device=self.device, dtype=self.dtype)
 
-        self.u_min = torch.tensor([-_U_LIM, -_U_LIM], device=self.device, dtype=self.dtype)
-        self.u_max = torch.tensor([ _U_LIM,  _U_LIM], device=self.device, dtype=self.dtype)
+        self.u_min = torch.tensor([-u_lim, -u_lim], device=self.device, dtype=self.dtype)
+        self.u_max = torch.tensor([ u_lim,  u_lim], device=self.device, dtype=self.dtype)
 
         self.bv = torch.tensor([_BV1, _BV2], device=self.device, dtype=self.dtype)
 

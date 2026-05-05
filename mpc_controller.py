@@ -36,6 +36,7 @@ class MPC_controller:
         x_goal: torch.Tensor,
         N:      int,
         device: torch.device,
+        u_lim:  float = 0.15,
     ):
         self.device = device
         self.x0     = x0.detach().clone().to(device=device, dtype=torch.float64)
@@ -59,8 +60,8 @@ class MPC_controller:
             [0.2, 0.0002, 0.2, 0.0002], device=device, dtype=torch.float64
         ))
 
-        self.true_dynamics = true_dynamics.DoublePendulumDynamics(device=device)
-        self.MPC_dynamics  = MPC_dynamics.DoublePendulumDynamics(device=device)
+        self.true_dynamics = true_dynamics.DoublePendulumDynamics(device=device, u_lim=u_lim)
+        self.MPC_dynamics  = MPC_dynamics.DoublePendulumDynamics(device=device, u_lim=u_lim)
 
         self.n_u_total = self.N * self.MPC_dynamics.u_min.shape[0]
         self.qp_fallback_count = 0
