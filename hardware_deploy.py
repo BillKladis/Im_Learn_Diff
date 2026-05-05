@@ -601,8 +601,10 @@ def load_model(
     if isinstance(data, dict):
         state_dict = data.get("model_state_dict", data)
         metadata   = data.get("metadata", None)
-        tp         = data.get("training_params", {})
-        u_lim      = tp.get("u_lim", 0.15) if tp else 0.15
+        # training_params may be at top level OR nested inside metadata
+        tp = data.get("training_params") or \
+             (metadata.get("training_params") if isinstance(metadata, dict) else None) or {}
+        u_lim = tp.get("u_lim", 0.15) if tp else 0.15
     else:
         state_dict = data
         metadata   = None
