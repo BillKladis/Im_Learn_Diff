@@ -78,9 +78,9 @@ TOP_PERT_Q1D = 0.30
 TOP_PERT_Q2  = 0.20
 TOP_PERT_Q2D = 0.30
 
-EVAL_EVERY      = 5
-SAVE_EVERY      = 25
-DIAG_SAVE_EVERY = 10
+EVAL_EVERY      = 10
+SAVE_EVERY      = 50
+DIAG_SAVE_EVERY = 20
 SAVE_DIR        = "saved_models"
 LOG_FILE        = "/tmp/hw_v2_noiserobust.log"
 
@@ -311,7 +311,7 @@ def main():
 
         f01_str = arr_str = post_str = "—"
         mark = ""
-        if (meta + 1) % EVAL_EVERY == 0 or meta == 0:
+        if (meta + 1) % EVAL_EVERY == 0:
             f01, arr, post = eval2k(model, mpc, x0, x_goal)
             f01_str  = f"{f01:.1%}"
             arr_str  = str(arr) if arr is not None else "None"
