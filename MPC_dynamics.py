@@ -13,6 +13,10 @@ _I2 = 0.00023702395072092597
 _G  = 9.81
 _U_LIM = 0.15   # Nm
 
+# Joint viscous friction — must match true_dynamics so MPC predictions agree.
+_BV1 = 0.005
+_BV2 = 0.005
+
 
 class DoublePendulumDynamics:
     """
@@ -48,6 +52,8 @@ class DoublePendulumDynamics:
 
         self.u_min = torch.tensor([-_U_LIM, -_U_LIM], device=self.device, dtype=self.dtype)
         self.u_max = torch.tensor([ _U_LIM,  _U_LIM], device=self.device, dtype=self.dtype)
+
+        self.bv = torch.tensor([_BV1, _BV2], device=self.device, dtype=self.dtype)
 
     def compute_M_C_G(self, x: torch.Tensor):
         x = x.to(device=self.device, dtype=self.dtype)
@@ -88,8 +94,11 @@ class DoublePendulumDynamics:
         q1, q1_dot, q2, q2_dot = x[0], x[1], x[2], x[3]
         q_dot = torch.stack([q1_dot, q2_dot])
 
+        # Viscous friction.
+        tau_eff = tau - self.bv * q_dot
+
         M, C, G = self.compute_M_C_G(x)
-        q_ddot = torch.linalg.solve(M, tau - C @ q_dot + G)
+        q_ddot = torch.linalg.solve(M, tau_eff - C @ q_dot + G)
 
         return torch.stack([q1_dot, q_ddot[0], q2_dot, q_ddot[1]])
 

@@ -3,5 +3,6 @@ __pycache__/
 *.pyo
 *.pyd
 saved_models/run_20260426_223101/
+saved_models/hw_v1_diag_*/
 exp_compare.py
 logs/
