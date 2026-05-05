@@ -40,9 +40,11 @@ CONTROL_DIM = 2
 HIDDEN_DIM      = 128
 GATE_RANGE_Q    = 0.99
 GATE_RANGE_R    = 0.20
-F_EXTRA_BOUND   = 2.5    # with H_bottom≈32 gives DU*≈0.078Nm per element (52% of u_max)
+F_EXTRA_BOUND   = 1.5    # tightened: was 2.5 (caused fe runaway 0.13→6+); now 31% u_max max
 F_KICKSTART_AMP = 0.01   # very small init so network starts near-zero
 Q_BIAS_Q1       = 0.5    # gates≈1.46 → Q_eff=0.146; enough to beat gravity at top (0.146*0.3>0.027Nm)
+W_F_END_REG      = 1.0   # penalise fe in last few steps of bottom rollout (catch phase)
+F_END_REG_STEPS  = 10    # last 10 steps of N_BOTTOM=25 → covers catch transition
 
 Q_NEAR_PI_POWER = 4
 
@@ -224,13 +226,16 @@ def main():
     for meta in range(META_EPOCHS):
         L_bot_last = float("nan")
         for _ in range(N_BOTTOM_PER_TOP):
-            # A. Energy tracking (0.75s); limits velocity at top, clean gradient
+            # A. Energy tracking (1.25s); limits velocity at top, clean gradient
+            # w_f_end_reg suppresses fe in last F_END_REG_STEPS — catch phase
             loss_b, _ = train_module.train_linearization_network(
                 lin_net=model, mpc=mpc,
                 x0=x0, x_goal=x_goal, demo=demo_bottom,
                 num_steps=N_BOTTOM, num_epochs=1, lr=LR,
                 track_mode="energy",
                 detach_gates_Q_for_qp=True,
+                w_f_end_reg=W_F_END_REG,
+                f_end_reg_steps=F_END_REG_STEPS,
                 external_optimizer=optimizer_f,
                 restore_best=False,
                 grad_debug=True,
