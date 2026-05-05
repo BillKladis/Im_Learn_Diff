@@ -56,7 +56,7 @@ LR               = 1e-3
 WEIGHT_DECAY     = 1e-4
 
 W_Q_PROFILE = 100.0
-PUMP    = [0.2, 1.0, 0.2, 1.0]   # bottom: reduce Q_pos to 20% (allow free swing), keep Q_vel
+PUMP    = [1.0, 1.0, 1.0, 1.0]   # bottom: keep Q at base (let MPC drive directly via Q_pos)
 STABLE  = [2.0, 1.0, 2.0, 1.0]   # top: double Q_pos for strong hold
 
 W_STABLE_PHASE     = 3.0
@@ -80,6 +80,7 @@ TOP_PERT_Q2D = 0.30
 
 EVAL_EVERY = 10
 SAVE_EVERY = 50
+DIAG_SAVE_EVERY = 20  # unconditional snapshot for diagnostics, regardless of f01
 SAVE_DIR   = "saved_models"
 LOG_FILE   = "/tmp/hardware_v1.log"
 
@@ -320,6 +321,12 @@ def main():
             name = save_checkpoint(model_kwargs, best_state, meta + 1,
                                    f"best_f01={best_f01:.1%}", SAVE_DIR)
             out(f"  → Saved: {name}")
+
+        if (meta + 1) % DIAG_SAVE_EVERY == 0:
+            cur_state = {k: v.clone() for k, v in model.state_dict().items()}
+            name = save_checkpoint(model_kwargs, cur_state, meta + 1,
+                                   f"diag_ep{meta+1}", SAVE_DIR, tag="_diag")
+            out(f"  → Diag snapshot: {name}")
 
     elapsed = time.time() - t0
     if best_state is not None:
