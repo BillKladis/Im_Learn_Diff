@@ -41,7 +41,7 @@ SEED = 42
 
 MODEL_KWARGS = dict(
     state_dim=4, control_dim=2, horizon=10, hidden_dim=128,
-    gate_range_q=0.99, gate_range_r=0.20, f_extra_bound=2.5, f_kickstart_amp=0.01,
+    gate_range_q=0.99, gate_range_r=0.20, f_extra_bound=1.5, f_kickstart_amp=0.01,
 )
 
 # ── Hardware-realistic noise levels ───────────────────────────────────────
@@ -122,12 +122,12 @@ def run_section(title, tests, model, mpc, x0, x_goal):
 def main():
     import glob
 
-    # Find latest hw_v1 checkpoint
-    ckpt_paths = sorted(glob.glob("saved_models/hw_v1*/*.pth"))
+    # Find latest hw_v1 checkpoint by modification time
+    ckpt_paths = glob.glob("saved_models/hw_v1*/*.pth")
     if not ckpt_paths:
         print("No hw_v1 checkpoint found. Run exp_hardware_v1.py first.")
         return
-    ckpt = ckpt_paths[-1]
+    ckpt = max(ckpt_paths, key=os.path.getmtime)
     print(f"Loading: {ckpt}")
 
     x0     = torch.tensor(X0,     dtype=torch.float64, device=DEVICE)
