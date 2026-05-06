@@ -1,18 +1,17 @@
 """exp_hardware_v5_sa015.py — Single-actuated shoulder-only, u_max=0.15 Nm.
 
 Physical setup:
-  - Joint 1 (shoulder): controlled by MPC / lin_net
-  - Joint 2 (elbow): held rigid via PD stiffness (kp=5.0, kd=0.5)
-  - Only tau1 from the network; tau2 = -kp*q2 - kd*q2_dot in dynamics
+  - Joint 1 (shoulder): controlled by MPC / lin_net, limit U_LIM=0.15 Nm
+  - Joint 2 (elbow): held rigid via PD stiffness, limit SA_U_LIM_ELBOW=2.0 Nm
 
-This mimics the MAB hardware in single-actuated mode where the elbow
-motor runs in impedance mode with high stiffness while the shoulder motor
-is torque-controlled by the learned policy.
+The elbow PD clamp (2.0 Nm) is intentionally much higher than the shoulder
+limit (0.15 Nm).  On the MAB hardware the elbow motor runs in high-impedance
+mode whose stall torque far exceeds the shoulder control budget; using the
+same 0.15 Nm cap caused the PD to saturate at |q2|>0.03 rad and the elbow
+to oscillate freely — not a rigid link at all.  2.0 Nm keeps q2 well inside
+±0.2 rad during typical shoulder manoeuvres.
 
 Starting from hw_v1_ep50. u_max=0.15 Nm (full shoulder authority).
-
-Expected: easier than double-actuated since we only need to stabilize the
-effective rigid-link double pendulum. Should converge faster.
 """
 
 import glob
@@ -40,9 +39,7 @@ DT     = 0.05
 HORIZON = 10
 U_LIM   = 0.15   # Nm — full shoulder authority
 
-# PD stiffness for elbow joint (joint 2), holding q2=0
-SA_KP = 5.0   # Nm/rad
-SA_KD = 0.5   # Nm·s/rad
+# No PD parameters needed — SA mode freezes q2=0 (rigid link)
 
 STATE_DIM   = 4
 CONTROL_DIM = 2
@@ -56,7 +53,7 @@ W_F_END_REG      = 1.0
 F_END_REG_STEPS  = 10
 Q_NEAR_PI_POWER  = 4
 
-META_EPOCHS      = 100
+META_EPOCHS      = 150
 N_BOTTOM_PER_TOP = 3
 N_BOTTOM         = 25
 N_TOP            = 100
@@ -94,25 +91,28 @@ LOG_FILE        = "/tmp/hw_v5_sa015.log"
 
 # ── Single-actuated dynamics wrapper ──────────────────────────────────────────
 
-def wrap_sa_dynamics(mpc, kp: float, kd: float, u_lim: float):
-    """Replace mpc.true_RK4_disc with a version that applies PD stiffness on joint 2.
+def wrap_sa_dynamics(mpc):
+    """Simulate single-actuated mode by freezing the elbow (q2 = 0 always).
 
-    In our state ordering [q1, q1d, q2, q2d]:
-      q2  = x[2],  q2d = x[3]
-      tau2_pd = clamp(-kp*q2 - kd*q2d, ±u_lim)
+    The elbow is modelled as a rigid mechanical lock: q2 and q2_dot are
+    held at 0 on entry to and exit from every RK4 step.  Only tau1
+    (shoulder) is used; tau2 is zero and irrelevant.
 
-    The QP still outputs [tau1, tau2_qp] but tau2_qp is overridden by PD.
-    Gradients through tau2 are detached (correct for single-actuated training).
+    This is the correct approximation when the elbow motor runs in
+    high-stiffness impedance mode on the MAB hardware.  A PD-based
+    approach causes bang-bang instability because the elbow inertia
+    (I2 ≈ 0.00024 kg·m²) is so small that any finite torque cap saturates
+    at tiny q2 displacements and creates large-amplitude oscillations.
+
+    Gradients flow through q1 / q1_dot; q2 / q2_dot are constant zeros.
     """
-    orig_rk4 = mpc.true_RK4_disc   # bound method — captures the instance
+    orig_rk4 = mpc.true_RK4_disc
 
     def sa_rk4(x, u, dt, n_sub=10):
-        q2  = x[2]
-        q2d = x[3]
-        tau2_pd = (-kp * q2 - kd * q2d).detach().clamp(-u_lim, u_lim)
-        u_sa = u.clone()
-        u_sa[1] = tau2_pd
-        return orig_rk4(x, u_sa, dt, n_sub)
+        x_in = torch.cat([x[:2], torch.zeros(2, dtype=x.dtype, device=x.device)])
+        u_in = torch.cat([u[:1], torch.zeros(1, dtype=u.dtype, device=u.device)])
+        x_out = orig_rk4(x_in, u_in, dt, n_sub)
+        return torch.cat([x_out[:2], torch.zeros(2, dtype=x_out.dtype, device=x_out.device)])
 
     mpc.true_RK4_disc = sa_rk4
     return mpc
@@ -189,8 +189,7 @@ def save_checkpoint(model_kwargs, state_dict, meta, label, save_dir, tag=""):
             "label": label,
             "u_lim": U_LIM,
             "single_actuated": True,
-            "sa_kp": SA_KP,
-            "sa_kd": SA_KD,
+            "rigid_elbow": True,
         },
         session_name=name,
     )
@@ -211,8 +210,7 @@ def main():
     out("=" * 80)
     out("  EXP: HARDWARE v5 — single-actuated (shoulder only), u_max=0.15 Nm")
     out(f"  device: {device}")
-    out(f"  U_LIM={U_LIM}  SA_KP={SA_KP}  SA_KD={SA_KD}")
-    out(f"  Joint 2 (elbow): PD stiffness — tau2=-{SA_KP}*q2-{SA_KD}*q2d")
+    out(f"  U_LIM={U_LIM}  (single-actuated: elbow frozen at q2=0)")
     out("=" * 80)
 
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=HORIZON,
@@ -220,8 +218,8 @@ def main():
     mpc.dt = torch.tensor(DT, dtype=torch.float64, device=device)
 
     # Apply single-actuated dynamics wrapper
-    wrap_sa_dynamics(mpc, kp=SA_KP, kd=SA_KD, u_lim=U_LIM)
-    out(f"  SA dynamics: tau2 overridden with PD in true_RK4_disc")
+    wrap_sa_dynamics(mpc)
+    out(f"  SA dynamics: elbow frozen at q2=0 (rigid link approximation)")
 
     demo_bottom = make_energy_demo(N_BOTTOM, device)
     demo_top    = make_hold_demo(N_TOP, device)
