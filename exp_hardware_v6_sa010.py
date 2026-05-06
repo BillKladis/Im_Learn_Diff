@@ -1,14 +1,9 @@
 """exp_hardware_v6_sa010.py — Single-actuated shoulder-only, u_max=0.10 Nm.
 
-Physical setup:
-  - Joint 1 (shoulder): controlled by MPC / lin_net, limit U_LIM=0.10 Nm
-  - Joint 2 (elbow): held rigid via PD stiffness, limit SA_U_LIM_ELBOW=2.0 Nm
-
-See exp_hardware_v5_sa015.py for rationale on the separate elbow PD cap.
-
+SA dynamics freeze the elbow at q2=0, q2d=0 in RK4 (rigid link approximation).
+Models MAB hardware high-stiffness impedance mode on joint 2.
 Starting from hw_v1_ep50. u_max=0.10 Nm shoulder authority.
-Note: gravity at q1=π/2 is ~0.089 Nm ≈ u_lim — swing-up is borderline;
-energy pumping may be needed.
+Note: gravity at q1=π/2 is ~0.089 Nm ≈ u_lim — swing-up is borderline.
 """
 
 import glob

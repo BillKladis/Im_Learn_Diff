@@ -1,16 +1,7 @@
 """exp_hardware_v5_sa015.py — Single-actuated shoulder-only, u_max=0.15 Nm.
 
-Physical setup:
-  - Joint 1 (shoulder): controlled by MPC / lin_net, limit U_LIM=0.15 Nm
-  - Joint 2 (elbow): held rigid via PD stiffness, limit SA_U_LIM_ELBOW=2.0 Nm
-
-The elbow PD clamp (2.0 Nm) is intentionally much higher than the shoulder
-limit (0.15 Nm).  On the MAB hardware the elbow motor runs in high-impedance
-mode whose stall torque far exceeds the shoulder control budget; using the
-same 0.15 Nm cap caused the PD to saturate at |q2|>0.03 rad and the elbow
-to oscillate freely — not a rigid link at all.  2.0 Nm keeps q2 well inside
-±0.2 rad during typical shoulder manoeuvres.
-
+SA dynamics freeze the elbow at q2=0, q2d=0 in RK4 (rigid link approximation).
+Models MAB hardware high-stiffness impedance mode on joint 2.
 Starting from hw_v1_ep50. u_max=0.15 Nm (full shoulder authority).
 """
 
