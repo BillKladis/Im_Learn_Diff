@@ -177,23 +177,32 @@ class LogRecorder:
         f01 = float((wraps < 0.10).mean())
         final_err = float(np.linalg.norm(x_est[-1] - x_goal.cpu().numpy()))
         rms = np.sqrt(np.mean(resid**2, axis=0))
-        # Per-component timing breakdown (skip step 0 — cvx JIT spike).
+        # Two timing windows.  Step 0 is dominated by torch/cvxpy/osqp JIT and
+        # cold-cache effects (often 100-1000× steady state) — useful to call
+        # out, but not representative of real-time control.  Steady-state
+        # numbers (post-warmup) are what matters for the 50ms budget.
         warm = slice(min(1, n - 1), n)
+        loop_warm  = loop[warm]
         read  = self.read_ms[:n][warm]
         ekf   = self.ekf_ms[:n][warm]
         mdl   = self.model_ms[:n][warm]
         qp    = self.qp_ms[:n][warm]
         wri   = self.write_ms[:n][warm]
-        components = (
-            f"  Component (mean ms, post-warmup):\n"
-            f"      read={read.mean():.2f}  ekf={ekf.mean():.2f}  "
-            f"model={mdl.mean():.2f}  qp={qp.mean():.2f}  write={wri.mean():.2f}\n"
-        )
+
+        budget_ms = self.dt * 1000.0
+        warm_p99  = float(np.percentile(loop_warm, 99))
+        budget_msg = "✓ under budget" if warm_p99 <= budget_ms else "⚠ OVER budget"
+
         return (
             f"  Steps:       {n}  ({n * self.dt:.1f}s)\n"
-            f"  Loop time:   mean={loop.mean():.1f}ms  p99={np.percentile(loop, 99):.1f}ms"
-            f"  max={loop.max():.1f}ms  budget={self.dt*1000:.0f}ms\n"
-            + components +
+            f"  Loop time (steady-state, step≥1):\n"
+            f"      mean={loop_warm.mean():.1f}ms  p99={warm_p99:.1f}ms"
+            f"  max={loop_warm.max():.1f}ms  budget={budget_ms:.0f}ms  {budget_msg}\n"
+            f"  Loop time (incl. step 0 JIT spike): mean={loop.mean():.1f}ms"
+            f"  step0={loop[0]:.0f}ms\n"
+            f"  Component (mean ms, steady-state):\n"
+            f"      read={read.mean():.2f}  ekf={ekf.mean():.2f}  "
+            f"model={mdl.mean():.2f}  qp={qp.mean():.2f}  write={wri.mean():.2f}\n"
             f"  Saturation:  {sat.mean()*100:.1f}% of steps clamped at u_lim\n"
             f"  ESTOP:       {int(estop.sum())} step(s) (vel > {ESTOP_VEL_LIMIT} rad/s)\n"
             f"  Hardware f01: {f01*100:.1f}%  (wraps<0.10 to inverted)\n"
