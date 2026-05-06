@@ -165,7 +165,9 @@ def load_model(ckpt_path: str) -> Tuple[object, dict, float]:
         print(f"  [WARN] Unexpected keys: {unexpected}")
 
     model.eval()
-    info = {"arch": arch, "u_lim": u_lim, **kwargs}
+    # Expose whether checkpoint was trained as single-actuated
+    sa_flag = bool(tp.get("single_actuated", False) or tp.get("rigid_elbow", False))
+    info = {"arch": arch, "u_lim": u_lim, "single_actuated": sa_flag, **kwargs}
     return model, info, u_lim
 
 
@@ -450,6 +452,12 @@ def main():
     model, info, u_lim_ckpt = load_model(ckpt)
     u_lim = args.u_lim if args.u_lim is not None else u_lim_ckpt
     print(f"  arch={info['arch']}  u_lim={u_lim}  horizon={info['horizon']}")
+    if info["single_actuated"] and args.actuate == "double":
+        print("  [WARN] Checkpoint was trained as single-actuated (rigid elbow) but "
+              "--actuate double was requested.  Pass --actuate single for correct behaviour.")
+    elif not info["single_actuated"] and args.actuate == "single":
+        print("  [WARN] Checkpoint was trained double-actuated but --actuate single "
+              "was requested.  The rigid-elbow wrap will still be applied to MPC.")
 
     if args.check:
         print("  Model loaded OK.")
