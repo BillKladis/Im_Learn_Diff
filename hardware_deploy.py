@@ -462,10 +462,10 @@ def main():
                                      device=torch.device("cpu"), u_lim=u_lim)
     mpc.dt = torch.tensor(0.05, dtype=torch.float64)
 
-    # SA simulation uses rigid-elbow dynamics to match training
-    if args.actuate == "single" and args.sim:
+    # SA mode: MPC plans with rigid-elbow dynamics (matches SA training)
+    if args.actuate == "single":
         wrap_sa_dynamics(mpc)
-        print("  SA sim: rigid-elbow dynamics active")
+        print("  SA mode: rigid-elbow dynamics in MPC planner")
 
     run(model, mpc, x_goal,
         sim=args.sim, ekf_mode=args.ekf, actuate=args.actuate,
