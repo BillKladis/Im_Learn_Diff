@@ -1,20 +1,23 @@
 """
-mpc_controller.py — Linearised receding-horizon MPC with cvxpylayers backend.
+mpc_controller.py — Linearised receding-horizon MPC with switchable QP backend.
 
-Changes vs previous version:
-  - QP solved by cvxpylayers (CvxpyLayer) instead of qpth.
-  - Removed Qf_dense, extra_linear_state, u_lin_delta arguments throughout.
-  - Default diagonal Qf used (no learned Qf head).
-  - Energy shaping (_build_energy_control_tau1 in Simulate.py) still adds
-    extra_linear_control directly to f — that path is preserved.
+Two QP solvers, sharing the same cost-matrix construction:
+
+  solver_backend="cvx"  (default)
+      cvxpylayers + SCS.  Slower (~50–300 ms per solve) but DIFFERENTIABLE
+      via implicit-diff through KKT.  Required for training.
+
+  solver_backend="osqp"
+      OSQP direct C solver.  Fast (~1–5 ms per solve) but NOT differentiable.
+      Use at deployment time when no gradients are needed.
 
 QP form (control-space, delta-u parameterisation):
     min  ½ ΔUᵀ H ΔU + fᵀ ΔU
     s.t. lb ≤ ΔU ≤ ub
 
 The cvxpylayers DPP-compliant formulation passes H via its Cholesky-like
-square root H_sqrt where  H_sqrt.T @ H_sqrt = H. The objective becomes
-½ ||H_sqrt @ ΔU||² + f @ ΔU which is DPP and differentiable.
+square root H_sqrt where H_sqrt.T @ H_sqrt = H.  OSQP takes H directly
+in upper-triangular CSC form.
 """
 
 from typing import List, Optional, Tuple
@@ -37,6 +40,9 @@ class MPC_controller:
         N:      int,
         device: torch.device,
         u_lim:  float = 0.15,
+        solver_backend: str = "cvx",   # "cvx" (differentiable) or "osqp" (fast)
+        qp_eps: float = 1e-3,           # OSQP convergence tolerance
+        qp_max_iters: int = 200,        # OSQP iteration cap (also used by SCS)
     ):
         self.device = device
         self.x0     = x0.detach().clone().to(device=device, dtype=torch.float64)
@@ -66,8 +72,20 @@ class MPC_controller:
         self.n_u_total = self.N * self.MPC_dynamics.u_min.shape[0]
         self.qp_fallback_count = 0
 
-        # Build the cvxpylayers QP once.
-        self._build_qp_layer()
+        # Stash solver-tuning parameters for both backends.
+        self.qp_eps = float(qp_eps)
+        self.qp_max_iters = int(qp_max_iters)
+
+        # Build the chosen backend.  cvx is the default (covers training).
+        if solver_backend not in ("cvx", "osqp"):
+            raise ValueError(
+                f"solver_backend must be 'cvx' or 'osqp', got {solver_backend!r}"
+            )
+        self.solver_backend = solver_backend
+        if solver_backend == "cvx":
+            self._build_qp_layer()
+        else:
+            self._build_osqp_workspace()
 
     # ──────────────────────────────────────────────────────────────────────
     # cvxpylayers QP construction
@@ -94,6 +112,58 @@ class MPC_controller:
             parameters=[H_sqrt, f_par, lb_par, ub_par],
             variables=[DU],
         )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # OSQP workspace (fast direct solver, no autograd)
+    # ──────────────────────────────────────────────────────────────────────
+    def _build_osqp_workspace(self):
+        """Pre-build a reusable OSQP workspace.
+
+        OSQP wants P in upper-triangular CSC form.  We allocate a fully
+        dense upper-triangular pattern at setup so that on every solve the
+        pattern (nnz indices) is unchanged — only the .data values move.
+        That lets us call `update(Px=...)` instead of `setup(...)` each
+        step, which is the difference between ~1 ms and ~10 ms per solve.
+        """
+        import osqp
+        import scipy.sparse as sp
+
+        n = self.n_u_total
+
+        # Fully-dense upper-triangular pattern (n*(n+1)/2 nonzeros).
+        # Setting all to 1.0 first guarantees no entries get dropped.
+        P_dense_init = np.triu(np.ones((n, n), dtype=np.float64))
+        P_csc = sp.csc_matrix(P_dense_init)
+        # Constraint matrix for box constraints is just identity.
+        A_csc = sp.eye(n, format="csc", dtype=np.float64)
+
+        self.osqp_prob = osqp.OSQP()
+        self.osqp_prob.setup(
+            P_csc, np.zeros(n), A_csc,
+            np.full(n, -1e6), np.full(n, 1e6),
+            eps_abs=self.qp_eps,
+            eps_rel=self.qp_eps,
+            max_iter=self.qp_max_iters,
+            verbose=False,
+            polish=False,         # polishing adds ~0.5 ms; box QPs rarely need it
+            warm_start=True,      # carry over previous solution as warm start
+            adaptive_rho=False,   # adaptive_rho costs Python overhead per solve
+            check_termination=25, # check convergence every 25 iters (cheap)
+            scaling=10,           # equilibration helps conditioning (~free)
+        )
+
+        # Cache the (row, col) index arrays so we can extract H values from a
+        # dense numpy array in CSC column-major order.  scipy.sparse.find
+        # returns (rows, cols, data) — we want them in the same order OSQP's
+        # internal Px array expects, which is the order P_csc.data was built.
+        rows = []
+        cols = []
+        for j in range(n):
+            for i in range(j + 1):
+                rows.append(i)
+                cols.append(j)
+        self._osqp_P_rows = np.asarray(rows, dtype=np.int64)
+        self._osqp_P_cols = np.asarray(cols, dtype=np.int64)
 
     # ──────────────────────────────────────────────────────────────────────
     # Cost matrices
@@ -356,7 +426,19 @@ class MPC_controller:
         lb: torch.Tensor,
         ub: torch.Tensor,
     ) -> torch.Tensor:
-        """Solve the QP via cvxpylayers and return ΔU* (n,)."""
+        """Solve the QP and return ΔU* (n,).  Dispatches to the chosen backend."""
+        if self.solver_backend == "osqp":
+            return self._solve_mpc_qp_osqp(H, f, lb, ub)
+        return self._solve_mpc_qp_cvx(H, f, lb, ub)
+
+    def _solve_mpc_qp_cvx(
+        self,
+        H:  torch.Tensor,
+        f:  torch.Tensor,
+        lb: torch.Tensor,
+        ub: torch.Tensor,
+    ) -> torch.Tensor:
+        """cvxpylayers backend — slower but differentiable.  Used in training."""
 
         def _fallback_zero():
             self.qp_fallback_count += 1
@@ -376,7 +458,11 @@ class MPC_controller:
         try:
             (DU_opt,) = self.qp_layer(
                 H_sqrt, f, lb, ub,
-                solver_args={"solve_method": "SCS", "eps": 1e-6, "max_iters": 50000},
+                solver_args={
+                    "solve_method": "SCS",
+                    "eps": self.qp_eps,
+                    "max_iters": self.qp_max_iters,
+                },
             )
         except Exception:
             return _fallback_zero()
@@ -390,6 +476,58 @@ class MPC_controller:
                 lambda grad: torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
             )
         return DU_opt
+
+    def _solve_mpc_qp_osqp(
+        self,
+        H:  torch.Tensor,
+        f:  torch.Tensor,
+        lb: torch.Tensor,
+        ub: torch.Tensor,
+    ) -> torch.Tensor:
+        """OSQP backend — direct C QP solver, ~10–100× faster than cvx.
+
+        Not differentiable.  Use only at deployment / eval time.  Updates
+        the pre-built workspace's P (upper-tri values), q, l, u in place.
+        """
+        def _fallback_zero():
+            self.qp_fallback_count += 1
+            return torch.zeros(self.n_u_total, device=self.device, dtype=torch.float64)
+
+        if not torch.isfinite(H).all() or not torch.isfinite(f).all():
+            return _fallback_zero()
+
+        # Symmetric ridge for numerical safety (matches cvx path).
+        H_np = H.detach().cpu().numpy().astype(np.float64, copy=False)
+        n = H_np.shape[0]
+        H_np = H_np + 1e-6 * np.eye(n, dtype=np.float64)
+
+        # Extract upper-triangular values in the same column-major CSC order
+        # OSQP saw at setup time.
+        Px = H_np[self._osqp_P_rows, self._osqp_P_cols]
+
+        f_np  = f.detach().cpu().numpy().astype(np.float64, copy=False)
+        lb_np = lb.detach().cpu().numpy().astype(np.float64, copy=False)
+        ub_np = ub.detach().cpu().numpy().astype(np.float64, copy=False)
+
+        try:
+            self.osqp_prob.update(Px=Px, q=f_np, l=lb_np, u=ub_np)
+            result = self.osqp_prob.solve()
+        except Exception:
+            return _fallback_zero()
+
+        # OSQP status: 'solved' / 'solved_inaccurate' are both usable.
+        # Anything else (max_iter_reached, primal_infeasible, ...) → fallback.
+        status = getattr(result.info, "status", "")
+        if status not in ("solved", "solved inaccurate", "solved_inaccurate"):
+            return _fallback_zero()
+
+        DU = np.asarray(result.x, dtype=np.float64)
+        if not np.isfinite(DU).all():
+            return _fallback_zero()
+
+        DU_t = torch.from_numpy(DU).to(device=self.device, dtype=torch.float64)
+        DU_t = DU_t.clamp(lb, ub)
+        return DU_t
 
     # ──────────────────────────────────────────────────────────────────────
     # Top-level control entry point

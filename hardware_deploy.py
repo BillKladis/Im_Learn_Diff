@@ -113,12 +113,20 @@ class LogRecorder:
         self.bias     = np.empty((max_steps, 2),   dtype=np.float64)
         self.resid    = np.empty((max_steps, 4),   dtype=np.float64)
         self.loop_ms  = np.empty(max_steps,        dtype=np.float32)
+        # Per-component breakdown (all in ms).  Helps identify whether the
+        # bottleneck is encoder I/O, EKF Jacobian, model fwd, or QP solve.
+        self.read_ms  = np.empty(max_steps,        dtype=np.float32)
+        self.ekf_ms   = np.empty(max_steps,        dtype=np.float32)
+        self.model_ms = np.empty(max_steps,        dtype=np.float32)
+        self.qp_ms    = np.empty(max_steps,        dtype=np.float32)
+        self.write_ms = np.empty(max_steps,        dtype=np.float32)
         self.sat      = np.empty(max_steps,        dtype=bool)
         self.estop    = np.empty(max_steps,        dtype=bool)
         self.k = 0
 
     def append(self, t, x_hw, x_est, u_mpc, u_cmd, bias, resid,
-               loop_ms, sat, estop):
+               loop_ms, sat, estop,
+               read_ms=0.0, ekf_ms=0.0, model_ms=0.0, qp_ms=0.0, write_ms=0.0):
         i = self.k
         if i >= self.N:
             return
@@ -130,6 +138,11 @@ class LogRecorder:
         self.bias[i]    = bias
         self.resid[i]   = resid
         self.loop_ms[i] = loop_ms
+        self.read_ms[i] = read_ms
+        self.ekf_ms[i]  = ekf_ms
+        self.model_ms[i]= model_ms
+        self.qp_ms[i]   = qp_ms
+        self.write_ms[i]= write_ms
         self.sat[i]     = sat
         self.estop[i]   = estop
         self.k += 1
@@ -141,7 +154,11 @@ class LogRecorder:
             t=self.t[:n], x_hw=self.x_hw[:n], x_est=self.x_est[:n],
             u_mpc=self.u_mpc[:n], u_cmd=self.u_cmd[:n],
             bias=self.bias[:n], resid=self.resid[:n],
-            loop_ms=self.loop_ms[:n], sat=self.sat[:n], estop=self.estop[:n],
+            loop_ms=self.loop_ms[:n],
+            read_ms=self.read_ms[:n], ekf_ms=self.ekf_ms[:n],
+            model_ms=self.model_ms[:n], qp_ms=self.qp_ms[:n],
+            write_ms=self.write_ms[:n],
+            sat=self.sat[:n], estop=self.estop[:n],
         )
 
     def summary(self, x_goal: torch.Tensor) -> str:
@@ -160,10 +177,23 @@ class LogRecorder:
         f01 = float((wraps < 0.10).mean())
         final_err = float(np.linalg.norm(x_est[-1] - x_goal.cpu().numpy()))
         rms = np.sqrt(np.mean(resid**2, axis=0))
+        # Per-component timing breakdown (skip step 0 — cvx JIT spike).
+        warm = slice(min(1, n - 1), n)
+        read  = self.read_ms[:n][warm]
+        ekf   = self.ekf_ms[:n][warm]
+        mdl   = self.model_ms[:n][warm]
+        qp    = self.qp_ms[:n][warm]
+        wri   = self.write_ms[:n][warm]
+        components = (
+            f"  Component (mean ms, post-warmup):\n"
+            f"      read={read.mean():.2f}  ekf={ekf.mean():.2f}  "
+            f"model={mdl.mean():.2f}  qp={qp.mean():.2f}  write={wri.mean():.2f}\n"
+        )
         return (
             f"  Steps:       {n}  ({n * self.dt:.1f}s)\n"
             f"  Loop time:   mean={loop.mean():.1f}ms  p99={np.percentile(loop, 99):.1f}ms"
             f"  max={loop.max():.1f}ms  budget={self.dt*1000:.0f}ms\n"
+            + components +
             f"  Saturation:  {sat.mean()*100:.1f}% of steps clamped at u_lim\n"
             f"  ESTOP:       {int(estop.sum())} step(s) (vel > {ESTOP_VEL_LIMIT} rad/s)\n"
             f"  Hardware f01: {f01*100:.1f}%  (wraps<0.10 to inverted)\n"
@@ -439,8 +469,12 @@ class ControlLoop:
         self.step_n = 0
         self._t0 = time.perf_counter()
 
-    def step(self, x_hw: np.ndarray) -> np.ndarray:
-        """One control step. Returns [tau1, tau2] actually applied."""
+    def step(self, x_hw: np.ndarray, read_ms: float = 0.0) -> np.ndarray:
+        """One control step. Returns [tau1, tau2] actually applied.
+
+        `read_ms` is the wall time the caller spent in `hw.read()` and is
+        recorded in the telemetry; pass 0 if not measured (sim).
+        """
         t_loop_start = time.perf_counter()
 
         # 1. Permute hardware ordering → network ordering (CPU)
@@ -448,6 +482,7 @@ class ControlLoop:
         x_raw = torch.from_numpy(x_hw_arr[HW_TO_OURS].copy())
 
         # 2. EKF predict+update (skip on first step — no previous u yet)
+        t_ekf_start = time.perf_counter()
         if self.ekf is not None and self.step_n > 0:
             x_est, bias = self.ekf.step(x_raw, self._u_prev)
         else:
@@ -455,6 +490,7 @@ class ControlLoop:
             bias  = torch.zeros(2, dtype=torch.float64)
             if self.ekf is not None and self.step_n == 0:
                 self.ekf.reset(x_est)
+        ekf_ms = (time.perf_counter() - t_ekf_start) * 1000.0
 
         # 3. Build x_model: SA zeroes elbow before model inference
         x_model_cpu = x_est.clone()
@@ -470,6 +506,7 @@ class ControlLoop:
             self._hist[-1] = x_model_cpu
 
         # 4. Model forward (on device, no_grad, eval-mode already set)
+        t_model_start = time.perf_counter()
         with torch.no_grad():
             gQ, gR, f_extra, _, _, gQf = self.model(
                 self._hist, self._q_base, self._r_base
@@ -479,9 +516,12 @@ class ControlLoop:
                 gR      = gR.to("cpu")
                 f_extra = f_extra.to("cpu")
                 gQf     = gQf.to("cpu")
+        model_ms = (time.perf_counter() - t_model_start) * 1000.0
 
-        # 5. QP solve (CPU only — cvxpylayer is CPU-bound).
-        # Fill pre-allocated linearisation buffers in-place.
+        # 5. QP solve — includes nominal rollout, linearization (vmap+jacrev),
+        #    cost-matrix construction, and the actual QP solve.  This is
+        #    typically the dominant cost.
+        t_qp_start = time.perf_counter()
         self._x_lin[:] = x_model_cpu.unsqueeze(0)
         u_lin_seq = torch.clamp(
             self._u_seq, min=self._u_min.unsqueeze(0), max=self._u_max.unsqueeze(0)
@@ -498,6 +538,7 @@ class ControlLoop:
         U_reshaped = U_opt_full.detach().view(self.mpc.N, 2)
         self._u_seq[:-1] = U_reshaped[1:]
         self._u_seq[-1]  = U_reshaped[-1]
+        qp_ms = (time.perf_counter() - t_qp_start) * 1000.0
 
         u_opt_d = u_opt.detach()
 
@@ -529,9 +570,11 @@ class ControlLoop:
                 print(f"  [ESTOP] step={self.step_n}  vel={vel:.1f} rad/s", flush=True)
 
         # 9. Send torques; record for next EKF predict
+        t_write_start = time.perf_counter()
         self.hw.write(tau)
+        write_ms = (time.perf_counter() - t_write_start) * 1000.0
         self._u_prev = torch.from_numpy(tau.copy())
-        loop_ms = (time.perf_counter() - t_loop_start) * 1000.0
+        loop_ms = (time.perf_counter() - t_loop_start) * 1000.0 + read_ms
 
         # 10. Telemetry
         if self.recorder is not None:
@@ -541,6 +584,8 @@ class ControlLoop:
                 u_mpc=u_mpc_record, u_cmd=tau, bias=bias.numpy(),
                 resid=(x_raw - x_est).numpy(),
                 loop_ms=loop_ms, sat=sat_flag, estop=estop_flag,
+                read_ms=read_ms, ekf_ms=ekf_ms,
+                model_ms=model_ms, qp_ms=qp_ms, write_ms=write_ms,
             )
 
         # 11. Periodic status print
@@ -591,8 +636,10 @@ def run(
     try:
         for _ in range(max_steps):
             t_loop = time.perf_counter()
+            t_read_start = time.perf_counter()
             x_hw   = hw.read()
-            ctrl.step(x_hw)
+            read_ms = (time.perf_counter() - t_read_start) * 1000.0
+            ctrl.step(x_hw, read_ms=read_ms)
             elapsed = time.perf_counter() - t_loop
             sleep   = max(0.0, dt - elapsed)
             if sleep > 0:
@@ -651,6 +698,19 @@ def main():
                         "always run on CPU (cvxpylayer is CPU-only).  For the "
                         "tiny networks used here at 20Hz, CPU is usually faster "
                         "than CUDA due to PCIe transfer overhead.")
+    p.add_argument("--solver", type=str, default="osqp",
+                   choices=["cvx", "osqp"],
+                   help="QP solver backend.  'osqp' is direct C, ~10x faster "
+                        "for the 20-dim box QP we have but not differentiable. "
+                        "'cvx' is cvxpylayers + SCS, slower but differentiable "
+                        "(needed for training; pointless at deploy).")
+    p.add_argument("--qp-eps", type=float, default=1e-3,
+                   help="QP convergence tolerance (OSQP eps_abs/eps_rel, or "
+                        "SCS eps).  Tighter ⇒ slower.  Default 1e-3 is fine "
+                        "for control; training uses 1e-6.")
+    p.add_argument("--qp-iters", type=int, default=200,
+                   help="QP iteration cap.  OSQP usually converges in 10-30, "
+                        "200 is comfortably above worst case.")
     args = p.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -678,9 +738,15 @@ def main():
     x0     = torch.zeros(4, dtype=torch.float64)
     x_goal = torch.tensor([math.pi, 0.0, 0.0, 0.0], dtype=torch.float64)
 
-    mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=info["horizon"],
-                                     device=torch.device("cpu"), u_lim=u_lim)
+    mpc = mpc_module.MPC_controller(
+        x0=x0, x_goal=x_goal, N=info["horizon"],
+        device=torch.device("cpu"), u_lim=u_lim,
+        solver_backend=args.solver,
+        qp_eps=args.qp_eps,
+        qp_max_iters=args.qp_iters,
+    )
     mpc.dt = torch.tensor(0.05, dtype=torch.float64)
+    print(f"  Solver:    {args.solver}  (eps={args.qp_eps}  max_iters={args.qp_iters})")
 
     # SA mode: MPC plans with rigid-elbow dynamics (matches SA training)
     if args.actuate == "single":
