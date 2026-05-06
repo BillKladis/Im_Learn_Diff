@@ -74,8 +74,8 @@ ESTOP_VEL_LIMIT = 20.0   # rad/s
 def wrap_sa_dynamics(mpc) -> None:
     """Replace mpc.true_RK4_disc with a rigid-elbow version (q2=q2d=0).
 
-    Used in simulation mode with single-actuated models so that the sim
-    matches the training dynamics exactly.
+    Used for both sim and hardware SA mode so MPC planning matches the
+    rigid-elbow dynamics the model was trained with.
     """
     orig = mpc.true_RK4_disc
 
