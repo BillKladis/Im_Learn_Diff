@@ -420,6 +420,8 @@ class ControlLoop:
         monitor:   int   = 1,
         device:    torch.device = torch.device("cpu"),
         recorder:  Optional["LogRecorder"] = None,
+        jac_cache: int   = 1,
+        profile:   bool  = False,
     ):
         self.model    = model
         self.mpc      = mpc
@@ -430,13 +432,14 @@ class ControlLoop:
         self.monitor  = monitor
         self.device   = device
         self.recorder = recorder
+        self.profile  = profile     # if True, print fine-grained timing for first 5 steps
         self.step_n   = 0
 
         # Build EKF (always CPU — small matrices, autograd jacobians)
         if ekf_mode == "ekf6":
-            self.ekf = EKF6(mpc, Q_STATE, Q_BIAS, R_OBS)
+            self.ekf = EKF6(mpc, Q_STATE, Q_BIAS, R_OBS, jac_cache=jac_cache)
         elif ekf_mode == "ekf4":
-            self.ekf = EKF4(mpc, Q_STATE, R_OBS)
+            self.ekf = EKF4(mpc, Q_STATE, R_OBS, jac_cache=jac_cache)
         else:
             self.ekf = None
 
@@ -474,12 +477,19 @@ class ControlLoop:
 
         `read_ms` is the wall time the caller spent in `hw.read()` and is
         recorded in the telemetry; pass 0 if not measured (sim).
+
+        When self.profile=True, we capture wall time at every section
+        boundary on the first 5 steps and print the breakdown.  Useful for
+        finding where the "loop time vs. component sum" gap lives.
         """
         t_loop_start = time.perf_counter()
+        prof = (self.profile and self.step_n < 5)
+        prof_marks = [("start", t_loop_start)] if prof else None
 
         # 1. Permute hardware ordering → network ordering (CPU)
         x_hw_arr = np.asarray(x_hw, dtype=np.float64)
         x_raw = torch.from_numpy(x_hw_arr[HW_TO_OURS].copy())
+        if prof: prof_marks.append(("permute", time.perf_counter()))
 
         # 2. EKF predict+update (skip on first step — no previous u yet)
         t_ekf_start = time.perf_counter()
@@ -491,6 +501,7 @@ class ControlLoop:
             if self.ekf is not None and self.step_n == 0:
                 self.ekf.reset(x_est)
         ekf_ms = (time.perf_counter() - t_ekf_start) * 1000.0
+        if prof: prof_marks.append(("ekf", time.perf_counter()))
 
         # 3. Build x_model: SA zeroes elbow before model inference
         x_model_cpu = x_est.clone()
@@ -504,6 +515,7 @@ class ControlLoop:
             self._hist[-1] = x_model_cpu.to(self.device, non_blocking=True)
         else:
             self._hist[-1] = x_model_cpu
+        if prof: prof_marks.append(("hist", time.perf_counter()))
 
         # 4. Model forward (on device, no_grad, eval-mode already set)
         t_model_start = time.perf_counter()
@@ -517,6 +529,7 @@ class ControlLoop:
                 f_extra = f_extra.to("cpu")
                 gQf     = gQf.to("cpu")
         model_ms = (time.perf_counter() - t_model_start) * 1000.0
+        if prof: prof_marks.append(("model", time.perf_counter()))
 
         # 5. QP solve — includes nominal rollout, linearization (vmap+jacrev),
         #    cost-matrix construction, and the actual QP solve.  This is
@@ -539,6 +552,7 @@ class ControlLoop:
         self._u_seq[:-1] = U_reshaped[1:]
         self._u_seq[-1]  = U_reshaped[-1]
         qp_ms = (time.perf_counter() - t_qp_start) * 1000.0
+        if prof: prof_marks.append(("qp", time.perf_counter()))
 
         u_opt_d = u_opt.detach()
 
@@ -568,6 +582,7 @@ class ControlLoop:
             tau = np.zeros(2)
             if self.monitor >= 1:
                 print(f"  [ESTOP] step={self.step_n}  vel={vel:.1f} rad/s", flush=True)
+        if prof: prof_marks.append(("post-qp-bookkeeping", time.perf_counter()))
 
         # 9. Send torques; record for next EKF predict
         t_write_start = time.perf_counter()
@@ -575,6 +590,7 @@ class ControlLoop:
         write_ms = (time.perf_counter() - t_write_start) * 1000.0
         self._u_prev = torch.from_numpy(tau.copy())
         loop_ms = (time.perf_counter() - t_loop_start) * 1000.0 + read_ms
+        if prof: prof_marks.append(("write+u_prev", time.perf_counter()))
 
         # 10. Telemetry
         if self.recorder is not None:
@@ -593,6 +609,16 @@ class ControlLoop:
             err = float(np.linalg.norm(x_est.numpy() - self.x_goal.cpu().numpy()))
             print(f"  step={self.step_n+1:>5}  u=[{tau[0]:+.3f},{tau[1]:+.3f}]"
                   f"  err={err:.3f}  loop={loop_ms:.1f}ms", flush=True)
+
+        # 12. Fine-grained profile print (first 5 steps when profile=True)
+        if prof and prof_marks is not None:
+            t_telemetry_done = time.perf_counter()
+            prof_marks.append(("recorder", t_telemetry_done))
+            print(f"  [profile] step {self.step_n}  loop_ms={loop_ms:.2f}", flush=True)
+            for i in range(1, len(prof_marks)):
+                name, t = prof_marks[i]
+                dt = (t - prof_marks[i - 1][1]) * 1000
+                print(f"      {name:>22s}  +{dt:6.2f}ms", flush=True)
 
         self.step_n += 1
         return tau
@@ -614,13 +640,16 @@ def run(
     device:    torch.device = torch.device("cpu"),
     logfile:   Optional[str] = None,
     model_name: str = "",
+    jac_cache: int  = 1,
+    profile:   bool = False,
 ):
     hw       = HardwareInterface(mpc, sim=sim)
     recorder = LogRecorder(max_steps, dt, ekf_mode, actuate, u_lim, model_name)
     ctrl     = ControlLoop(model, mpc, hw, x_goal,
                            ekf_mode=ekf_mode, actuate=actuate,
                            u_lim=u_lim, monitor=monitor,
-                           device=device, recorder=recorder)
+                           device=device, recorder=recorder,
+                           jac_cache=jac_cache, profile=profile)
 
     print(f"  Starting control loop  sim={sim}  ekf={ekf_mode}  "
           f"actuate={actuate}  u_lim={u_lim}  dt={dt}s  device={device}",
@@ -711,6 +740,16 @@ def main():
     p.add_argument("--qp-iters", type=int, default=200,
                    help="QP iteration cap.  OSQP usually converges in 10-30, "
                         "200 is comfortably above worst case.")
+    p.add_argument("--jac-cache", type=int, default=1,
+                   help="Recompute the EKF Jacobian every K steps; reuse it "
+                        "between recomputes.  K=1 (default) = always fresh. "
+                        "K=5 → ~5x EKF speedup with minor estimation drift "
+                        "during fast motion.  K=10+ may visibly hurt the "
+                        "swing-up catch.")
+    p.add_argument("--profile", action="store_true",
+                   help="Print fine-grained per-section wall time for the "
+                        "first 5 control steps.  Use to find where the "
+                        "(loop_ms − sum-of-components) gap lives.")
     args = p.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -764,7 +803,8 @@ def main():
     run(model, mpc, x_goal,
         sim=args.sim, ekf_mode=args.ekf, actuate=args.actuate,
         u_lim=u_lim, monitor=args.monitor, max_steps=args.steps,
-        device=device, logfile=logfile, model_name=args.model)
+        device=device, logfile=logfile, model_name=args.model,
+        jac_cache=args.jac_cache, profile=args.profile)
 
 
 if __name__ == "__main__":

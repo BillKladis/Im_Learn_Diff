@@ -19,11 +19,16 @@ import torch
 class EKF4:
     """Standard 4-state EKF: filters noisy state observations."""
 
-    def __init__(self, mpc, Q: torch.Tensor, R: torch.Tensor):
+    def __init__(self, mpc, Q: torch.Tensor, R: torch.Tensor,
+                 jac_cache: int = 1):
         """
-        mpc  : MPC_controller (provides true_RK4_disc)
-        Q    : (4,4) process noise covariance
-        R    : (4,4) measurement noise covariance
+        mpc        : MPC_controller (provides true_RK4_disc)
+        Q          : (4,4) process noise covariance
+        R          : (4,4) measurement noise covariance
+        jac_cache  : recompute the Jacobian F every K steps (1 = every step,
+                     no cache).  Higher K trades estimation precision for
+                     speed: F is the dominant cost (~60ms via autograd).
+                     Reasonable: K∈{1,3,5}.  Risky: K>10.
         """
         self.mpc = mpc
         self.Q = Q.double()
@@ -31,12 +36,17 @@ class EKF4:
         self.dt = mpc.dt
         self.x_est = None
         self.P = None
+        self.jac_cache = max(1, int(jac_cache))
+        self._jac_step = 0
+        self._F_cached = None
 
     def reset(self, x0: torch.Tensor, P0: torch.Tensor = None):
         self.x_est = x0.detach().clone().double()
         self.P = P0 if P0 is not None else torch.eye(4, dtype=torch.float64) * 0.01
+        self._jac_step = 0
+        self._F_cached = None
 
-    def _jacobian(self, x, u):
+    def _compute_jacobian(self, x, u):
         """Compute F = d(RK4)/dx via autograd."""
         x_in = x.detach().clone().requires_grad_(True)
         x_next = self.mpc.true_RK4_disc(x_in, u.detach(), self.dt)
@@ -45,6 +55,13 @@ class EKF4:
             grad = torch.autograd.grad(x_next[i], x_in, retain_graph=(i < 3))[0]
             F[i] = grad.detach()
         return F
+
+    def _jacobian(self, x, u):
+        """Cached Jacobian: recompute every jac_cache steps, reuse otherwise."""
+        if self._F_cached is None or (self._jac_step % self.jac_cache == 0):
+            self._F_cached = self._compute_jacobian(x, u)
+        self._jac_step += 1
+        return self._F_cached
 
     def step(self, y: torch.Tensor, u: torch.Tensor):
         """
@@ -57,6 +74,8 @@ class EKF4:
         P = self.P
 
         # ── Predict ────────────────────────────────────────────────────────
+        # x_pred is ALWAYS computed fresh from current x (nonlinear RK4).
+        # Only F (linearisation for covariance propagation) may be cached.
         x_pred = self.mpc.true_RK4_disc(x, u.detach(), self.dt).detach()
         F = self._jacobian(x, u)
         P_pred = F @ P @ F.t() + self.Q
@@ -82,12 +101,15 @@ class EKF6:
     """
 
     def __init__(self, mpc, Q_state: torch.Tensor, Q_bias: torch.Tensor,
-                 R: torch.Tensor, bias_clamp: float = 3.0):
+                 R: torch.Tensor, bias_clamp: float = 3.0,
+                 jac_cache: int = 1):
         """
-        Q_state  : (4,4) state process noise covariance
-        Q_bias   : (2,2) bias random-walk covariance (controls tracking speed)
-        R        : (4,4) measurement noise covariance
+        Q_state   : (4,4) state process noise covariance
+        Q_bias    : (2,2) bias random-walk covariance (controls tracking speed)
+        R         : (4,4) measurement noise covariance
         bias_clamp: saturate |d_est| to this value (actuator-limit-scale)
+        jac_cache : recompute (F, G) every K steps; see EKF4.__init__.  The
+                    Jacobians are the cost (~60ms via autograd).
         """
         self.mpc = mpc
         self.Q_state = Q_state.double()
@@ -97,6 +119,9 @@ class EKF6:
         self.bias_clamp = bias_clamp
         self.x_aug = None   # (6,)
         self.P = None       # (6,6)
+        self.jac_cache = max(1, int(jac_cache))
+        self._jac_step = 0
+        self._FG_cached = None
 
         # Measurement Jacobian H = [I_4 | 0_{4x2}]
         self.H = torch.cat([torch.eye(4, dtype=torch.float64),
@@ -113,8 +138,10 @@ class EKF6:
             P[:4, :4] = torch.eye(4) * 0.01
             P[4:, 4:] = torch.eye(2) * 0.1
             self.P = P
+        self._jac_step = 0
+        self._FG_cached = None
 
-    def _jacobians(self, x, u_eff):
+    def _compute_jacobians(self, x, u_eff):
         """F = d(RK4)/dx, G = d(RK4)/du, both (4,4) and (4,2)."""
         x_in = x.detach().clone().requires_grad_(True)
         u_in = u_eff.detach().clone().requires_grad_(True)
@@ -127,6 +154,13 @@ class EKF6:
             F[i] = grads[0].detach()
             G[i] = grads[1].detach()
         return F, G
+
+    def _jacobians(self, x, u_eff):
+        """Cached Jacobians: recompute every jac_cache steps, reuse otherwise."""
+        if self._FG_cached is None or (self._jac_step % self.jac_cache == 0):
+            self._FG_cached = self._compute_jacobians(x, u_eff)
+        self._jac_step += 1
+        return self._FG_cached
 
     def step(self, y: torch.Tensor, u: torch.Tensor):
         """
