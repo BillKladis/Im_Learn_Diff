@@ -37,6 +37,7 @@ F_KICKSTART_AMP = 0.01
 
 META_EPOCHS_CONTINUE = 20   # ep80→ep100
 START_EPOCH          = 80
+DIAG_SAVE_EVERY      = 5    # save best_state every 5 epochs
 NOISE_SIGMA          = [0.005, 0.10, 0.005, 0.10]  # hardest stage
 
 N_BOTTOM_PER_TOP = 3
@@ -220,6 +221,11 @@ def main():
 
         L_bot = float("nan")
         out(f"  [{meta+1:>3}]  {L_bot:>8.3f}  {L_top:>8.3f}  {f01_str:>7}  {arr_str:>5}  {post_str:>6}{mark}")
+
+        if (i + 1) % DIAG_SAVE_EVERY == 0 and best_state is not None:
+            bname = save_checkpoint(model_kwargs, best_state, meta + 1,
+                                    f"best_f01={best_f01:.1%}_diag{meta+1}", tag="_diag")
+            out(f"  → Diag best: {bname}  (f01={best_f01:.1%})")
 
     elapsed = time.time() - t0
     if best_state is not None:
