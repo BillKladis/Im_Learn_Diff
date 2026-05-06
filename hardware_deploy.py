@@ -293,21 +293,27 @@ class ControlLoop:
                 self.ekf.reset(x_est)
 
         # 3. Roll state history and run lin_net
+        # For SA mode: zero out elbow states (q2, q2d) before model inference —
+        # the model was trained with rigid-link freeze and has never seen q2≠0.
+        x_model = x_est.clone()
+        if self.actuate == "single":
+            x_model[2] = 0.0
+            x_model[3] = 0.0
         self._hist = torch.roll(self._hist, -1, dims=0)
-        self._hist[-1] = x_est
+        self._hist[-1] = x_model
         with torch.no_grad():
             gQ, gR, f_extra, _, _, gQf = self.model(
                 self._hist, self.mpc.q_base_diag, self.mpc.r_base_diag
             )
 
         # 4. Build linearisation sequences and call QP
-        x_lin_seq = x_est.unsqueeze(0).expand(self.mpc.N, -1).clone()
+        x_lin_seq = x_model.unsqueeze(0).expand(self.mpc.N, -1).clone()
         u_lin_seq = torch.clamp(self._u_seq.clone(),
                                 min=self.mpc.MPC_dynamics.u_min.unsqueeze(0),
                                 max=self.mpc.MPC_dynamics.u_max.unsqueeze(0))
 
         u_opt, U_opt_full = self.mpc.control(
-            x_est, x_lin_seq, u_lin_seq, self.x_goal,
+            x_model, x_lin_seq, u_lin_seq, self.x_goal,
             diag_corrections_Q=gQ,
             diag_corrections_R=gR,
             extra_linear_control=f_extra.reshape(-1),
