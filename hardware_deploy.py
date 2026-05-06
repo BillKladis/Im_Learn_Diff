@@ -70,8 +70,9 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-sys.path.insert(0, "/home/user/Im_Learn_Diff")
-os.chdir("/home/user/Im_Learn_Diff")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+os.chdir(_HERE)
 
 import lin_net as network_module
 import mpc_controller as mpc_module
