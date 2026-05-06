@@ -3,7 +3,7 @@
 SA dynamics freeze the elbow at q2=0, q2d=0 in RK4 (rigid link approximation).
 Models MAB hardware high-stiffness impedance mode on joint 2.
 Starting from hw_v1_ep50. u_max=0.10 Nm shoulder authority.
-Note: gravity at q1=π/2 is ~0.089 Nm ≈ u_lim — swing-up is borderline.
+Note: gravity at q1=π/2 is ~0.1165 Nm > u_lim=0.10 — swing-up requires energy pumping.
 """
 
 import glob
