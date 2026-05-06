@@ -172,7 +172,6 @@ def save_checkpoint(model_kwargs, state_dict, meta, label, save_dir, tag=""):
             "label": label,
             "u_lim": U_LIM,
             "single_actuated": True,
-            "single_actuated": True,
             "rigid_elbow": True,
         },
         session_name=name,
