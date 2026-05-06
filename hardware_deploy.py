@@ -1,37 +1,32 @@
-"""hardware_deploy.py — Plug-and-play deployment pipeline for MAB double pendulum.
+"""hardware_deploy.py — Hardware abstraction for MAB double pendulum deployment.
 
-Minimal-latency control loop with configurable EKF, TVLQR stabiliser,
-auto-detected network architecture, single/double actuation, and
-per-step diagnostics at selectable verbosity levels.
+Wraps pyCandle I/O, model loading (auto-detected architecture), EKF state
+estimation, and single/double actuation selection into one clean interface.
 
-Usage examples
---------------
-# Simulation (no hardware):
-python hardware_deploy.py --mode sim --model latest_v1
+Usage
+-----
+  # Simulation test (no hardware):
+  python hardware_deploy.py --model latest_v1 --sim
 
-# Real hardware, full diagnostics, EKF6, TVLQR stabiliser:
-python hardware_deploy.py --mode hw --model latest_v1 --ekf ekf6 \
-    --stabilizer tvlqr --tvlqr_policy tvlqr_policy_1.npz \
-    --monitor diagnostic --log /tmp/deploy.log
+  # Real hardware, double-actuated, EKF6:
+  python hardware_deploy.py --model latest_v1 --ekf ekf6
 
-# Single-actuated shoulder-only, sim test:
-python hardware_deploy.py --mode sim --model latest_v3 --actuate single \
-    --u_lim 0.10 --monitor verbose
+  # Single-actuated (shoulder only), u_lim override:
+  python hardware_deploy.py --model latest_v5 --actuate single
 
-# Latency benchmark:
-python hardware_deploy.py --mode bench --model saved_models/hw_v1_*/hw_v1_*.pth
+  # Quick model-load check:
+  python hardware_deploy.py --model latest_v3 --check
 
 State ordering
 --------------
-  Hardware (pyCandle):  [q1, q2,     q1_dot, q2_dot]
-  Network (ours):       [q1, q1_dot, q2,     q2_dot]
-  Permutation:  x_ours = x_hw[[0, 2, 1, 3]]   (same inverse)
-  TVLQR uses hardware ordering internally.
+  Hardware (pyCandle): [q1, q2,     q1_dot, q2_dot]
+  Network (ours):      [q1, q1_dot, q2,     q2_dot]
+  Permutation (self-inverse): x_ours = x_hw[[0, 2, 1, 3]]
 
 Joint mapping
 -------------
-  SHOULDER = joint 1 (q1),  MAB ID 402
-  ELBOW    = joint 2 (q2),  MAB ID 382
+  Joint 1 (shoulder): MAB ID 402
+  Joint 2 (elbow):    MAB ID 382
 """
 
 from __future__ import annotations
@@ -42,11 +37,7 @@ import math
 import os
 import sys
 import time
-import traceback
-from abc import ABC, abstractmethod
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -58,509 +49,31 @@ import lin_net as network_module
 import mpc_controller as mpc_module
 from ekf import EKF4, EKF6
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Hardware IDs ───────────────────────────────────────────────────────────────
 SHOULDER_ID = 402
 ELBOW_ID    = 382
 
-# Permutation between hardware and our state ordering (self-inverse)
-HW_TO_OURS  = [0, 2, 1, 3]   # x_ours = x_hw[[0,2,1,3]]
-OURS_TO_HW  = [0, 2, 1, 3]   # same permutation
+# State permutation: hardware [q1,q2,q1d,q2d] ↔ ours [q1,q1d,q2,q2d]
+HW_TO_OURS = [0, 2, 1, 3]   # self-inverse
 
-# Default EKF noise matrices (tuned for MAB double pendulum)
-DEFAULT_Q_STATE = torch.diag(torch.tensor([1e-6, 1e-4, 1e-6, 1e-4], dtype=torch.float64))
-DEFAULT_Q_BIAS  = torch.eye(2, dtype=torch.float64) * 1e-3
-DEFAULT_R_OBS   = torch.diag(torch.tensor([4e-6, 1e-3, 4e-6, 1e-3], dtype=torch.float64))
+# Default EKF noise tuning (MAB double pendulum)
+Q_STATE = torch.diag(torch.tensor([1e-6, 1e-4, 1e-6, 1e-4], dtype=torch.float64))
+Q_BIAS  = torch.eye(2, dtype=torch.float64) * 1e-3
+R_OBS   = torch.diag(torch.tensor([4e-6, 1e-3, 4e-6, 1e-3], dtype=torch.float64))
 
-# Single-actuated PD stiffness on joint 2 (hold elbow rigid at q2=0)
+# Single-actuated elbow PD (holds q2 ≈ 0 when shoulder is torque-controlled)
 SA_KP = 5.0   # Nm/rad
 SA_KD = 0.5   # Nm·s/rad
 
-# Safety limits
-SAFETY_ERR_LIMIT = 2.0   # rad — max angle error before E-stop (angle components only)
-SAFETY_VEL_LIMIT = 20.0  # rad/s — max velocity before E-stop
-RESET_DELAY      = 0.5   # seconds after E-stop before re-arm
+# Safety
+ESTOP_VEL_LIMIT = 20.0   # rad/s
 
-# Monitor verbosity levels
-MONITOR_NONE       = 0
-MONITOR_MINIMAL    = 1
-MONITOR_STANDARD   = 2
-MONITOR_VERBOSE    = 3
-MONITOR_DIAGNOSTIC = 4
 
-MONITOR_LEVELS = {
-    "none":       MONITOR_NONE,
-    "minimal":    MONITOR_MINIMAL,
-    "standard":   MONITOR_STANDARD,
-    "verbose":    MONITOR_VERBOSE,
-    "diagnostic": MONITOR_DIAGNOSTIC,
-}
-
-
-# ── Diagnostics ────────────────────────────────────────────────────────────────
-
-@dataclass
-class StepMetrics:
-    step:          int
-    t_read_ms:     float = 0.0
-    t_ekf_ms:      float = 0.0
-    t_model_ms:    float = 0.0
-    t_qp_ms:       float = 0.0
-    t_tvlqr_ms:    float = 0.0
-    t_write_ms:    float = 0.0
-    t_total_ms:    float = 0.0
-    t_sleep_ms:    float = 0.0
-    jitter_ms:     float = 0.0
-    qp_fallback:   bool  = False
-    tvlqr_active:  bool  = False
-    safety_trip:   bool  = False
-    u_mpc:         np.ndarray = field(default_factory=lambda: np.zeros(2))
-    u_tvlqr:       np.ndarray = field(default_factory=lambda: np.zeros(2))
-    u_applied:     np.ndarray = field(default_factory=lambda: np.zeros(2))
-    bias_est:      np.ndarray = field(default_factory=lambda: np.zeros(2))
-    ekf_innov:     np.ndarray = field(default_factory=lambda: np.zeros(4))
-    x_raw:         np.ndarray = field(default_factory=lambda: np.zeros(4))
-    x_est:         np.ndarray = field(default_factory=lambda: np.zeros(4))
-    err_norm:      float = 0.0
-
-
-class DiagnosticsLogger:
-    """Ring-buffer metric logger with selectable verbosity."""
-
-    _HDR = (
-        f"{'step':>6}  {'t_rd':>6}  {'t_ekf':>6}  {'t_mod':>6}  {'t_qp':>6}  "
-        f"{'t_tvlqr':>7}  {'t_wr':>6}  {'t_tot':>6}  {'jit':>6}  "
-        f"{'tvlqr':>6}  {'fb':>3}  {'safe':>4}  "
-        f"{'u1':>7}  {'u2':>7}  {'b1':>7}  {'b2':>7}  "
-        f"{'q1':>7}  {'q1d':>7}  {'q2':>7}  {'q2d':>7}  {'err':>6}"
-    )
-
-    def __init__(
-        self,
-        level:       int             = MONITOR_STANDARD,
-        window:      int             = 300,
-        print_every: int             = 50,
-        log_file:    Optional[str]   = None,
-    ):
-        self.level       = level
-        self.print_every = print_every
-        self.buf: deque  = deque(maxlen=window)
-        self._fh         = open(log_file, "w", buffering=1) if log_file else None
-
-        if level >= MONITOR_VERBOSE:
-            self._write(self._HDR)
-            self._write("-" * len(self._HDR))
-
-    # ── public ────────────────────────────────────────────────────────────────
-
-    def log(self, m: StepMetrics):
-        if self.level == MONITOR_NONE:
-            return
-        self.buf.append(m)
-
-        if self.level >= MONITOR_VERBOSE:
-            self._write(self._row(m))
-
-        if m.step > 0 and m.step % self.print_every == 0:
-            if self.level >= MONITOR_STANDARD:
-                self._print_summary(m.step)
-            elif self.level == MONITOR_MINIMAL:
-                print(f"  step={m.step:>5}  u=[{m.u_applied[0]:+.3f},{m.u_applied[1]:+.3f}]"
-                      f"  err={m.err_norm:.3f}  loop={m.t_total_ms:.1f}ms", flush=True)
-
-    def final_summary(self):
-        if not self.buf or self.level == MONITOR_NONE:
-            return
-        ms = list(self.buf)
-        self._banner("FINAL DIAGNOSTICS SUMMARY")
-        self._timing_table(ms)
-        fb_rate = sum(1 for m in ms if m.qp_fallback) / len(ms) * 100
-        tvlqr_rate = sum(1 for m in ms if m.tvlqr_active) / len(ms) * 100
-        safe_trips = sum(1 for m in ms if m.safety_trip)
-        print(f"  QP fallback rate : {fb_rate:.2f}%")
-        print(f"  TVLQR active     : {tvlqr_rate:.1f}%")
-        print(f"  Safety trips     : {safe_trips}")
-        biases = np.array([m.bias_est for m in ms])
-        print(f"  Bias est (final) : d1={biases[-1,0]:+.4f}  d2={biases[-1,1]:+.4f} Nm")
-
-    def close(self):
-        if self._fh:
-            self._fh.close()
-
-    # ── internal ──────────────────────────────────────────────────────────────
-
-    def _row(self, m: StepMetrics) -> str:
-        return (
-            f"{m.step:>6}  {m.t_read_ms:>6.2f}  {m.t_ekf_ms:>6.2f}  "
-            f"{m.t_model_ms:>6.2f}  {m.t_qp_ms:>6.2f}  {m.t_tvlqr_ms:>7.2f}  "
-            f"{m.t_write_ms:>6.2f}  {m.t_total_ms:>6.2f}  {m.jitter_ms:>6.2f}  "
-            f"{'Y' if m.tvlqr_active else 'N':>6}  {'Y' if m.qp_fallback else 'N':>3}  "
-            f"{'Y' if m.safety_trip else 'N':>4}  "
-            f"{m.u_applied[0]:>7.4f}  {m.u_applied[1]:>7.4f}  "
-            f"{m.bias_est[0]:>7.4f}  {m.bias_est[1]:>7.4f}  "
-            f"{m.x_est[0]:>7.4f}  {m.x_est[1]:>7.4f}  "
-            f"{m.x_est[2]:>7.4f}  {m.x_est[3]:>7.4f}  {m.err_norm:>6.3f}"
-        )
-
-    def _print_summary(self, step: int):
-        if not self.buf:
-            return
-        ms = list(self.buf)
-        totals  = np.array([m.t_total_ms for m in ms])
-        qps     = np.array([m.t_qp_ms    for m in ms])
-        jitters = np.abs([m.jitter_ms    for m in ms])
-        fb_rate = sum(1 for m in ms if m.qp_fallback) / len(ms) * 100
-        biases  = np.array([m.bias_est for m in ms])
-        errs    = np.array([m.err_norm for m in ms])
-        print(
-            f"\n  [step={step:>5}]"
-            f"  loop {totals.mean():.1f}/{np.percentile(totals,99):.1f}ms (mean/p99)"
-            f"  QP {qps.mean():.1f}/{np.percentile(qps,99):.1f}ms"
-            f"  jitter {jitters.mean():.1f}ms"
-            f"  fb={fb_rate:.0f}%"
-            f"  err_mean={errs.mean():.3f}"
-            f"  bias=[{biases[-1,0]:+.4f},{biases[-1,1]:+.4f}]",
-            flush=True,
-        )
-
-    def _timing_table(self, ms: List[StepMetrics]):
-        totals  = np.array([m.t_total_ms  for m in ms])
-        qps     = np.array([m.t_qp_ms     for m in ms])
-        ekfs    = np.array([m.t_ekf_ms    for m in ms])
-        models  = np.array([m.t_model_ms  for m in ms])
-        jitters = np.abs([m.jitter_ms     for m in ms])
-
-        def row(name, a):
-            a = np.array(a)
-            print(f"  {name:<22} mean={a.mean():>6.2f}ms  p50={np.percentile(a,50):>6.2f}ms"
-                  f"  p95={np.percentile(a,95):>6.2f}ms  p99={np.percentile(a,99):>6.2f}ms"
-                  f"  max={a.max():>6.2f}ms")
-
-        row("Loop total",      totals)
-        row("QP solve",        qps)
-        row("EKF update",      ekfs)
-        row("Model inference", models)
-        row("Timing jitter",   jitters)
-
-    def _banner(self, title: str):
-        print("\n" + "=" * 70)
-        print(f"  {title}")
-        print("=" * 70)
-
-    def _write(self, line: str):
-        print(line, flush=True)
-        if self._fh:
-            self._fh.write(line + "\n")
-
-
-# ── TVLQR hybrid controller ────────────────────────────────────────────────────
-
-class TVLQRController:
-    """KNN-based TVLQR using a pre-computed trajectory policy.
-
-    Policy .npz must contain:
-        states      (N, 4)  — reference trajectory in hardware ordering
-        times       (N,)    — time stamps (seconds)
-        gains       (N, 2, 4) — LQR gains K at each waypoint
-        feedforward (N, 2)  — feedforward d at each waypoint
-        u_nom       (N, 2)  — nominal control along trajectory
-
-    All arrays use hardware joint ordering: [q1, q2, q1_dot, q2_dot].
-    Control law:  u = u_nom(t) - K_knn(x) @ (x - x_nom(t)) - d(t)
-    """
-
-    def __init__(
-        self,
-        policy_path:  str,
-        n_neighbors:  int   = 10,
-        activate_err: float = 0.5,   # switch from MPC to TVLQR below this error norm
-        u_lim:        float = 0.15,
-    ):
-        data = np.load(policy_path)
-        self.states      = data["states"]       # (N, 4) hw ordering
-        self.times       = data["times"]        # (N,)
-        self.gains       = data["gains"]        # (N, 2, 4)
-        self.feedforward = data["feedforward"]  # (N, 2)
-        self.u_nom       = data["u_nom"]        # (N, 2)
-        self.n_neighbors = n_neighbors
-        self.activate_err = activate_err
-        self.u_lim        = u_lim
-        self._t0: Optional[float] = None
-
-    def reset(self):
-        self._t0 = None
-
-    def get_control(
-        self,
-        x_hw:     np.ndarray,    # hardware ordering [q1, q2, q1_dot, q2_dot]
-        t_elapsed: float,        # seconds since episode start
-    ) -> np.ndarray:
-        """Return u in hardware ordering [tau1, tau2]."""
-        if self._t0 is None:
-            self._t0 = t_elapsed
-
-        # Clamp time to trajectory range
-        t = np.clip(t_elapsed, self.times[0], self.times[-1])
-
-        # ── Interpolate u_nom, x_nom, d at time t ──
-        idx = np.searchsorted(self.times, t)
-        idx = np.clip(idx, 1, len(self.times) - 1)
-        t0, t1 = self.times[idx-1], self.times[idx]
-        alpha  = (t - t0) / (t1 - t0 + 1e-12)
-
-        x_nom = (1-alpha) * self.states[idx-1]      + alpha * self.states[idx]
-        u_n   = (1-alpha) * self.u_nom[idx-1]       + alpha * self.u_nom[idx]
-        d     = (1-alpha) * self.feedforward[idx-1] + alpha * self.feedforward[idx]
-
-        # ── KNN gain lookup on state space ──
-        diffs = self.states - x_hw[np.newaxis, :]         # (N, 4)
-        dists = np.sum(diffs**2, axis=1)
-        nn    = np.argpartition(dists, min(self.n_neighbors, len(dists)-1))[:self.n_neighbors]
-        w     = 1.0 / (dists[nn] + 1e-12)
-        w    /= w.sum()
-        K     = np.einsum("i,ijk->jk", w, self.gains[nn])   # (2, 4) weighted K
-
-        # ── Control law ──
-        u = u_n - K @ (x_hw - x_nom) - d
-        return np.clip(u, -self.u_lim, self.u_lim)
-
-    def should_activate(self, x_hw: np.ndarray, x_goal_hw: np.ndarray) -> bool:
-        """True when close enough to goal for TVLQR to be reliable."""
-        dq1 = math.atan2(math.sin(x_hw[0] - x_goal_hw[0]),
-                         math.cos(x_hw[0] - x_goal_hw[0]))
-        dq2 = math.atan2(math.sin(x_hw[1] - x_goal_hw[1]),
-                         math.cos(x_hw[1] - x_goal_hw[1]))
-        err  = math.sqrt(dq1**2 + x_hw[2]**2 + dq2**2 + x_hw[3]**2)
-        return err < self.activate_err
-
-
-# ── Hardware interfaces ────────────────────────────────────────────────────────
-
-class HardwareInterface(ABC):
-    @abstractmethod
-    def connect(self) -> bool: ...
-
-    @abstractmethod
-    def read_state(self) -> Tuple[np.ndarray, float]:
-        """Return (x_hw [q1,q2,q1d,q2d], read_latency_ms)."""
-
-    @abstractmethod
-    def write_torque(self, tau: np.ndarray) -> float:
-        """Send [tau1, tau2] Nm. Return write_latency_ms."""
-
-    @abstractmethod
-    def disconnect(self) -> None: ...
-
-
-class SimulationInterface(HardwareInterface):
-    """Software-in-the-loop simulation using true RK4 dynamics."""
-
-    def __init__(
-        self,
-        mpc,
-        x0:          torch.Tensor,
-        dt:          float          = 0.05,
-        obs_sigma:   float          = 0.0,
-        ctrl_bias:   Optional[np.ndarray] = None,
-    ):
-        self.mpc      = mpc
-        self.x        = x0.clone().double()
-        self.dt_t     = torch.tensor(dt, dtype=torch.float64)
-        self.obs_sigma = obs_sigma
-        self.ctrl_bias = torch.tensor(ctrl_bias, dtype=torch.float64) \
-                         if ctrl_bias is not None else None
-        self._u_last  = torch.zeros(2, dtype=torch.float64)
-
-    def connect(self) -> bool:
-        return True
-
-    def read_state(self) -> Tuple[np.ndarray, float]:
-        t0 = time.perf_counter()
-        self.x = self.mpc.true_RK4_disc(self.x, self._u_last, self.dt_t).detach()
-        x_np = self.x.numpy()[OURS_TO_HW]    # → hardware ordering
-        if self.obs_sigma > 0:
-            x_np = x_np + np.random.randn(4) * self.obs_sigma
-        return x_np, (time.perf_counter() - t0) * 1e3
-
-    def write_torque(self, tau: np.ndarray) -> float:
-        t0 = time.perf_counter()
-        u = torch.tensor(tau, dtype=torch.float64)
-        if self.ctrl_bias is not None:
-            u = u + self.ctrl_bias
-        u_lim = float(self.mpc.MPC_dynamics.u_max[0])
-        self._u_last = u.clamp(-u_lim, u_lim)
-        return (time.perf_counter() - t0) * 1e3
-
-    def disconnect(self) -> None:
-        self._u_last = torch.zeros(2, dtype=torch.float64)
-
-    @property
-    def true_state_ours(self) -> np.ndarray:
-        return self.x.numpy()
-
-
-class MABInterface(HardwareInterface):
-    """pyCandle MAB Robotics interface.
-
-    Uses IMPEDANCE mode with zero stiffness/damping = pure torque control.
-    Motors: SHOULDER_ID=402 (joint 1), ELBOW_ID=382 (joint 2).
-    Hardware state ordering: [q1, q2, q1_dot, q2_dot]
-    """
-
-    def __init__(self, u_lim: float = 0.15):
-        self.u_lim    = u_lim
-        self._candle  = None
-        self._shoulder = None
-        self._elbow    = None
-
-    def connect(self) -> bool:
-        try:
-            import pyCandle
-        except ImportError:
-            raise ImportError(
-                "pyCandle not found. Install the MAB Robotics pyCandle driver:\n"
-                "  pip install pyCandle  (or build from MAB source)"
-            )
-
-        print("  [HW] Connecting to MAB hardware via pyCandle CAN ...", flush=True)
-        candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True, pyCandle.USB)
-        ids = candle.ping(pyCandle.CAN_BAUD_1M)
-
-        if not ids:
-            print("  [HW] ERROR: No CAN devices found.", flush=True)
-            return False
-
-        print(f"  [HW] Found CAN IDs: {ids}", flush=True)
-
-        for dev_id in ids:
-            candle.addMd80(dev_id)
-
-        shoulder = elbow = None
-        for md in candle.md80s:
-            if md.getId() == SHOULDER_ID:
-                shoulder = md
-            elif md.getId() == ELBOW_ID:
-                elbow = md
-
-        if shoulder is None or elbow is None:
-            found = [md.getId() for md in candle.md80s]
-            print(f"  [HW] ERROR: Expected IDs {SHOULDER_ID},{ELBOW_ID}, found {found}")
-            return False
-
-        for md in candle.md80s:
-            candle.controlMd80Mode(md.getId(), pyCandle.IMPEDANCE)
-            md.setImpedanceControllerParams(0, 0)   # zero stiffness/damping → pure torque
-            md.setTargetTorque(0)
-            candle.controlMd80Enable(md.getId(), True)
-
-        candle.begin()
-        print(f"  [HW] Motors enabled. Shoulder={SHOULDER_ID}, Elbow={ELBOW_ID}")
-
-        self._candle   = candle
-        self._shoulder = shoulder
-        self._elbow    = elbow
-        return True
-
-    def read_state(self) -> Tuple[np.ndarray, float]:
-        t0 = time.perf_counter()
-        q1    = self._shoulder.getPosition()
-        q2    = self._elbow.getPosition()
-        q1d   = self._shoulder.getVelocity()
-        q2d   = self._elbow.getVelocity()
-        x_hw  = np.array([q1, q2, q1d, q2d], dtype=np.float64)
-        return x_hw, (time.perf_counter() - t0) * 1e3
-
-    def write_torque(self, tau: np.ndarray) -> float:
-        t0 = time.perf_counter()
-        tau = np.clip(tau, -self.u_lim, self.u_lim)
-        self._shoulder.setTargetTorque(float(tau[0]))
-        self._elbow.setTargetTorque(float(tau[1]))
-        return (time.perf_counter() - t0) * 1e3
-
-    def disconnect(self) -> None:
-        if self._shoulder is not None:
-            try:
-                self._shoulder.setTargetTorque(0.0)
-                self._elbow.setTargetTorque(0.0)
-                time.sleep(0.05)
-                self._candle.end()
-            except Exception as e:
-                print(f"  [HW] Warning during disconnect: {e}")
-        print("  [HW] Disconnected.")
-
-
-# ── Architecture auto-detection ────────────────────────────────────────────────
-
-_ARCH_MAP = {
-    "separated": "SeparatedLinearizationNetwork",
-    "base":      "LinearizationNetwork",
-    "sc":        "LinearizationNetworkSC",
-}
-
-
-def detect_architecture(state_dict: dict, metadata: Optional[dict] = None) -> str:
-    """Infer architecture class name from checkpoint content."""
-    # 1. Explicit architecture tag in metadata
-    if metadata:
-        arch = metadata.get("architecture", "")
-        if "separated_fnet_qnet" in arch:
-            return "SeparatedLinearizationNetwork"
-        if "sc" in arch.lower() or "sincos" in arch.lower():
-            return "LinearizationNetworkSC"
-        if "linear" in arch.lower():
-            return "LinearizationNetwork"
-
-    # 2. Key-name heuristic: SeparatedLinearizationNetwork has f_net.* + q_net.*
-    keys = list(state_dict.keys())
-    if any(k.startswith("f_net.") for k in keys):
-        return "SeparatedLinearizationNetwork"
-
-    # 3. Encoder input-size heuristic: SC uses 30-dim input (5×6), base uses 20-dim (5×4)
-    enc_key = next((k for k in keys if "encoder" in k and "weight" in k and "0" in k), None)
-    if enc_key:
-        in_dim = state_dict[enc_key].shape[1]
-        if in_dim == 30:
-            return "LinearizationNetworkSC"
-
-    return "LinearizationNetwork"
-
-
-def infer_model_kwargs(state_dict: dict, metadata: Optional[dict] = None) -> dict:
-    """Extract constructor kwargs from checkpoint."""
-    if metadata:
-        kw = {
-            "state_dim":       metadata.get("state_dim",       4),
-            "control_dim":     metadata.get("control_dim",     2),
-            "horizon":         metadata.get("horizon",         10),
-            "hidden_dim":      metadata.get("hidden_dim",      128),
-            "gate_range_q":    metadata.get("gate_range_q",    0.99),
-            "gate_range_r":    metadata.get("gate_range_r",    0.20),
-            "f_extra_bound":   metadata.get("f_extra_bound",   1.5),
-            "f_kickstart_amp": metadata.get("f_kickstart_amp", 0.01),
-        }
-        return kw
-
-    # Fallback: infer hidden_dim from weight shapes
-    hidden_dim = 128
-    for k, v in state_dict.items():
-        if "trunk" in k and "weight" in k and "0" in k:
-            hidden_dim = v.shape[0]
-            break
-
-    return dict(
-        state_dim=4, control_dim=2, horizon=10, hidden_dim=hidden_dim,
-        gate_range_q=0.99, gate_range_r=0.20,
-        f_extra_bound=1.5, f_kickstart_amp=0.01,
-    )
-
+# ── Model loading ──────────────────────────────────────────────────────────────
 
 def resolve_model_path(spec: str) -> str:
-    """Resolve model spec string to an actual .pth path."""
-    # Direct path
-    if os.path.isfile(spec):
-        return spec
-
-    # Shorthands
-    patterns: Dict[str, str] = {
+    """Resolve shorthand like 'latest_v1' to an actual .pth file path."""
+    shorthands = {
         "latest_v1":    "saved_models/hw_v1*/*.pth",
         "latest_v2":    "saved_models/hw_v2_nr_*FINAL*/*.pth",
         "latest_v2diag":"saved_models/hw_v2_nr_diag*/*.pth",
@@ -569,60 +82,63 @@ def resolve_model_path(spec: str) -> str:
         "latest_v5":    "saved_models/hw_v5_sa015*/*.pth",
         "latest_v6":    "saved_models/hw_v6_sa010*/*.pth",
     }
-    pat = patterns.get(spec)
-    if pat:
-        paths = glob.glob(pat)
-        if paths:
-            return max(paths, key=os.path.getmtime)
-        # fallback to diag
-        if spec == "latest_v2":
-            paths = glob.glob("saved_models/hw_v2_nr_diag*/*.pth")
-            if paths:
-                return max(paths, key=os.path.getmtime)
-
-    # Glob pattern
-    paths = glob.glob(spec)
-    if paths:
-        return max(paths, key=os.path.getmtime)
-
-    raise FileNotFoundError(f"Cannot find model: {spec!r}")
+    pattern = shorthands.get(spec, spec)
+    paths = glob.glob(pattern)
+    if not paths:
+        raise FileNotFoundError(f"No checkpoint found for {spec!r} (pattern: {pattern})")
+    return max(paths, key=os.path.getmtime)
 
 
-def load_model(
-    ckpt_path: str,
-    arch_override: Optional[str] = None,
-) -> Tuple[object, dict, float]:
-    """Load checkpoint → (model, metadata, u_lim).
+def detect_architecture(state_dict: dict) -> str:
+    """Infer architecture from state_dict key structure."""
+    keys = set(state_dict.keys())
+    if any(k.startswith("f_net.") for k in keys):
+        return "SeparatedLinearizationNetwork"
+    # SinCos variant: encoder input dim = 30 (6 history × 5 sincos features)
+    enc = state_dict.get("encoder.0.weight")
+    if enc is not None and enc.shape[1] == 30:
+        return "LinearizationNetworkSC"
+    return "LinearizationNetwork"
 
-    Returns model in eval mode on CPU.
+
+def load_model(ckpt_path: str) -> Tuple[object, dict, float]:
+    """Load checkpoint → (model, info_dict, u_lim).
+
+    info_dict contains 'arch', 'u_lim', and model kwargs.
+    Model is returned in eval mode on CPU.
     """
     data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     if isinstance(data, dict):
         state_dict = data.get("model_state_dict", data)
-        metadata   = data.get("metadata", None)
-        # training_params may be at top level OR nested inside metadata
-        tp = data.get("training_params") or \
-             (metadata.get("training_params") if isinstance(metadata, dict) else None) or {}
-        u_lim = tp.get("u_lim", 0.15) if tp else 0.15
+        metadata   = data.get("metadata", {}) or {}
+        # training_params may sit at top level or nested inside metadata
+        tp = data.get("training_params") or metadata.get("training_params") or {}
+        u_lim = tp.get("u_lim", 0.15)
     else:
         state_dict = data
-        metadata   = None
+        metadata   = {}
         u_lim      = 0.15
 
-    # Architecture resolution
-    if arch_override:
-        arch_name = _ARCH_MAP.get(arch_override.lower(), arch_override)
-    else:
-        arch_name = detect_architecture(state_dict, metadata)
+    arch = detect_architecture(state_dict)
 
-    model_kwargs = infer_model_kwargs(state_dict, metadata)
+    # Infer model kwargs (fall back to standard defaults)
+    def _from(key, default):
+        return metadata.get(key, default)
 
-    arch_cls = getattr(network_module, arch_name, None)
-    if arch_cls is None:
-        raise ValueError(f"Unknown architecture: {arch_name!r}")
+    kwargs = dict(
+        state_dim       = _from("state_dim",       4),
+        control_dim     = _from("control_dim",      2),
+        horizon         = _from("horizon",          10),
+        hidden_dim      = _from("hidden_dim",       128),
+        gate_range_q    = _from("gate_range_q",     0.99),
+        gate_range_r    = _from("gate_range_r",     0.20),
+        f_extra_bound   = _from("f_extra_bound",    1.5),
+        f_kickstart_amp = _from("f_kickstart_amp",  0.01),
+    )
 
-    model = arch_cls(**model_kwargs).double()
+    arch_cls = getattr(network_module, arch)
+    model = arch_cls(**kwargs).double()
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"  [WARN] Missing keys: {missing}")
@@ -630,613 +146,300 @@ def load_model(
         print(f"  [WARN] Unexpected keys: {unexpected}")
 
     model.eval()
-    return model, {"arch": arch_name, "u_lim": u_lim, **model_kwargs}, u_lim
+    info = {"arch": arch, "u_lim": u_lim, **kwargs}
+    return model, info, u_lim
 
 
-# ── Controller ─────────────────────────────────────────────────────────────────
+# ── Hardware interface ─────────────────────────────────────────────────────────
 
-class DeployController:
+class HardwareInterface:
+    """Thin wrapper around pyCandle for the MAB double pendulum.
+
+    In simulation mode (sim=True) the hardware is replaced by the MPC
+    dynamics model so the same control loop can be tested without hardware.
     """
-    Minimal-latency MPC + optional EKF + optional TVLQR control loop.
 
-    Pipeline per step
-    -----------------
-    1. x_hw (hardware ordering) → permute → x_ours
-    2. EKF  predict + update  → x_est, bias_est (ours ordering)
-    3. State history → lin_net → gates_Q, gates_R, f_extra
-    4. MPC QP → u_mpc (ours ordering)
-    5. [Optional] TVLQR → u_tvlqr (hw ordering) if near goal
-    6. Bias cancellation → u_final
-    7. [Single-actuated] override tau2 with PD stiffness
-    8. Apply torque limit + send
+    def __init__(self, mpc, sim: bool = False):
+        self.sim = sim
+        self.mpc = mpc
+        self._x  = torch.zeros(4, dtype=torch.float64)  # sim state (our ordering)
+
+        if not sim:
+            import pyCandle
+            self._pc = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True, pyCandle.USB)
+            ids = self._pc.ping()
+            if SHOULDER_ID not in ids or ELBOW_ID not in ids:
+                raise RuntimeError(
+                    f"Expected motors {SHOULDER_ID},{ELBOW_ID}, found {ids}"
+                )
+            self._sh = next(m for m in self._pc.getMd80List() if m.getId() == SHOULDER_ID)
+            self._el = next(m for m in self._pc.getMd80List() if m.getId() == ELBOW_ID)
+            for md in (self._sh, self._el):
+                self._pc.controlMd80Mode(md.getId(), pyCandle.IMPEDANCE)
+                md.setImpedanceControllerParams(0.0, 0.0)  # pure torque mode
+                self._pc.controlMd80Enable(md.getId(), True)
+            self._pc.begin()
+            print(f"  Hardware ready: shoulder={SHOULDER_ID}, elbow={ELBOW_ID}")
+
+    def read(self) -> np.ndarray:
+        """Return state in hardware ordering: [q1, q2, q1_dot, q2_dot]."""
+        if self.sim:
+            x = self._x.numpy()
+            return np.array([x[0], x[2], x[1], x[3]])  # ours→hw permutation
+        self._pc.waitForAnswer()
+        return np.array([
+            self._sh.getPosition(), self._el.getPosition(),
+            self._sh.getVelocity(), self._el.getVelocity(),
+        ])
+
+    def write(self, tau: np.ndarray):
+        """Apply torques [tau1, tau2] (Nm). tau1=shoulder, tau2=elbow."""
+        if self.sim:
+            u = torch.tensor(tau, dtype=torch.float64)
+            self._x = self.mpc.true_RK4_disc(self._x, u, self.mpc.dt)
+            return
+        self._sh.setTargetTorque(float(tau[0]))
+        self._el.setTargetTorque(float(tau[1]))
+        self._pc.transmit()
+
+    def zero(self):
+        """Send zero torques (safe shutdown)."""
+        self.write(np.zeros(2))
+
+    def close(self):
+        self.zero()
+        if not self.sim:
+            for md in (self._sh, self._el):
+                self._pc.controlMd80Enable(md.getId(), False)
+            self._pc.end()
+
+
+# ── Control loop ───────────────────────────────────────────────────────────────
+
+class ControlLoop:
+    """
+    One-step controller: read hardware → EKF → lin_net + QP → apply torque.
+
+    Parameters
+    ----------
+    model     : loaded lin_net (SeparatedLinearizationNetwork etc.)
+    mpc       : MPC_controller instance (carries QP and dynamics)
+    hw        : HardwareInterface
+    x_goal    : goal state in our ordering [q1, q1d, q2, q2d]
+    ekf_mode  : 'none' | 'ekf4' | 'ekf6'
+    actuate   : 'double' | 'single'  (single = shoulder only, elbow PD-held)
+    u_lim     : torque limit (Nm) — used for single-actuated elbow clamp
+    monitor   : verbosity 0=none 1=minimal 2=standard
     """
 
     def __init__(
         self,
         model,
         mpc,
-        x_goal:          torch.Tensor,
-        dt:              float                  = 0.05,
-        ekf_mode:        str                    = "ekf6",   # none/ekf4/ekf6
-        ekf_Q_state:     Optional[torch.Tensor] = None,
-        ekf_Q_bias:      Optional[torch.Tensor] = None,
-        ekf_R:           Optional[torch.Tensor] = None,
-        cancel_bias:     bool                   = True,
-        bias_warmup:     int                    = 20,
-        tvlqr:           Optional[TVLQRController] = None,
-        tvlqr_blend:     bool                   = False,  # True=blend, False=hard switch
-        tvlqr_threshold: float                  = 0.4,    # err norm to activate TVLQR
-        single_actuated: bool                   = False,
-        sa_kp:           float                  = SA_KP,
-        sa_kd:           float                  = SA_KD,
-        monitor_level:   int                    = MONITOR_STANDARD,
-        log_file:        Optional[str]          = None,
-        print_every:     int                    = 50,
+        hw:        HardwareInterface,
+        x_goal:    torch.Tensor,
+        ekf_mode:  str   = "ekf6",
+        actuate:   str   = "double",
+        u_lim:     float = 0.15,
+        monitor:   int   = 1,
     ):
-        self.model           = model
-        self.mpc             = mpc
-        self.x_goal          = x_goal.double()
-        self.x_goal_hw       = x_goal.numpy()[OURS_TO_HW]
-        self.dt              = dt
-        self.dt_t            = torch.tensor(dt, dtype=torch.float64)
-        self.cancel_bias     = cancel_bias
-        self.bias_warmup     = bias_warmup
-        self.tvlqr           = tvlqr
-        self.tvlqr_blend     = tvlqr_blend
-        self.tvlqr_threshold = tvlqr_threshold
-        self.single_actuated = single_actuated
-        self.sa_kp           = sa_kp
-        self.sa_kd           = sa_kd
+        self.model    = model
+        self.mpc      = mpc
+        self.hw       = hw
+        self.x_goal   = x_goal
+        self.actuate  = actuate
+        self.u_lim    = u_lim
+        self.monitor  = monitor
+        self.step_n   = 0
 
-        n_u = mpc.MPC_dynamics.u_min.shape[0]
-        self.n_u = n_u
-        self.u_lim_t = mpc.MPC_dynamics.u_max   # (n_u,)
-
-        self.state_history: deque = deque(
-            [torch.zeros(4, dtype=torch.float64)] * 5, maxlen=5
-        )
-        self.u_seq_guess = torch.zeros((mpc.N, n_u), dtype=torch.float64)
-        self.u_prev      = torch.zeros(n_u, dtype=torch.float64)
-
-        # EKF
-        Q_s = ekf_Q_state if ekf_Q_state is not None else DEFAULT_Q_STATE
-        Q_b = ekf_Q_bias  if ekf_Q_bias  is not None else DEFAULT_Q_BIAS
-        R   = ekf_R       if ekf_R       is not None else DEFAULT_R_OBS
-
+        # Build EKF
         if ekf_mode == "ekf6":
-            self.ekf: Optional[object] = EKF6(mpc, Q_s, Q_b, R)
+            self.ekf = EKF6(mpc, Q_STATE, Q_BIAS, R_OBS)
         elif ekf_mode == "ekf4":
-            self.ekf = EKF4(mpc, Q_s, R)
+            self.ekf = EKF4(mpc, Q_STATE, R_OBS)
         else:
             self.ekf = None
-        self.ekf_mode = ekf_mode
 
-        self.diag = DiagnosticsLogger(
-            level=monitor_level,
-            print_every=print_every,
-            log_file=log_file,
-        )
-        self.step_count = 0
-        self._episode_t0: float = 0.0
+        # State history for lin_net (5 frames)
+        self._hist       = torch.zeros((5, 4), dtype=torch.float64)
+        # Warm-start control sequence for QP (N × 2)
+        self._u_seq      = torch.zeros((mpc.N, 2), dtype=torch.float64)
+        # Previous torque sent to hardware (for EKF predict step)
+        self._u_prev     = torch.zeros(2, dtype=torch.float64)
 
-    # ── episode control ───────────────────────────────────────────────────────
-
-    def reset(self, x0_hw: np.ndarray):
-        x0 = torch.tensor(x0_hw[HW_TO_OURS], dtype=torch.float64)
-        self.state_history = deque([x0.clone() for _ in range(5)], maxlen=5)
-        self.u_seq_guess   = torch.zeros((self.mpc.N, self.n_u), dtype=torch.float64)
-        self.u_prev        = torch.zeros(self.n_u, dtype=torch.float64)
+    def reset(self, x_hw: np.ndarray):
+        x_t = torch.tensor(np.array(x_hw)[HW_TO_OURS], dtype=torch.float64)
+        self._hist[:] = x_t
+        self._u_seq[:]  = 0.0
+        self._u_prev[:] = 0.0
         if self.ekf is not None:
-            self.ekf.reset(x0)
-        if self.tvlqr is not None:
-            self.tvlqr.reset()
-        self.step_count  = 0
-        self._episode_t0 = time.perf_counter()
+            self.ekf.reset(x_t)
+        self.step_n = 0
 
-    # ── main step ─────────────────────────────────────────────────────────────
-
-    def step(self, x_hw: np.ndarray, t_read_ms: float = 0.0) -> Tuple[np.ndarray, StepMetrics]:
-        """
-        One control step.
-
-        Args:
-            x_hw      : hardware state [q1, q2, q1_dot, q2_dot]
-            t_read_ms : read latency already measured externally
-
-        Returns:
-            tau_hw    : [tau1, tau2] Nm in hardware ordering
-            metrics   : StepMetrics
-        """
+    def step(self, x_hw: np.ndarray) -> np.ndarray:
+        """One control step. Returns [tau1, tau2] actually applied."""
         t0 = time.perf_counter()
-        t_elapsed = t0 - self._episode_t0
 
-        # Permute to our ordering
-        y = torch.tensor(x_hw[HW_TO_OURS], dtype=torch.float64)
+        # 1. Permute hardware ordering → network ordering
+        x_raw = torch.tensor(np.array(x_hw)[HW_TO_OURS], dtype=torch.float64)
 
-        # ── EKF ──────────────────────────────────────────────────────────────
-        t_ekf0 = time.perf_counter()
-        if self.ekf is not None and self.step_count > 0:
-            if self.ekf_mode == "ekf6":
-                x_est, bias_est = self.ekf.step(y, self.u_prev)
-            else:
-                x_est, bias_est = self.ekf.step(y, self.u_prev)
+        # 2. EKF predict+update (skip on first step — no previous u yet)
+        if self.ekf is not None and self.step_n > 0:
+            x_est, bias = self.ekf.step(x_raw, self._u_prev)
         else:
-            x_est    = y.clone()
-            bias_est = torch.zeros(self.n_u, dtype=torch.float64)
-            if self.ekf is not None:
+            x_est = x_raw.clone()
+            bias  = torch.zeros(2, dtype=torch.float64)
+            if self.ekf is not None and self.step_n == 0:
                 self.ekf.reset(x_est)
-        t_ekf_ms = (time.perf_counter() - t_ekf0) * 1e3
 
-        ekf_innov = (y - x_est).numpy()
-        self.state_history.append(x_est.clone())
-
-        # ── Model inference ───────────────────────────────────────────────────
-        t_mod0 = time.perf_counter()
-        hist_t = torch.stack(list(self.state_history), dim=0)
+        # 3. Roll state history and run lin_net
+        self._hist = torch.roll(self._hist, -1, dims=0)
+        self._hist[-1] = x_est
         with torch.no_grad():
-            gates_Q, gates_R, f_extra, _, _, gates_Qf = self.model(
-                hist_t,
-                q_base_diag=self.mpc.q_base_diag,
-                r_base_diag=self.mpc.r_base_diag,
+            gQ, gR, f_extra, _, _, gQf = self.model(
+                self._hist, self.mpc.q_base_diag, self.mpc.r_base_diag
             )
-        t_model_ms = (time.perf_counter() - t_mod0) * 1e3
 
-        # ── MPC QP ───────────────────────────────────────────────────────────
-        t_qp0 = time.perf_counter()
-        u_seq_c = self.u_seq_guess.clamp(
-            min=-self.u_lim_t.unsqueeze(0),
-            max= self.u_lim_t.unsqueeze(0),
-        )
-        u_mpc, U_full = self.mpc.control(
-            x_est,
-            x_est.unsqueeze(0).expand(self.mpc.N, -1).clone(),
-            u_seq_c,
-            self.x_goal,
-            diag_corrections_Q=gates_Q,
-            diag_corrections_R=gates_R,
+        # 4. Build linearisation sequences and call QP
+        x_lin_seq = x_est.unsqueeze(0).expand(self.mpc.N, -1).clone()
+        u_lin_seq = torch.clamp(self._u_seq.clone(),
+                                min=self.mpc.MPC_dynamics.u_min.unsqueeze(0),
+                                max=self.mpc.MPC_dynamics.u_max.unsqueeze(0))
+
+        u_opt, U_opt_full = self.mpc.control(
+            x_est, x_lin_seq, u_lin_seq, self.x_goal,
+            diag_corrections_Q=gQ,
+            diag_corrections_R=gR,
             extra_linear_control=f_extra.reshape(-1),
-            diag_corrections_Qf=gates_Qf,
+            diag_corrections_Qf=gQf,
         )
-        t_qp_ms = (time.perf_counter() - t_qp0) * 1e3
-        qp_fallback = (self.mpc.qp_fallback_count > 0)
-        self.mpc.qp_fallback_count = 0
 
-        # Warm-start next QP
-        U_r = U_full.detach().view(self.mpc.N, self.n_u)
-        self.u_seq_guess[:-1] = U_r[1:].clone()
-        self.u_seq_guess[-1]  = U_r[-1].clone()
+        # Shift warm-start for next step
+        U_reshaped = U_opt_full.detach().view(self.mpc.N, 2)
+        self._u_seq[:-1] = U_reshaped[1:].clone()
+        self._u_seq[-1]  = U_reshaped[-1].clone()
 
-        # ── TVLQR ────────────────────────────────────────────────────────────
-        t_tv0 = time.perf_counter()
-        tvlqr_active = False
-        u_tvlqr_hw = np.zeros(2)
-
-        if self.tvlqr is not None:
-            near_goal = self.tvlqr.should_activate(x_hw, self.x_goal_hw) \
-                        if self.tvlqr_threshold > 0 else True
-            if near_goal:
-                u_tvlqr_hw   = self.tvlqr.get_control(x_hw, t_elapsed)
-                tvlqr_active = True
-        t_tvlqr_ms = (time.perf_counter() - t_tv0) * 1e3
-
-        # ── Bias cancellation + combine ───────────────────────────────────────
-        use_bias = (self.cancel_bias and self.ekf is not None
-                    and self.step_count >= self.bias_warmup
-                    and self.ekf_mode == "ekf6")
-        if use_bias:
-            u_cmd = torch.clamp(
-                u_mpc.detach() - bias_est.detach(),
-                min=-self.u_lim_t, max=self.u_lim_t,
-            )
+        # 5. Bias cancellation (EKF6 only; skip first 20 steps for warmup)
+        if isinstance(self.ekf, EKF6) and self.step_n >= 20:
+            u_cmd = torch.clamp(u_opt.detach() - bias,
+                                self.mpc.MPC_dynamics.u_min,
+                                self.mpc.MPC_dynamics.u_max)
         else:
-            u_cmd = u_mpc.detach().clone()
+            u_cmd = torch.clamp(u_opt.detach(),
+                                self.mpc.MPC_dynamics.u_min,
+                                self.mpc.MPC_dynamics.u_max)
 
-        # Combine MPC and TVLQR
-        # Torque is always [tau_shoulder, tau_elbow] in both orderings — no permutation needed.
-        u_cmd_np = u_cmd.numpy()
-        if tvlqr_active:
-            if self.tvlqr_blend:
-                # Blend: use both, weight TVLQR more when closer to goal
-                dq1  = math.atan2(math.sin(x_hw[0] - self.x_goal_hw[0]),
-                                  math.cos(x_hw[0] - self.x_goal_hw[0]))
-                err  = math.sqrt(dq1**2 + x_hw[2]**2)
-                alpha = max(0.0, 1.0 - err / self.tvlqr_threshold)
-                u_final = (1.0 - alpha) * u_cmd_np + alpha * u_tvlqr_hw
-            else:
-                u_final = u_tvlqr_hw.copy()   # hard switch — TVLQR takes over
-        else:
-            u_final = u_cmd_np
+        tau = u_cmd.numpy().copy()
 
-        # Apply torque limit
-        u_lim_np = self.u_lim_t.numpy()
-        u_final  = np.clip(u_final, -u_lim_np, u_lim_np)
+        # 6. Single-actuated: replace elbow torque with PD to hold q2 ≈ 0
+        if self.actuate == "single":
+            q2  = float(x_est[2])
+            q2d = float(x_est[3])
+            tau[1] = float(np.clip(-SA_KP * q2 - SA_KD * q2d, -self.u_lim, self.u_lim))
 
-        # ── Single-actuated override ──────────────────────────────────────────
-        if self.single_actuated:
-            q2  = x_hw[1]    # elbow position (hw ordering)
-            q2d = x_hw[3]    # elbow velocity
-            tau2_pd = -self.sa_kp * q2 - self.sa_kd * q2d
-            tau2_pd = float(np.clip(tau2_pd, -u_lim_np[1], u_lim_np[1]))
-            u_final[1] = tau2_pd
+        # 7. Safety: e-stop on excessive velocity
+        vel = float(np.linalg.norm([float(x_est[1]), float(x_est[3])]))
+        if vel > ESTOP_VEL_LIMIT:
+            tau = np.zeros(2)
+            if self.monitor >= 1:
+                print(f"  [ESTOP] step={self.step_n}  vel={vel:.1f} rad/s", flush=True)
 
-        self.u_prev = torch.tensor(u_final, dtype=torch.float64)
+        # 8. Send torques; record for next EKF predict
+        self.hw.write(tau)
+        self._u_prev = torch.tensor(tau, dtype=torch.float64)
+        self.step_n += 1
 
-        t_total_ms = (time.perf_counter() - t0) * 1e3
+        # 9. Periodic status print
+        if self.monitor >= 2 and self.step_n % 50 == 0:
+            err = float(np.linalg.norm(x_est.numpy() - self.x_goal.numpy()))
+            dt_ms = (time.perf_counter() - t0) * 1000
+            print(f"  step={self.step_n:>5}  u=[{tau[0]:+.3f},{tau[1]:+.3f}]"
+                  f"  err={err:.3f}  loop={dt_ms:.1f}ms", flush=True)
 
-        # Error norm (hardware-angle-wrap-aware)
-        dq1  = math.atan2(math.sin(x_hw[0] - self.x_goal_hw[0]),
-                          math.cos(x_hw[0] - self.x_goal_hw[0]))
-        dq2  = math.atan2(math.sin(x_hw[1] - self.x_goal_hw[1]),
-                          math.cos(x_hw[1] - self.x_goal_hw[1]))
-        err_norm = math.sqrt(dq1**2 + x_hw[2]**2 + dq2**2 + x_hw[3]**2)
-
-        m = StepMetrics(
-            step          = self.step_count,
-            t_read_ms     = t_read_ms,
-            t_ekf_ms      = t_ekf_ms,
-            t_model_ms    = t_model_ms,
-            t_qp_ms       = t_qp_ms,
-            t_tvlqr_ms    = t_tvlqr_ms,
-            t_total_ms    = t_total_ms,
-            qp_fallback   = qp_fallback,
-            tvlqr_active  = tvlqr_active,
-            u_mpc         = u_cmd_np.copy(),
-            u_tvlqr       = u_tvlqr_hw.copy(),
-            u_applied     = u_final.copy(),
-            bias_est      = bias_est.numpy().copy(),
-            ekf_innov     = ekf_innov.copy(),
-            x_raw         = x_hw.copy(),
-            x_est         = x_est.numpy().copy(),
-            err_norm      = err_norm,
-        )
-        self._last_metrics = m
-        self.step_count += 1
-        return u_final, m
+        return tau
 
 
-# ── Safety monitor ─────────────────────────────────────────────────────────────
+# ── Run loop ───────────────────────────────────────────────────────────────────
 
-def safety_check(x_hw: np.ndarray) -> bool:
-    """Return True if state is within safe bounds (no E-stop needed)."""
-    # Angle components only for position safety; velocities separately
-    if abs(x_hw[2]) > SAFETY_VEL_LIMIT or abs(x_hw[3]) > SAFETY_VEL_LIMIT:
-        return False
-    return True
-
-
-# ── Main control loop ──────────────────────────────────────────────────────────
-
-def run_loop(
-    controller: DeployController,
-    interface:  HardwareInterface,
-    x0_hw:     np.ndarray,
-    dt:        float = 0.05,
-    n_steps:   int   = 2000,
-) -> List[StepMetrics]:
-    controller.reset(x0_hw)
-
-    dt_target = dt
-    all_metrics: List[StepMetrics] = []
-    t_tick = time.perf_counter()
-
-    print(f"\n  Control loop: {n_steps} steps @ {1/dt:.0f} Hz  (dt={dt*1e3:.1f}ms)")
-    print(f"  Press Ctrl+C to stop safely.\n")
-
-    try:
-        for step in range(n_steps):
-            t_loop_start = time.perf_counter()
-
-            # ── Read ──────────────────────────────────────────────────────────
-            x_hw, t_read_ms = interface.read_state()
-
-            # ── Safety ────────────────────────────────────────────────────────
-            if not safety_check(x_hw):
-                print(f"\n  [SAFETY] Trip at step {step}: vel={x_hw[2]:.2f},{x_hw[3]:.2f} rad/s")
-                interface.write_torque(np.zeros(2))
-                time.sleep(RESET_DELAY)
-                controller.reset(x_hw)
-                t_tick = time.perf_counter()
-                continue
-
-            # ── Control step ──────────────────────────────────────────────────
-            tau, m = controller.step(x_hw, t_read_ms=t_read_ms)
-
-            # ── Write ─────────────────────────────────────────────────────────
-            t_write_start = time.perf_counter()
-            interface.write_torque(tau)
-            m.t_write_ms = (time.perf_counter() - t_write_start) * 1e3
-
-            # ── Timing ────────────────────────────────────────────────────────
-            t_next = t_tick + (step + 1) * dt_target
-            sleep_s = t_next - time.perf_counter()
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
-            t_elapsed_step = time.perf_counter() - (t_tick + step * dt_target)
-            m.jitter_ms  = (t_elapsed_step - dt_target) * 1e3
-            m.t_sleep_ms = max(0.0, sleep_s * 1e3)
-
-            controller.diag.log(m)
-            all_metrics.append(m)
-
-    except KeyboardInterrupt:
-        print("\n  [Ctrl+C] Stopping safely.")
-
-    finally:
-        interface.write_torque(np.zeros(2))
-        interface.disconnect()
-        controller.diag.final_summary()
-        controller.diag.close()
-
-    return all_metrics
-
-
-# ── Benchmark mode ─────────────────────────────────────────────────────────────
-
-def run_benchmark(
+def run(
     model,
     mpc,
-    x_goal:    torch.Tensor,
-    ekf_mode:  str = "ekf6",
-    tvlqr:     Optional[TVLQRController] = None,
-    n_warmup:  int = 100,
-    n_bench:   int = 500,
+    x_goal:   torch.Tensor,
+    sim:      bool  = False,
+    ekf_mode: str   = "ekf6",
+    actuate:  str   = "double",
+    u_lim:    float = 0.15,
+    monitor:  int   = 1,
+    dt:       float = 0.05,
+    max_steps: int  = 4000,
 ):
-    print("\n" + "="*65)
-    print("  LATENCY BENCHMARK (no hardware I/O)")
-    print("="*65)
+    hw   = HardwareInterface(mpc, sim=sim)
+    ctrl = ControlLoop(model, mpc, hw, x_goal,
+                       ekf_mode=ekf_mode, actuate=actuate,
+                       u_lim=u_lim, monitor=monitor)
 
-    ctrl = DeployController(
-        model=model, mpc=mpc, x_goal=x_goal,
-        ekf_mode=ekf_mode, tvlqr=tvlqr,
-        monitor_level=MONITOR_NONE,
-    )
-    x0_hw = np.zeros(4)
-    ctrl.reset(x0_hw)
+    print(f"  Starting control loop  sim={sim}  ekf={ekf_mode}  "
+          f"actuate={actuate}  u_lim={u_lim}  dt={dt}s", flush=True)
+    print("  Press Ctrl+C to stop.", flush=True)
 
-    for _ in range(n_warmup):
-        ctrl.step(x0_hw)
+    x_hw = hw.read()
+    ctrl.reset(x_hw)
 
-    qp_t, mod_t, ekf_t, tv_t, tot_t = [], [], [], [], []
-    for _ in range(n_bench):
-        _, m = ctrl.step(x0_hw)
-        qp_t.append(m.t_qp_ms)
-        mod_t.append(m.t_model_ms)
-        ekf_t.append(m.t_ekf_ms)
-        tv_t.append(m.t_tvlqr_ms)
-        tot_t.append(m.t_total_ms)
-
-    q = np.percentile
-    print(f"\n  {n_bench} steps after {n_warmup} warmup:")
-    print(f"  {'Metric':<22}  {'mean':>7}  {'p50':>7}  {'p95':>7}  {'p99':>7}  {'max':>7}")
-    print(f"  {'-'*58}")
-    for name, arr in [
-        ("QP solve (ms)",   qp_t),
-        ("Model infer (ms)", mod_t),
-        ("EKF update (ms)",  ekf_t),
-        ("TVLQR (ms)",       tv_t),
-        ("Loop total (ms)",  tot_t),
-    ]:
-        a = np.array(arr)
-        print(f"  {name:<22}  {a.mean():>7.2f}  {q(a,50):>7.2f}  "
-              f"{q(a,95):>7.2f}  {q(a,99):>7.2f}  {a.max():>7.2f}")
-
-    dt_budget = 1000.0 / 20.0
-    remaining = dt_budget - np.mean(tot_t)
-    print(f"\n  Target period @ 20 Hz: {dt_budget:.1f} ms")
-    print(f"  I/O budget remaining:  {remaining:.1f} ms")
-    print("="*65 + "\n")
+    try:
+        for _ in range(max_steps):
+            t_loop = time.perf_counter()
+            x_hw   = hw.read()
+            ctrl.step(x_hw)
+            elapsed = time.perf_counter() - t_loop
+            sleep   = max(0.0, dt - elapsed)
+            if sleep > 0:
+                time.sleep(sleep)
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
+    finally:
+        hw.close()
+        print("  Torques zeroed. Done.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="MAB double pendulum deployment pipeline",
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-
-    p.add_argument(
-        "--mode", choices=["sim", "hw", "bench"], default="sim",
-        help="sim  = simulation  |  hw = real hardware  |  bench = latency benchmark",
-    )
-    p.add_argument(
-        "--model", type=str, default="latest_v1",
-        help=(
-            "Model spec. Options:\n"
-            "  latest_v1 / latest_v2 / latest_v2diag / latest_v3 / latest_v4 / latest_v5 / latest_v6\n"
-            "  Path to .pth file\n"
-            "  Glob pattern  (e.g. 'saved_models/hw_v1*/*.pth')"
-        ),
-    )
-    p.add_argument(
-        "--arch", choices=["auto", "separated", "base", "sc"], default="auto",
-        help="Network architecture override (default: auto-detect from checkpoint)",
-    )
-    p.add_argument(
-        "--actuate", choices=["double", "single"], default="double",
-        help="double = both joints from MPC  |  single = shoulder only, elbow PD",
-    )
-    p.add_argument(
-        "--ekf", choices=["none", "ekf4", "ekf6"], default="ekf6",
-        help="Filter: none=raw observations  ekf4=state filter  ekf6=state+bias filter",
-    )
-    p.add_argument(
-        "--stabilizer", choices=["none", "tvlqr"], default="none",
-        help="Stabilizer: none=MPC only  tvlqr=switch to TVLQR when near goal",
-    )
-    p.add_argument(
-        "--tvlqr_policy", type=str, default="tvlqr_policy_1.npz",
-        help="Path to TVLQR policy .npz file",
-    )
-    p.add_argument(
-        "--tvlqr_threshold", type=float, default=0.4,
-        help="State-error norm to activate TVLQR stabiliser (default 0.4 rad)",
-    )
-    p.add_argument(
-        "--tvlqr_blend", action="store_true",
-        help="Blend MPC + TVLQR near threshold instead of hard switching",
-    )
-    p.add_argument(
-        "--monitor", choices=list(MONITOR_LEVELS.keys()), default="standard",
-        help=(
-            "Verbosity:\n"
-            "  none       — silent\n"
-            "  minimal    — step counter + control every 100 steps\n"
-            "  standard   — 50-step summaries with timing and error\n"
-            "  verbose    — per-step table (all metrics)\n"
-            "  diagnostic — verbose + file logging + final summary"
-        ),
-    )
-    p.add_argument(
-        "--u_lim", type=float, default=None,
-        help="Torque limit override (Nm). Default: read from checkpoint or 0.15",
-    )
-    p.add_argument(
-        "--freq", type=float, default=20.0,
-        help="Control frequency in Hz (default 20 Hz)",
-    )
-    p.add_argument(
-        "--steps", type=int, default=2000,
-        help="Number of control steps (default 2000 = 100 s @ 20 Hz)",
-    )
-    p.add_argument(
-        "--obs_sigma", type=float, default=0.0,
-        help="Observation noise std for sim mode (rad / rad·s⁻¹)",
-    )
-    p.add_argument(
-        "--bias", type=float, default=0.0,
-        help="Constant torque bias injected in sim mode (Nm, both joints)",
-    )
-    p.add_argument(
-        "--cancel_bias", action="store_true", default=True,
-        help="Apply EKF6 bias cancellation (default on when ekf=ekf6)",
-    )
-    p.add_argument(
-        "--no_cancel_bias", dest="cancel_bias", action="store_false",
-    )
-    p.add_argument(
-        "--log", type=str, default=None,
-        help="Write full per-step table to this file (auto-set for diagnostic mode)",
-    )
-    p.add_argument(
-        "--print_every", type=int, default=50,
-        help="Console summary interval in steps (default 50)",
-    )
-    p.add_argument(
-        "--sa_kp", type=float, default=SA_KP,
-        help=f"Single-actuated joint-2 PD stiffness kp (default {SA_KP} Nm/rad)",
-    )
-    p.add_argument(
-        "--sa_kd", type=float, default=SA_KD,
-        help=f"Single-actuated joint-2 PD damping kd (default {SA_KD} Nm·s/rad)",
-    )
-    return p
-
-
 def main():
-    args = build_parser().parse_args()
+    p = argparse.ArgumentParser(description="MAB double pendulum hardware deployment")
+    p.add_argument("--model",   default="latest_v1",
+                   help="Checkpoint path or shorthand: latest_v1/v2/v3/v4/v5/v6")
+    p.add_argument("--ekf",     default="ekf6", choices=["none", "ekf4", "ekf6"])
+    p.add_argument("--actuate", default="double", choices=["double", "single"])
+    p.add_argument("--u_lim",   type=float, default=None,
+                   help="Override torque limit from checkpoint")
+    p.add_argument("--sim",     action="store_true",
+                   help="Simulation mode (no hardware)")
+    p.add_argument("--check",   action="store_true",
+                   help="Just load and print model info, then exit")
+    p.add_argument("--steps",   type=int, default=4000)
+    p.add_argument("--monitor", type=int, default=1, choices=[0, 1, 2],
+                   help="0=silent 1=minimal 2=standard")
+    args = p.parse_args()
 
-    # ── Resolve model ──────────────────────────────────────────────────────────
-    try:
-        ckpt_path = resolve_model_path(args.model)
-    except FileNotFoundError as e:
-        print(f"ERROR: {e}")
-        sys.exit(1)
-
-    arch_override = None if args.arch == "auto" else args.arch
-    model, ckpt_meta, u_lim_ckpt = load_model(ckpt_path, arch_override)
-
+    ckpt = resolve_model_path(args.model)
+    print(f"  Loading: {ckpt}")
+    model, info, u_lim_ckpt = load_model(ckpt)
     u_lim = args.u_lim if args.u_lim is not None else u_lim_ckpt
+    print(f"  arch={info['arch']}  u_lim={u_lim}  horizon={info['horizon']}")
 
-    print(f"\n{'='*70}")
-    print(f"  MAB Double Pendulum Deployment")
-    print(f"{'='*70}")
-    print(f"  Checkpoint : {ckpt_path}")
-    print(f"  Architecture: {ckpt_meta['arch']}")
-    print(f"  hidden_dim  : {ckpt_meta.get('hidden_dim', '?')}")
-    print(f"  Torque limit: {u_lim} Nm")
-    print(f"  Mode        : {args.mode}")
-    print(f"  Actuated    : {args.actuate}")
-    print(f"  EKF         : {args.ekf}")
-    print(f"  Stabilizer  : {args.stabilizer}")
-    print(f"  Monitor     : {args.monitor}")
-    print(f"  Freq        : {args.freq} Hz")
-    print(f"{'='*70}\n")
+    if args.check:
+        print("  Model loaded OK.")
+        return
 
-    dt     = 1.0 / args.freq
-    device = torch.device("cpu")
     x0     = torch.zeros(4, dtype=torch.float64)
     x_goal = torch.tensor([math.pi, 0.0, 0.0, 0.0], dtype=torch.float64)
 
-    mpc = mpc_module.MPC_controller(
-        x0=x0, x_goal=x_goal, N=10, device=device, u_lim=u_lim
-    )
-    mpc.dt = torch.tensor(dt, dtype=torch.float64)
+    mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=info["horizon"],
+                                     device=torch.device("cpu"), u_lim=u_lim)
+    mpc.dt = torch.tensor(0.05, dtype=torch.float64)
 
-    # ── TVLQR ─────────────────────────────────────────────────────────────────
-    tvlqr = None
-    if args.stabilizer == "tvlqr":
-        if not os.path.isfile(args.tvlqr_policy):
-            print(f"  WARNING: TVLQR policy not found: {args.tvlqr_policy!r}")
-            print(f"  Falling back to MPC-only mode.")
-        else:
-            tvlqr = TVLQRController(
-                policy_path=args.tvlqr_policy,
-                activate_err=args.tvlqr_threshold,
-                u_lim=u_lim,
-            )
-            print(f"  TVLQR policy loaded: {args.tvlqr_policy}")
-            print(f"  Activation threshold: err < {args.tvlqr_threshold:.2f} rad")
-
-    # ── Benchmark ─────────────────────────────────────────────────────────────
-    if args.mode == "bench":
-        run_benchmark(model, mpc, x_goal, ekf_mode=args.ekf, tvlqr=tvlqr)
-        return
-
-    # ── Log file ──────────────────────────────────────────────────────────────
-    log_file = args.log
-    if log_file is None and args.monitor == "diagnostic":
-        log_file = "/tmp/hw_deploy_diagnostic.log"
-        print(f"  Diagnostic log → {log_file}")
-
-    monitor_level = MONITOR_LEVELS[args.monitor]
-
-    # ── Interface ─────────────────────────────────────────────────────────────
-    if args.mode == "sim":
-        ctrl_bias = np.array([args.bias, args.bias]) if args.bias != 0.0 else None
-        interface = SimulationInterface(
-            mpc=mpc, x0=x0, dt=dt,
-            obs_sigma=args.obs_sigma, ctrl_bias=ctrl_bias,
-        )
-    else:
-        interface = MABInterface(u_lim=u_lim)
-
-    if not interface.connect():
-        print("  ERROR: Failed to connect. Exiting.")
-        sys.exit(1)
-
-    # ── Controller ────────────────────────────────────────────────────────────
-    controller = DeployController(
-        model            = model,
-        mpc              = mpc,
-        x_goal           = x_goal,
-        dt               = dt,
-        ekf_mode         = args.ekf,
-        cancel_bias      = args.cancel_bias,
-        tvlqr            = tvlqr,
-        tvlqr_blend      = args.tvlqr_blend,
-        tvlqr_threshold  = args.tvlqr_threshold,
-        single_actuated  = (args.actuate == "single"),
-        sa_kp            = args.sa_kp,
-        sa_kd            = args.sa_kd,
-        monitor_level    = monitor_level,
-        log_file         = log_file,
-        print_every      = args.print_every,
-    )
-
-    x0_hw = np.zeros(4)
-    run_loop(controller, interface, x0_hw, dt=dt, n_steps=args.steps)
+    run(model, mpc, x_goal,
+        sim=args.sim, ekf_mode=args.ekf, actuate=args.actuate,
+        u_lim=u_lim, monitor=args.monitor, max_steps=args.steps)
 
 
 if __name__ == "__main__":
