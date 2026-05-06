@@ -17,6 +17,34 @@ Usage
   # Quick model-load check:
   python hardware_deploy.py --model latest_v3 --check
 
+  # Save full per-step telemetry (npz, written once at run end):
+  python hardware_deploy.py --model latest_v2diag --logfile run.npz
+
+  # Run the network on GPU (model only — EKF/MPC stay on CPU).
+  # NOTE: at 20Hz with these tiny networks, GPU is usually slower than
+  # CPU due to PCIe transfer overhead.  Try both, compare loop_ms in summary.
+  python hardware_deploy.py --model latest_v2diag --device cuda
+
+Telemetry / log file (.npz)
+---------------------------
+A logfile is saved on every run (default: hw_runs/<model>_<actuate>_<ekf>_<ts>.npz).
+Per-step arrays:
+  t        (N,)   wall-clock seconds since reset
+  x_hw     (N,4)  raw measurement, hardware ordering
+  x_est    (N,4)  EKF posterior, our ordering [q1,q1d,q2,q2d]
+  u_mpc    (N,2)  raw QP output (before bias subtract / clamp)
+  u_cmd    (N,2)  torque actually sent to motors
+  bias     (N,2)  EKF6 torque-bias estimate (zeros for ekf4/none)
+  resid    (N,4)  x_raw - x_est  (proxy for measurement noise)
+  loop_ms  (N,)   per-step wall time (target: dt*1000 = 50ms)
+  sat      (N,)   bool: did the clamp activate at u_lim?
+  estop    (N,)   bool: did the velocity ESTOP trip?
+Plus scalars: dt, ekf_mode, actuate, u_lim, model_name.
+
+End-of-run summary prints loop-time stats, saturation rate, hardware-f01
+(fraction of steps within 0.10 of inverted), final |x - x_goal|, and
+per-axis RMS of the EKF residual (a noise-floor diagnostic).
+
 State ordering
 --------------
   Hardware (pyCandle): [q1, q2,     q1_dot, q2_dot]
@@ -48,6 +76,100 @@ os.chdir("/home/user/Im_Learn_Diff")
 import lin_net as network_module
 import mpc_controller as mpc_module
 from ekf import EKF4, EKF6
+
+# Force single-threaded torch.  At 20 Hz with tiny tensors the per-op
+# scheduling overhead from PyTorch's thread pool dominates; pinning to 1
+# thread gives more predictable loop timing.
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass  # already set
+
+
+# ── Log recorder ───────────────────────────────────────────────────────────────
+
+class LogRecorder:
+    """Pre-allocated, allocation-free per-step telemetry buffer.
+
+    All arrays are sized for `max_steps` at construction.  `append()` is a
+    pure index-write (no resize, no Python list growth), so per-step cost is
+    a few microseconds.  Disk I/O happens only in `save()` (called once,
+    in the run's `finally` block).
+    """
+
+    def __init__(self, max_steps: int, dt: float, ekf_mode: str,
+                 actuate: str, u_lim: float, model_name: str):
+        self.N = max_steps
+        self.dt = float(dt)
+        self.meta = dict(ekf_mode=ekf_mode, actuate=actuate,
+                         u_lim=float(u_lim), model_name=model_name)
+        self.t        = np.empty(max_steps,        dtype=np.float64)
+        self.x_hw     = np.empty((max_steps, 4),   dtype=np.float64)
+        self.x_est    = np.empty((max_steps, 4),   dtype=np.float64)
+        self.u_mpc    = np.empty((max_steps, 2),   dtype=np.float64)
+        self.u_cmd    = np.empty((max_steps, 2),   dtype=np.float64)
+        self.bias     = np.empty((max_steps, 2),   dtype=np.float64)
+        self.resid    = np.empty((max_steps, 4),   dtype=np.float64)
+        self.loop_ms  = np.empty(max_steps,        dtype=np.float32)
+        self.sat      = np.empty(max_steps,        dtype=bool)
+        self.estop    = np.empty(max_steps,        dtype=bool)
+        self.k = 0
+
+    def append(self, t, x_hw, x_est, u_mpc, u_cmd, bias, resid,
+               loop_ms, sat, estop):
+        i = self.k
+        if i >= self.N:
+            return
+        self.t[i]       = t
+        self.x_hw[i]    = x_hw
+        self.x_est[i]   = x_est
+        self.u_mpc[i]   = u_mpc
+        self.u_cmd[i]   = u_cmd
+        self.bias[i]    = bias
+        self.resid[i]   = resid
+        self.loop_ms[i] = loop_ms
+        self.sat[i]     = sat
+        self.estop[i]   = estop
+        self.k += 1
+
+    def save(self, path: str):
+        n = self.k
+        np.savez_compressed(
+            path, dt=self.dt, **self.meta,
+            t=self.t[:n], x_hw=self.x_hw[:n], x_est=self.x_est[:n],
+            u_mpc=self.u_mpc[:n], u_cmd=self.u_cmd[:n],
+            bias=self.bias[:n], resid=self.resid[:n],
+            loop_ms=self.loop_ms[:n], sat=self.sat[:n], estop=self.estop[:n],
+        )
+
+    def summary(self, x_goal: torch.Tensor) -> str:
+        n = self.k
+        if n == 0:
+            return "  No steps recorded."
+        loop  = self.loop_ms[:n]
+        sat   = self.sat[:n]
+        estop = self.estop[:n]
+        x_est = self.x_est[:n]
+        resid = self.resid[:n]
+        # Hardware f01: fraction of steps within 0.10 of inverted [pi,0,0,0]
+        q1, q1d, q2, q2d = x_est[:, 0], x_est[:, 1], x_est[:, 2], x_est[:, 3]
+        wrap_q1 = np.arctan2(np.sin(q1 - np.pi), np.cos(q1 - np.pi))
+        wraps = np.sqrt(wrap_q1**2 + q1d**2 + q2**2 + q2d**2)
+        f01 = float((wraps < 0.10).mean())
+        final_err = float(np.linalg.norm(x_est[-1] - x_goal.cpu().numpy()))
+        rms = np.sqrt(np.mean(resid**2, axis=0))
+        return (
+            f"  Steps:       {n}  ({n * self.dt:.1f}s)\n"
+            f"  Loop time:   mean={loop.mean():.1f}ms  p99={np.percentile(loop, 99):.1f}ms"
+            f"  max={loop.max():.1f}ms  budget={self.dt*1000:.0f}ms\n"
+            f"  Saturation:  {sat.mean()*100:.1f}% of steps clamped at u_lim\n"
+            f"  ESTOP:       {int(estop.sum())} step(s) (vel > {ESTOP_VEL_LIMIT} rad/s)\n"
+            f"  Hardware f01: {f01*100:.1f}%  (wraps<0.10 to inverted)\n"
+            f"  Final err:   |x-x_goal| = {final_err:.4f}\n"
+            f"  Resid RMS:   q1={rms[0]:.4f}  q1d={rms[1]:.4f}"
+            f"  q2={rms[2]:.4f}  q2d={rms[3]:.4f}\n"
+        )
 
 # ── Hardware IDs ───────────────────────────────────────────────────────────────
 SHOULDER_ID = 402
@@ -120,11 +242,12 @@ def detect_architecture(state_dict: dict) -> str:
     return "LinearizationNetwork"
 
 
-def load_model(ckpt_path: str) -> Tuple[object, dict, float]:
+def load_model(ckpt_path: str, device: torch.device = torch.device("cpu")
+               ) -> Tuple[object, dict, float]:
     """Load checkpoint → (model, info_dict, u_lim).
 
-    info_dict contains 'arch', 'u_lim', and model kwargs.
-    Model is returned in eval mode on CPU.
+    info_dict contains 'arch', 'u_lim', 'single_actuated', and model kwargs.
+    Model is returned in eval mode on the requested device.
     """
     data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
@@ -164,10 +287,11 @@ def load_model(ckpt_path: str) -> Tuple[object, dict, float]:
     if unexpected:
         print(f"  [WARN] Unexpected keys: {unexpected}")
 
-    model.eval()
+    model = model.to(device).eval()
     # Expose whether checkpoint was trained as single-actuated
     sa_flag = bool(tp.get("single_actuated", False) or tp.get("rigid_elbow", False))
-    info = {"arch": arch, "u_lim": u_lim, "single_actuated": sa_flag, **kwargs}
+    info = {"arch": arch, "u_lim": u_lim, "single_actuated": sa_flag,
+            "device": str(device), **kwargs}
     return model, info, u_lim
 
 
@@ -263,6 +387,8 @@ class ControlLoop:
         actuate:   str   = "double",
         u_lim:     float = 0.15,
         monitor:   int   = 1,
+        device:    torch.device = torch.device("cpu"),
+        recorder:  Optional["LogRecorder"] = None,
     ):
         self.model    = model
         self.mpc      = mpc
@@ -271,9 +397,11 @@ class ControlLoop:
         self.actuate  = actuate
         self.u_lim    = u_lim
         self.monitor  = monitor
+        self.device   = device
+        self.recorder = recorder
         self.step_n   = 0
 
-        # Build EKF
+        # Build EKF (always CPU — small matrices, autograd jacobians)
         if ekf_mode == "ekf6":
             self.ekf = EKF6(mpc, Q_STATE, Q_BIAS, R_OBS)
         elif ekf_mode == "ekf4":
@@ -281,28 +409,42 @@ class ControlLoop:
         else:
             self.ekf = None
 
-        # State history for lin_net (5 frames)
-        self._hist       = torch.zeros((5, 4), dtype=torch.float64)
+        # State history for lin_net (5 frames).  Lives on `device` so the
+        # forward pass doesn't transfer 20 floats every step when on GPU.
+        self._hist     = torch.zeros((5, 4), dtype=torch.float64, device=device)
+        # Pre-allocated linearisation sequence buffer (N × 4) on CPU (MPC stays on CPU).
+        self._x_lin    = torch.zeros((mpc.N, 4), dtype=torch.float64)
         # Warm-start control sequence for QP (N × 2)
-        self._u_seq      = torch.zeros((mpc.N, 2), dtype=torch.float64)
+        self._u_seq    = torch.zeros((mpc.N, 2), dtype=torch.float64)
         # Previous torque sent to hardware (for EKF predict step)
-        self._u_prev     = torch.zeros(2, dtype=torch.float64)
+        self._u_prev   = torch.zeros(2, dtype=torch.float64)
+        # Cache base diagonals on device — small constants, transfer once
+        self._q_base = mpc.q_base_diag.to(device) if device.type != "cpu" else mpc.q_base_diag
+        self._r_base = mpc.r_base_diag.to(device) if device.type != "cpu" else mpc.r_base_diag
+        # Cached u clamp tensors (stops expand/clone churn each step)
+        self._u_min = self.mpc.MPC_dynamics.u_min.detach().clone()
+        self._u_max = self.mpc.MPC_dynamics.u_max.detach().clone()
+        # Walltime origin for logging
+        self._t0 = None
 
     def reset(self, x_hw: np.ndarray):
-        x_t = torch.tensor(np.array(x_hw)[HW_TO_OURS], dtype=torch.float64)
-        self._hist[:] = x_t
+        x_t_cpu = torch.tensor(np.array(x_hw)[HW_TO_OURS], dtype=torch.float64)
+        x_t_dev = x_t_cpu.to(self.device) if self.device.type != "cpu" else x_t_cpu
+        self._hist[:]   = x_t_dev
         self._u_seq[:]  = 0.0
         self._u_prev[:] = 0.0
         if self.ekf is not None:
-            self.ekf.reset(x_t)
+            self.ekf.reset(x_t_cpu)
         self.step_n = 0
+        self._t0 = time.perf_counter()
 
     def step(self, x_hw: np.ndarray) -> np.ndarray:
         """One control step. Returns [tau1, tau2] actually applied."""
-        t0 = time.perf_counter()
+        t_loop_start = time.perf_counter()
 
-        # 1. Permute hardware ordering → network ordering
-        x_raw = torch.tensor(np.array(x_hw)[HW_TO_OURS], dtype=torch.float64)
+        # 1. Permute hardware ordering → network ordering (CPU)
+        x_hw_arr = np.asarray(x_hw, dtype=np.float64)
+        x_raw = torch.from_numpy(x_hw_arr[HW_TO_OURS].copy())
 
         # 2. EKF predict+update (skip on first step — no previous u yet)
         if self.ekf is not None and self.step_n > 0:
@@ -313,76 +455,100 @@ class ControlLoop:
             if self.ekf is not None and self.step_n == 0:
                 self.ekf.reset(x_est)
 
-        # 3. Roll state history and run lin_net
-        # For SA mode: zero out elbow states (q2, q2d) before model inference —
-        # the model was trained with rigid-link freeze and has never seen q2≠0.
-        x_model = x_est.clone()
+        # 3. Build x_model: SA zeroes elbow before model inference
+        x_model_cpu = x_est.clone()
         if self.actuate == "single":
-            x_model[2] = 0.0
-            x_model[3] = 0.0
-        self._hist = torch.roll(self._hist, -1, dims=0)
-        self._hist[-1] = x_model
+            x_model_cpu[2] = 0.0
+            x_model_cpu[3] = 0.0
+
+        # In-place hist roll — avoids torch.roll's full-tensor allocation
+        self._hist[:-1] = self._hist[1:].clone()
+        if self.device.type != "cpu":
+            self._hist[-1] = x_model_cpu.to(self.device, non_blocking=True)
+        else:
+            self._hist[-1] = x_model_cpu
+
+        # 4. Model forward (on device, no_grad, eval-mode already set)
         with torch.no_grad():
             gQ, gR, f_extra, _, _, gQf = self.model(
-                self._hist, self.mpc.q_base_diag, self.mpc.r_base_diag
+                self._hist, self._q_base, self._r_base
             )
+            if self.device.type != "cpu":
+                gQ      = gQ.to("cpu")
+                gR      = gR.to("cpu")
+                f_extra = f_extra.to("cpu")
+                gQf     = gQf.to("cpu")
 
-        # 4. Build linearisation sequences and call QP
-        x_lin_seq = x_model.unsqueeze(0).expand(self.mpc.N, -1).clone()
-        u_lin_seq = torch.clamp(self._u_seq.clone(),
-                                min=self.mpc.MPC_dynamics.u_min.unsqueeze(0),
-                                max=self.mpc.MPC_dynamics.u_max.unsqueeze(0))
-
+        # 5. QP solve (CPU only — cvxpylayer is CPU-bound).
+        # Fill pre-allocated linearisation buffers in-place.
+        self._x_lin[:] = x_model_cpu.unsqueeze(0)
+        u_lin_seq = torch.clamp(
+            self._u_seq, min=self._u_min.unsqueeze(0), max=self._u_max.unsqueeze(0)
+        )
         u_opt, U_opt_full = self.mpc.control(
-            x_model, x_lin_seq, u_lin_seq, self.x_goal,
+            x_model_cpu, self._x_lin, u_lin_seq, self.x_goal,
             diag_corrections_Q=gQ,
             diag_corrections_R=gR,
             extra_linear_control=f_extra.reshape(-1),
             diag_corrections_Qf=gQf,
         )
 
-        # Shift warm-start for next step
+        # Shift warm-start for next step (in-place)
         U_reshaped = U_opt_full.detach().view(self.mpc.N, 2)
-        self._u_seq[:-1] = U_reshaped[1:].clone()
-        self._u_seq[-1]  = U_reshaped[-1].clone()
+        self._u_seq[:-1] = U_reshaped[1:]
+        self._u_seq[-1]  = U_reshaped[-1]
 
-        # 5. Bias cancellation (EKF6 only; skip first 20 steps for warmup)
+        u_opt_d = u_opt.detach()
+
+        # 6. Bias cancellation (EKF6 only; skip first 20 steps for warmup)
         if isinstance(self.ekf, EKF6) and self.step_n >= 20:
-            u_cmd = torch.clamp(u_opt.detach() - bias,
-                                self.mpc.MPC_dynamics.u_min,
-                                self.mpc.MPC_dynamics.u_max)
+            u_pre_clamp = u_opt_d - bias
         else:
-            u_cmd = torch.clamp(u_opt.detach(),
-                                self.mpc.MPC_dynamics.u_min,
-                                self.mpc.MPC_dynamics.u_max)
+            u_pre_clamp = u_opt_d
+        u_cmd = torch.clamp(u_pre_clamp, self._u_min, self._u_max)
+
+        # Saturation flag: did clamp actually do anything?
+        sat_flag = bool(torch.any(u_cmd != u_pre_clamp).item())
 
         tau = u_cmd.numpy().copy()
+        u_mpc_record = u_opt_d.numpy().copy()  # raw QP output, before bias/clamp
 
-        # 6. Single-actuated: replace elbow torque with PD to hold q2 ≈ 0
+        # 7. Single-actuated: replace elbow torque with PD to hold q2 ≈ 0
         if self.actuate == "single":
             q2  = float(x_est[2])
             q2d = float(x_est[3])
             tau[1] = float(np.clip(-SA_KP * q2 - SA_KD * q2d, -self.u_lim, self.u_lim))
 
-        # 7. Safety: e-stop on excessive velocity
+        # 8. Safety: e-stop on excessive velocity
         vel = float(np.linalg.norm([float(x_est[1]), float(x_est[3])]))
-        if vel > ESTOP_VEL_LIMIT:
+        estop_flag = vel > ESTOP_VEL_LIMIT
+        if estop_flag:
             tau = np.zeros(2)
             if self.monitor >= 1:
                 print(f"  [ESTOP] step={self.step_n}  vel={vel:.1f} rad/s", flush=True)
 
-        # 8. Send torques; record for next EKF predict
+        # 9. Send torques; record for next EKF predict
         self.hw.write(tau)
-        self._u_prev = torch.tensor(tau, dtype=torch.float64)
+        self._u_prev = torch.from_numpy(tau.copy())
+        loop_ms = (time.perf_counter() - t_loop_start) * 1000.0
+
+        # 10. Telemetry
+        if self.recorder is not None:
+            t_rel = time.perf_counter() - (self._t0 or t_loop_start)
+            self.recorder.append(
+                t=t_rel, x_hw=x_hw_arr, x_est=x_est.numpy(),
+                u_mpc=u_mpc_record, u_cmd=tau, bias=bias.numpy(),
+                resid=(x_raw - x_est).numpy(),
+                loop_ms=loop_ms, sat=sat_flag, estop=estop_flag,
+            )
+
+        # 11. Periodic status print
+        if self.monitor >= 2 and (self.step_n + 1) % 50 == 0:
+            err = float(np.linalg.norm(x_est.numpy() - self.x_goal.cpu().numpy()))
+            print(f"  step={self.step_n+1:>5}  u=[{tau[0]:+.3f},{tau[1]:+.3f}]"
+                  f"  err={err:.3f}  loop={loop_ms:.1f}ms", flush=True)
+
         self.step_n += 1
-
-        # 9. Periodic status print
-        if self.monitor >= 2 and self.step_n % 50 == 0:
-            err = float(np.linalg.norm(x_est.numpy() - self.x_goal.numpy()))
-            dt_ms = (time.perf_counter() - t0) * 1000
-            print(f"  step={self.step_n:>5}  u=[{tau[0]:+.3f},{tau[1]:+.3f}]"
-                  f"  err={err:.3f}  loop={dt_ms:.1f}ms", flush=True)
-
         return tau
 
 
@@ -391,27 +557,36 @@ class ControlLoop:
 def run(
     model,
     mpc,
-    x_goal:   torch.Tensor,
-    sim:      bool  = False,
-    ekf_mode: str   = "ekf6",
-    actuate:  str   = "double",
-    u_lim:    float = 0.15,
-    monitor:  int   = 1,
-    dt:       float = 0.05,
-    max_steps: int  = 4000,
+    x_goal:    torch.Tensor,
+    sim:       bool  = False,
+    ekf_mode:  str   = "ekf6",
+    actuate:   str   = "double",
+    u_lim:     float = 0.15,
+    monitor:   int   = 1,
+    dt:        float = 0.05,
+    max_steps: int   = 4000,
+    device:    torch.device = torch.device("cpu"),
+    logfile:   Optional[str] = None,
+    model_name: str = "",
 ):
-    hw   = HardwareInterface(mpc, sim=sim)
-    ctrl = ControlLoop(model, mpc, hw, x_goal,
-                       ekf_mode=ekf_mode, actuate=actuate,
-                       u_lim=u_lim, monitor=monitor)
+    hw       = HardwareInterface(mpc, sim=sim)
+    recorder = LogRecorder(max_steps, dt, ekf_mode, actuate, u_lim, model_name)
+    ctrl     = ControlLoop(model, mpc, hw, x_goal,
+                           ekf_mode=ekf_mode, actuate=actuate,
+                           u_lim=u_lim, monitor=monitor,
+                           device=device, recorder=recorder)
 
     print(f"  Starting control loop  sim={sim}  ekf={ekf_mode}  "
-          f"actuate={actuate}  u_lim={u_lim}  dt={dt}s", flush=True)
+          f"actuate={actuate}  u_lim={u_lim}  dt={dt}s  device={device}",
+          flush=True)
+    if logfile:
+        print(f"  Logging to: {logfile}", flush=True)
     print("  Press Ctrl+C to stop.", flush=True)
 
     x_hw = hw.read()
     ctrl.reset(x_hw)
 
+    interrupted = False
     try:
         for _ in range(max_steps):
             t_loop = time.perf_counter()
@@ -422,10 +597,31 @@ def run(
             if sleep > 0:
                 time.sleep(sleep)
     except KeyboardInterrupt:
+        interrupted = True
         print("\n  Interrupted.")
     finally:
-        hw.close()
-        print("  Torques zeroed. Done.")
+        # Close hardware first (zero torques) — most important.
+        try:
+            hw.close()
+        except Exception as e:
+            print(f"  [WARN] hw.close() raised: {e}")
+        print("  Torques zeroed.")
+
+        # Then summary + log save.  Run unconditionally so even crashed
+        # runs leave forensic data on disk.
+        try:
+            print("\n" + "─" * 70)
+            print("  RUN SUMMARY" + ("  (interrupted)" if interrupted else ""))
+            print("─" * 70)
+            print(recorder.summary(x_goal), end="")
+            if logfile:
+                recorder.save(logfile)
+                print(f"  Saved log:   {logfile}.npz" if not logfile.endswith(".npz")
+                      else f"  Saved log:   {logfile}")
+        except Exception as e:
+            print(f"  [WARN] summary/save raised: {e}")
+        print("─" * 70)
+        print("  Done.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -445,11 +641,26 @@ def main():
     p.add_argument("--steps",   type=int, default=4000)
     p.add_argument("--monitor", type=int, default=1, choices=[0, 1, 2],
                    help="0=silent 1=minimal 2=standard")
+    p.add_argument("--logfile", type=str, default=None,
+                   help="If set, save full per-step telemetry to this .npz path "
+                        "(written once at run end, including on Ctrl+C / crash)")
+    p.add_argument("--device",  type=str, default="cpu",
+                   choices=["cpu", "cuda"],
+                   help="Device for the neural net forward pass.  EKF and MPC "
+                        "always run on CPU (cvxpylayer is CPU-only).  For the "
+                        "tiny networks used here at 20Hz, CPU is usually faster "
+                        "than CUDA due to PCIe transfer overhead.")
     args = p.parse_args()
+
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("  [WARN] --device cuda requested but torch.cuda.is_available()=False; "
+              "falling back to CPU.")
+        args.device = "cpu"
+    device = torch.device(args.device)
 
     ckpt = resolve_model_path(args.model)
     print(f"  Loading: {ckpt}")
-    model, info, u_lim_ckpt = load_model(ckpt)
+    model, info, u_lim_ckpt = load_model(ckpt, device=device)
     u_lim = args.u_lim if args.u_lim is not None else u_lim_ckpt
     print(f"  arch={info['arch']}  u_lim={u_lim}  horizon={info['horizon']}")
     if info["single_actuated"] and args.actuate == "double":
@@ -475,9 +686,18 @@ def main():
         wrap_sa_dynamics(mpc)
         print("  SA mode: rigid-elbow dynamics in MPC planner")
 
+    # Default logfile name if none given (always save by default).
+    logfile = args.logfile
+    if logfile is None:
+        from datetime import datetime
+        os.makedirs("hw_runs", exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logfile = f"hw_runs/{args.model}_{args.actuate}_{args.ekf}_{stamp}.npz"
+
     run(model, mpc, x_goal,
         sim=args.sim, ekf_mode=args.ekf, actuate=args.actuate,
-        u_lim=u_lim, monitor=args.monitor, max_steps=args.steps)
+        u_lim=u_lim, monitor=args.monitor, max_steps=args.steps,
+        device=device, logfile=logfile, model_name=args.model)
 
 
 if __name__ == "__main__":
