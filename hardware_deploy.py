@@ -69,6 +69,25 @@ SA_KD = 0.5   # Nm·s/rad
 ESTOP_VEL_LIMIT = 20.0   # rad/s
 
 
+# ── SA dynamics helper ────────────────────────────────────────────────────────
+
+def wrap_sa_dynamics(mpc) -> None:
+    """Replace mpc.true_RK4_disc with a rigid-elbow version (q2=q2d=0).
+
+    Used in simulation mode with single-actuated models so that the sim
+    matches the training dynamics exactly.
+    """
+    orig = mpc.true_RK4_disc
+
+    def _sa_rk4(x, u, dt, n_sub=10):
+        x_in = torch.cat([x[:2], torch.zeros(2, dtype=x.dtype, device=x.device)])
+        u_in = torch.cat([u[:1], torch.zeros(1, dtype=u.dtype, device=u.device)])
+        x_out = orig(x_in, u_in, dt, n_sub)
+        return torch.cat([x_out[:2], torch.zeros(2, dtype=x_out.dtype, device=x_out.device)])
+
+    mpc.true_RK4_disc = _sa_rk4
+
+
 # ── Model loading ──────────────────────────────────────────────────────────────
 
 def resolve_model_path(spec: str) -> str:
@@ -442,6 +461,11 @@ def main():
     mpc = mpc_module.MPC_controller(x0=x0, x_goal=x_goal, N=info["horizon"],
                                      device=torch.device("cpu"), u_lim=u_lim)
     mpc.dt = torch.tensor(0.05, dtype=torch.float64)
+
+    # SA simulation uses rigid-elbow dynamics to match training
+    if args.actuate == "single" and args.sim:
+        wrap_sa_dynamics(mpc)
+        print("  SA sim: rigid-elbow dynamics active")
 
     run(model, mpc, x_goal,
         sim=args.sim, ekf_mode=args.ekf, actuate=args.actuate,
